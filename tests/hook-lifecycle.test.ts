@@ -244,24 +244,41 @@ describe('Cursor IDE Compatibility (#838, #1049)', () => {
       const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
       const input = cursorAdapter.normalizeInput({ conversation_id: 'conv-123', workspace_roots: ['/project'] });
       expect(input.sessionId).toBe('conv-123');
+      expect(input.metadata?.cursorSessionIdSource).toBe('conversation_id');
     });
 
-    it('should fall back to generation_id', async () => {
+    it('should fall back to generation_id with an explicit fragmentation warning', async () => {
       const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
       const input = cursorAdapter.normalizeInput({ generation_id: 'gen-456', workspace_roots: ['/project'] });
       expect(input.sessionId).toBe('gen-456');
+      expect(input.metadata?.cursorSessionIdSource).toBe('generation_id');
+      expect(input.metadata?.cursorDiagnostics).toContain('session_id_from_generation_id');
     });
 
     it('should fall back to id field', async () => {
       const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
       const input = cursorAdapter.normalizeInput({ id: 'id-789', workspace_roots: ['/project'] });
       expect(input.sessionId).toBe('id-789');
+      expect(input.metadata?.cursorSessionIdSource).toBe('id');
+      expect(input.metadata?.cursorDiagnostics).toContain('session_id_from_id');
     });
 
     it('should return undefined when no session ID field is present', async () => {
       const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
       const input = cursorAdapter.normalizeInput({ workspace_roots: ['/project'] });
       expect(input.sessionId).toBeUndefined();
+      expect(input.metadata?.cursorDiagnostics).toContain('missing_session_id');
+    });
+
+    it('records sanitized raw payload keys and unknown fields for drift diagnostics', async () => {
+      const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
+      const input = cursorAdapter.normalizeInput({
+        conversation_id: 'conv-123',
+        workspace_roots: ['/project'],
+        future_cursor_field: 'new-shape',
+      });
+      expect(input.metadata?.cursorPayloadKeys).toContain('future_cursor_field');
+      expect(input.metadata?.cursorUnknownFields).toContain('future_cursor_field');
     });
   });
 
@@ -320,6 +337,54 @@ describe('Cursor IDE Compatibility (#838, #1049)', () => {
       const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
       const input = cursorAdapter.normalizeInput({ conversation_id: 'c1' });
       expect(input.cwd).toBe(process.cwd());
+      expect(input.metadata?.cursorDiagnostics).toContain('cwd_from_process');
+    });
+  });
+
+  describe('cursorAdapter tool payload diagnostics', () => {
+    it('warns when a shell command has no captured output', async () => {
+      const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
+      const input = cursorAdapter.normalizeInput({
+        conversation_id: 'c1',
+        workspace_roots: ['/project'],
+        command: 'echo hello',
+      });
+      expect(input.toolName).toBe('Bash');
+      expect(input.metadata?.cursorDiagnostics).toContain('shell_missing_output');
+    });
+
+    it('warns when tool-like payload lacks tool_name', async () => {
+      const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
+      const input = cursorAdapter.normalizeInput({
+        conversation_id: 'c1',
+        workspace_roots: ['/project'],
+        tool_input: { query: 'x' },
+        result_json: { ok: true },
+      });
+      expect(input.toolName).toBeUndefined();
+      expect(input.metadata?.cursorDiagnostics).toContain('missing_tool_name');
+    });
+  });
+
+  describe('cursorAdapter summarize payloads', () => {
+    it('maps camelCase lastAssistantMessage from Cursor stop hooks', async () => {
+      const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
+      const input = cursorAdapter.normalizeInput({
+        conversation_id: 'c1',
+        workspace_roots: ['/project'],
+        lastAssistantMessage: 'assistant summary text',
+      });
+      expect(input.lastAssistantMessage).toBe('assistant summary text');
+    });
+
+    it('maps snake_case last_assistant_message from Cursor stop hooks', async () => {
+      const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
+      const input = cursorAdapter.normalizeInput({
+        conversation_id: 'c1',
+        workspace_roots: ['/project'],
+        last_assistant_message: 'assistant summary text',
+      });
+      expect(input.lastAssistantMessage).toBe('assistant summary text');
     });
   });
 
@@ -352,6 +417,27 @@ describe('Cursor IDE Compatibility (#838, #1049)', () => {
       const { cursorAdapter } = await import('../src/cli/adapters/cursor.js');
       const output = cursorAdapter.formatOutput({});
       expect(output).toEqual({ continue: true });
+    });
+  });
+
+  describe('Cursor noise gates', () => {
+    it('filters low-value Cursor prompts without affecting meaningful prompts', async () => {
+      const { isLowValueCursorPrompt } = await import('../src/cli/handlers/session-init.js');
+      expect(isLowValueCursorPrompt('cursor', 'ok')).toBe(true);
+      expect(isLowValueCursorPrompt('cursor', '继续')).toBe(true);
+      expect(isLowValueCursorPrompt('cursor', 'fix auth bug')).toBe(false);
+    });
+
+    it('does not apply Cursor prompt filtering to other platforms', async () => {
+      const { isLowValueCursorPrompt } = await import('../src/cli/handlers/session-init.js');
+      expect(isLowValueCursorPrompt('claude', 'ok')).toBe(false);
+    });
+
+    it('filters short Cursor summaries without affecting other platforms', async () => {
+      const { isLowValueCursorSummary } = await import('../src/cli/handlers/summarize.js');
+      expect(isLowValueCursorSummary('cursor', 'Done.')).toBe(true);
+      expect(isLowValueCursorSummary('claude', 'Done.')).toBe(false);
+      expect(isLowValueCursorSummary('cursor', 'This response explains the change, the files touched, and the verification path in enough detail to be worth summarizing.')).toBe(false);
     });
   });
 });

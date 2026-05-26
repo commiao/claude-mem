@@ -1,6 +1,8 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { logger } from '../../../src/utils/logger.js';
 
+const originalEnv = { ...process.env };
+
 mock.module('../../../src/services/worker-service.js', () => ({
   updateCursorContextForProject: () => Promise.resolve(),
 }));
@@ -46,6 +48,7 @@ describe('ResponseProcessor', () => {
   let mockWorker: WorkerRef;
 
   beforeEach(() => {
+    process.env = { ...originalEnv, CLAUDE_MEM_KG_HUB_ENABLED: 'false' };
     loggerSpies = [
       spyOn(logger, 'info').mockImplementation(() => {}),
       spyOn(logger, 'debug').mockImplementation(() => {}),
@@ -100,6 +103,7 @@ describe('ResponseProcessor', () => {
   });
 
   afterEach(() => {
+    process.env = originalEnv;
     loggerSpies.forEach(spy => spy.mockRestore());
     mock.restore();
   });
@@ -129,6 +133,70 @@ describe('ResponseProcessor', () => {
   }
 
   describe('parsing observations from XML response', () => {
+    it('should enqueue stored observations for kg-hub sync with claude-mem observation ids', async () => {
+      process.env.CLAUDE_MEM_KG_HUB_ENABLED = 'true';
+      process.env.CLAUDE_MEM_KG_HUB_URL = 'http://127.0.0.1:8080';
+      process.env.CLAUDE_MEM_KG_HUB_MIN_INTERVAL_MS = '0';
+      const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ status: 'accepted' }), { status: 202 });
+      }) as unknown as typeof fetch;
+
+      mockStoreObservations = mock(() => ({
+        observationIds: [1047],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+      mockDbManager = {
+        ...mockDbManager,
+        getSessionStore: () => ({
+          storeObservations: mockStoreObservations,
+          ensureMemorySessionIdRegistered: mock(() => {}),
+          getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
+        }),
+      } as unknown as DatabaseManager;
+
+      const session = createMockSession({
+        contentSessionId: 'cursor-live-verify-20260520133600',
+        project: 'workspace_cursor',
+        platformSource: 'cursor',
+      } as Partial<ActiveSession>);
+      const responseText = `
+        <observation>
+          <type>feature</type>
+          <title>Cursor capture verified</title>
+          <narrative>Cursor session produced claude-mem observation 1047.</narrative>
+          <facts><fact>Cursor session cursor-live-verify-20260520133600 produced claude-mem observation 1047</fact></facts>
+          <concepts><concept>cursor</concept></concepts>
+          <files_read></files_read>
+          <files_modified></files_modified>
+        </observation>
+      `;
+
+      await processAgentResponse(
+        responseText,
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        null,
+        'TestAgent'
+      );
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(fetchCalls).toHaveLength(1);
+      const body = JSON.parse(String(fetchCalls[0].init?.body));
+      expect(body.source_obs_id).toBe('claude-mem-observation-1047');
+      expect(body.source_description).toBe('claude-mem obs id=1047 project=workspace_cursor type=discovery');
+      expect(body.name).toBe('claude-mem-obs-1047');
+      expect(body.episode_body).toContain('Cursor session cursor-live-verify-20260520133600');
+      expect(body.sync).toBe(false);
+    });
+
     it('should parse single observation from response', async () => {
       const session = createMockSession();
       const responseText = `

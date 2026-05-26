@@ -10,6 +10,14 @@ import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
 import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
 
+const MIN_CURSOR_SUMMARY_CHARS = 80;
+
+export function isLowValueCursorSummary(platformSource: string | undefined, lastAssistantMessage: string | undefined): boolean {
+  if (platformSource !== 'cursor') return false;
+  const message = lastAssistantMessage?.trim() ?? '';
+  return message.length > 0 && message.length < MIN_CURSOR_SUMMARY_CHARS;
+}
+
 export const summarizeHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     if (input.cwd && !shouldTrackProject(input.cwd)) {
@@ -33,6 +41,7 @@ export const summarizeHandler: EventHandler = {
     }
 
     const { sessionId, transcriptPath } = input;
+    const platformSource = normalizePlatformSource(input.platform);
 
     if (!sessionId) {
       logger.warn('HOOK', 'summarize: No sessionId provided, skipping');
@@ -66,11 +75,17 @@ export const summarizeHandler: EventHandler = {
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
+    if (isLowValueCursorSummary(platformSource, lastAssistantMessage)) {
+      logger.debug('HOOK', 'Skipping summary: low-value Cursor assistant message', {
+        sessionId,
+        messageLength: lastAssistantMessage.trim().length,
+      });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
     logger.dataIn('HOOK', 'Stop: Requesting summary', {
       hasLastAssistantMessage: !!lastAssistantMessage
     });
-
-    const platformSource = normalizePlatformSource(input.platform);
 
     const runtime = resolveRuntimeContext();
     if (runtime.runtime === 'server-beta') {
