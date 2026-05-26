@@ -4,6 +4,7 @@ import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../..
 import { ingestSummary } from '../http/shared.js';
 import { updateCursorContextForProject } from '../../integrations/CursorHooksInstaller.js';
 import { notifyTelegram } from '../../integrations/TelegramNotifier.js';
+import { syncObservationsToKgHub, type KgHubObservation } from '../../integrations/KgHubSink.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
@@ -179,6 +180,7 @@ async function syncAndBroadcastObservations(
   // duplicate IDs. Syncing them 1:1 triggers repeated Chroma "IDs already exist"
   // reconciles. See issue #2240.
   const uniqueObservationIds = [...new Set(result.observationIds)];
+  const kgHubObservations: KgHubObservation[] = [];
 
   for (const obsId of uniqueObservationIds) {
     const observationIndex = result.observationIds.indexOf(obsId);
@@ -191,6 +193,17 @@ async function syncAndBroadcastObservations(
       });
       continue;
     }
+    kgHubObservations.push({
+      id: obsId,
+      sourceObsId: `claude-mem-observation-${obsId}`,
+      sourceDescription: `claude-mem obs id=${obsId} project=${session.project} type=${obs.type}`,
+      name: `claude-mem-obs-${obsId}`,
+      content: renderKgHubObservationContent(obsId, obs, session),
+      referenceTime: new Date(result.createdAtEpoch).toISOString(),
+      contentSessionId: session.contentSessionId,
+      platformSource: session.platformSource,
+      project: session.project,
+    });
     const chromaStart = Date.now();
 
     dbManager.getChromaSync()?.syncObservation(
@@ -237,6 +250,12 @@ async function syncAndBroadcastObservations(
     });
   }
 
+  void syncObservationsToKgHub({ observations: kgHubObservations }).catch(error => {
+    logger.warn('INGEST', `${agentName} kg-hub sync failed, continuing without KG write`, {
+      observationIds: kgHubObservations.map(obs => obs.id),
+    }, error instanceof Error ? error : undefined);
+  });
+
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
   const settingValue: unknown = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
   const folderClaudeMdEnabled = settingValue === 'true' || settingValue === true;
@@ -259,6 +278,37 @@ async function syncAndBroadcastObservations(
       });
     }
   }
+}
+
+function renderKgHubObservationContent(
+  obsId: number,
+  obs: ParsedObservation,
+  session: ActiveSession
+): string {
+  const lines = [
+    `[${obs.type.toUpperCase()}] ${obs.title || `Observation ${obsId}`}`,
+    obs.subtitle || '',
+    '',
+    `Project: ${session.project}`,
+    `Platform: ${session.platformSource}`,
+    `Content session: ${session.contentSessionId}`,
+    `Claude-mem observation id: ${obsId}`,
+    '',
+    obs.narrative || '',
+  ];
+  if (obs.facts?.length) {
+    lines.push('', 'Facts:', ...obs.facts.map(fact => `- ${fact}`));
+  }
+  if (obs.concepts?.length) {
+    lines.push('', `Concepts: ${obs.concepts.join(', ')}`);
+  }
+  if (obs.files_read?.length) {
+    lines.push('', 'Files read:', ...obs.files_read.map(file => `- ${file}`));
+  }
+  if (obs.files_modified?.length) {
+    lines.push('', 'Files modified:', ...obs.files_modified.map(file => `- ${file}`));
+  }
+  return lines.filter(line => line !== null && line !== undefined).join('\n').trim();
 }
 
 async function syncAndBroadcastSummary(

@@ -24,10 +24,32 @@ interface SemanticContextResponse {
   count: number;
 }
 
+const LOW_VALUE_CURSOR_PROMPTS = new Set([
+  'ok',
+  'okay',
+  'yes',
+  'no',
+  'y',
+  'n',
+  '继续',
+  '再试',
+  '重试',
+  '好',
+  '嗯',
+]);
+
+export function isLowValueCursorPrompt(platformSource: string | undefined, rawPrompt: string | undefined): boolean {
+  if (platformSource !== 'cursor') return false;
+  const prompt = rawPrompt?.trim().toLowerCase() ?? '';
+  if (!prompt || prompt === '[media prompt]') return false;
+  return prompt.length <= 2 || LOW_VALUE_CURSOR_PROMPTS.has(prompt);
+}
+
 export const sessionInitHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     const { sessionId, prompt: rawPrompt } = input;
     const cwd = input.cwd ?? process.cwd();  
+    const platformSource = normalizePlatformSource(input.platform);
 
     if (!sessionId) {
       logger.warn('HOOK', 'session-init: No sessionId provided, skipping (Codex CLI or unknown platform)');
@@ -47,9 +69,15 @@ export const sessionInitHandler: EventHandler = {
     }
 
     const prompt = (!rawPrompt || !rawPrompt.trim()) ? '[media prompt]' : rawPrompt;
+    if (isLowValueCursorPrompt(platformSource, prompt)) {
+      logger.debug('HOOK', 'session-init: skipping low-value Cursor prompt', {
+        contentSessionId: sessionId,
+        promptLength: prompt.trim().length,
+      });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
 
     const project = getProjectContext(cwd).primary;
-    const platformSource = normalizePlatformSource(input.platform);
 
     const runtime = resolveRuntimeContext();
     if (runtime.runtime === 'server-beta') {
