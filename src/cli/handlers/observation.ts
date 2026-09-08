@@ -22,6 +22,7 @@ async function dispatchToWorker(
       contentSessionId: input.sessionId,
       platformSource,
       tool_name: input.toolName,
+      tool_use_id: input.toolUseId,
       tool_input: input.toolInput,
       tool_response: input.toolResponse,
       cwd: input.cwd,
@@ -75,6 +76,7 @@ export const observationHandler: EventHandler = {
         occurredAtEpoch: Date.now(),
         payload: {
           tool_name: toolName,
+          tool_use_id: input.toolUseId,
           tool_input: toolInput,
           tool_response: toolResponse,
           cwd,

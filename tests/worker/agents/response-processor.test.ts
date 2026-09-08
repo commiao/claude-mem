@@ -1286,3 +1286,37 @@ describe('bounded recovery submission', () => {
     } finally {db.close();}
   });
 });
+
+import { spawnSync } from 'node:child_process';
+import { codexAdapter } from '../../../src/cli/adapters/codex.js';
+
+describe('Codex hook recovery identity', () => {
+  test('preserves explicit tool ID or call ID without inventing IDs for legacy input', () => {
+    const base={session_id:'s',cwd:'/repo',hook_event_name:'PostToolUse',tool_name:'Read'};
+    expect(codexAdapter.normalizeInput({...base,tool_use_id:'tool-a',call_id:'call-b'}).toolUseId).toBe('tool-a');
+    expect(codexAdapter.normalizeInput({...base,call_id:'call-b'}).toolUseId).toBe('call-b');
+    expect(codexAdapter.normalizeInput(base).toolUseId).toBeUndefined();
+  });
+
+  test('passes the original ID through actual adapter and observation handler to worker HTTP', () => {
+    // Separate process avoids process-global mock.module contamination.
+    const result=spawnSync(process.execPath,['-e',`
+      import {mock} from 'bun:test';
+      const root=process.cwd();
+      let sent;
+      mock.module(root+'/src/services/hooks/server-client.ts',()=>({isServerClientError:()=>false}));
+      mock.module(root+'/src/shared/worker-utils.ts',()=>({
+        executeWithWorkerFallback:async(route,method,body)=>{sent={route,method,body};return {};},
+        isWorkerFallback:()=>false,
+      }));
+      mock.module(root+'/src/shared/should-track-project.ts',()=>({shouldTrackProject:()=>true}));
+      mock.module(root+'/src/services/hooks/runtime-selector.ts',()=>({resolveRuntimeContext:()=>({runtime:'worker'}),logServerFallback:()=>{}}));
+      const {codexAdapter}=await import(root+'/src/cli/adapters/codex.ts');
+      const {observationHandler}=await import(root+'/src/cli/handlers/observation.ts');
+      const input=codexAdapter.normalizeInput({session_id:'s',cwd:'/repo',tool_name:'Read',tool_input:{path:'test'},tool_response:'ok',tool_use_id:'original-call'});
+      await observationHandler.execute({...input,platform:'codex'});
+      if(sent?.route!=='/api/sessions/observations'||sent?.body?.tool_use_id!=='original-call'||sent?.body?.contentSessionId!=='s')throw new Error('Hook lost identity');
+    `],{cwd:process.cwd(),encoding:'utf8',timeout:20000});
+    expect({status:result.status,error:result.stderr}).toEqual({status:0,error:result.stderr});
+  });
+});
