@@ -1,3 +1,4 @@
+import { completeObservationBatch } from '../RecoveryLedger.js';
 
 import { logger } from '../../../utils/logger.js';
 import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
@@ -399,6 +400,8 @@ export async function processAgentResponse(
 
     // Plain-text skip responses are intentionally ignored. Re-queueing them
     // creates an observer loop where the same low-signal batch is retried.
+    completeObservationBatch(dbManager.getSessionStore().db, session.contentSessionId,
+      sessionManager.getClaimedMessages(session.sessionDbId), 'skipped', () => undefined);
     await sessionManager.confirmClaimedMessages(session.sessionDbId);
     session.earliestPendingTimestamp = null;
     return;
@@ -443,7 +446,7 @@ export async function processAgentResponse(
 
   let result: ReturnType<typeof sessionStore.storeObservations>;
   try {
-    result = sessionStore.storeObservations(
+    result = completeObservationBatch(sessionStore.db, session.contentSessionId, claimedMessages, 'stored', () => sessionStore.storeObservations(
       session.memorySessionId,
       context.project,
       labeledObservations,
@@ -452,7 +455,7 @@ export async function processAgentResponse(
       discoveryTokens,
       originalTimestamp ?? undefined,
       modelId
-    );
+    ));
   } finally {
     session.pendingAgentId = null;
     session.pendingAgentType = null;

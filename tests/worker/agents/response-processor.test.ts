@@ -1,4 +1,5 @@
-import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
+import { SessionManager as RealSessionManager } from '../../../src/services/worker/SessionManager.js';
+import { describe, test, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
 import { existsSync, readFileSync } from 'fs';
 import { logger } from '../../../src/utils/logger.js';
 
@@ -109,6 +110,7 @@ let claimedMessages: Array<{
   type: 'observation' | 'summarize';
   tool_name?: string;
   tool_input?: unknown;
+  toolUseId?: string;
 }> = [];
 let mockGetClaimedMessages: ReturnType<typeof mock>;
 
@@ -533,12 +535,51 @@ describe('ResponseProcessor', () => {
     });
   });
 
+  describe('durable completion integration', () => {
+    it('commits receipts with actual response output and deduplicates after SessionManager restart', async () => {
+      const db = new Database(':memory:');
+      try {
+        db.exec('CREATE TABLE outputs(id)');
+        const store = { ...mockDbManager.getSessionStore(), db,
+          storeObservations: () => { db.run('INSERT INTO outputs VALUES (1)'); return {observationIds: [],summaryId:null,createdAtEpoch:Date.now()}; } };
+        mockDbManager.getSessionStore = () => store as any;
+        claimedMessages = [{type:'observation',toolUseId:'durable-call'}];
+        const session = createMockSession();
+        await processAgentResponse('<observation><type>discovery</type><title>Durable test</title><narrative>Recorded.</narrative></observation>',
+          session,mockDbManager,mockSessionManager,undefined,0,null,'TestAgent');
+        expect(new RecoveryLedger(db).has(session.contentSessionId,'durable-call')).toBe(true);
+        expect(db.query('SELECT * FROM outputs').all()).toHaveLength(1);
+        const restarted = new RealSessionManager(mockDbManager);
+        spyOn(restarted,'initializeSession').mockReturnValue(session);
+        await restarted.queueObservation(1,{tool_name:'Read',tool_input:'{}',tool_response:'{}',prompt_number:1,cwd:'/repo',toolUseId:'durable-call'});
+        expect(restarted.getMessageBuffer().getTotalDepth()).toBe(0);
+      } finally { db.close(); }
+    });
+    it('does not confirm in-memory work if receipt persistence fails', async () => {
+      const db = new Database(':memory:');
+      try {
+        new RecoveryLedger(db);
+        db.exec("CREATE TABLE outputs(id); CREATE TRIGGER reject_receipt BEFORE INSERT ON observation_receipts BEGIN SELECT RAISE(ABORT, 'failure'); END");
+        const store = {...mockDbManager.getSessionStore(),db,storeObservations:()=>{
+          db.run('INSERT INTO outputs VALUES (1)'); return {observationIds:[],summaryId:null,createdAtEpoch:Date.now()};
+        }};
+        mockDbManager.getSessionStore=()=>store as any;
+        claimedMessages=[{type:'observation',toolUseId:'failed-call'}];
+        await expect(processAgentResponse('<observation><type>discovery</type><title>Test</title><narrative>Test</narrative></observation>',
+          createMockSession(),mockDbManager,mockSessionManager,undefined,0,null,'TestAgent')).rejects.toThrow();
+        expect(db.query('SELECT * FROM outputs').all()).toHaveLength(0);
+        expect(mockSessionManager.confirmClaimedMessages).not.toHaveBeenCalled();
+      } finally { db.close(); }
+    });
+  });
+
   describe('non-XML observer responses', () => {
     it('warns and clears pending work when the observer returns non-XML prose', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
       } as unknown as SessionManager;
 
@@ -574,6 +615,7 @@ describe('ResponseProcessor', () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
         resetProcessingToPending,
       } as unknown as SessionManager;
@@ -908,6 +950,7 @@ describe('ResponseProcessor', () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
       } as unknown as SessionManager;
 
@@ -929,6 +972,7 @@ describe('ResponseProcessor', () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
       } as unknown as SessionManager;
 
@@ -1140,5 +1184,105 @@ describe('ResponseProcessor', () => {
 
       expect(session.lastSummaryStored).toBe(false);
     });
+  });
+});
+
+import { Database } from 'bun:sqlite';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RecoveryLedger, completeObservationBatch } from '../../../src/services/worker/RecoveryLedger.js';
+import { readCodexEvents, isCompleted, replayUncompleted } from '../../../src/services/transcripts/recover-codex.js';
+
+describe('durable observation completion cursor', () => {
+  test('result and receipt both roll back when storage fails; only committed IDs survive reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-recovery-'));
+    const file = join(dir, 'test.db');
+    let db = new Database(file);
+    try {
+      db.exec('CREATE TABLE outputs (id TEXT PRIMARY KEY)');
+      const ledger = new RecoveryLedger(db);
+      expect(() => ledger.commit('s', ['a'], 'stored', () => {
+        db.run("INSERT INTO outputs VALUES ('a')"); throw new Error('crash before commit');
+      })).toThrow('crash before commit');
+      expect(ledger.has('s', 'a')).toBe(false);
+      expect(db.query('SELECT * FROM outputs').all()).toHaveLength(0);
+      ledger.commit('s', ['b'], 'stored', () => db.transaction(() => db.run("INSERT INTO outputs VALUES ('b')"))());
+      db.close(); db = new Database(file);
+      const restored = new RecoveryLedger(db);
+      expect(restored.has('s', 'a')).toBe(false);
+      expect(restored.has('s', 'b')).toBe(true);
+      expect(restored.has('other', 'b')).toBe(false);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('receipt write failure rolls back already stored output', () => {
+    const db = new Database(':memory:');
+    try {
+      const ledger = new RecoveryLedger(db);
+      db.exec("CREATE TABLE outputs(id); CREATE TRIGGER fail_receipt BEFORE INSERT ON observation_receipts BEGIN SELECT RAISE(ABORT, 'disk failure'); END");
+      expect(() => ledger.commit('s', ['a'], 'stored', () => db.run('INSERT INTO outputs VALUES (1)'))).toThrow();
+      expect(db.query('SELECT * FROM outputs').all()).toHaveLength(0);
+    } finally { db.close(); }
+  });
+
+  test('skips are durable; no-ID and summary inputs do not invent completion IDs', () => {
+    const db = new Database(':memory:');
+    try {
+      completeObservationBatch(db, 's', [{type:'observation',toolUseId:'a'}, {type:'summarize',toolUseId:'z'}, {type:'observation'}], 'skipped', () => {});
+      const ledger = new RecoveryLedger(db);
+      expect(ledger.has('s', 'a')).toBe(true); expect(ledger.has('s', 'z')).toBe(false);
+      expect(db.query('SELECT outcome FROM observation_receipts').get()).toEqual({outcome:'skipped'});
+    } finally { db.close(); }
+  });
+
+  test('restart scan reconstructs pairs and leaves earlier unfinished holes despite later completion', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-transcript-'));
+    const file = join(dir,'rollout.jsonl'); const db = new Database(':memory:');
+    try {
+      writeFileSync(file, [
+        {type:'session_meta',payload:{id:'s',cwd:'/repo'}},
+        {type:'response_item',payload:{type:'function_call',call_id:'a',name:'read',arguments:'{"path":"中文"}'}},
+        {type:'response_item',payload:{type:'custom_tool_call',call_id:'b',name:'patch',input:'patch text'}},
+        {type:'response_item',timestamp:'2026-09-08',payload:{type:'custom_tool_call_output',call_id:'b',output:'ok'}},
+        {type:'response_item',timestamp:'2026-09-08',payload:{type:'function_call_output',call_id:'a',output:'data'}},
+      ].map(x=>JSON.stringify(x)).join('\n')+'\n');
+      new RecoveryLedger(db).commit('s',['b'],'stored',()=>{});
+      const remaining = [];
+      for await(const e of readCodexEvents(file)) if(!isCompleted(db,e)) remaining.push(e);
+      expect(remaining).toHaveLength(1); expect(remaining[0].toolUseId).toBe('a');
+      expect(remaining[0].toolInput).toEqual({path:'中文'});
+    } finally { db.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  test('malformed tail and unpaired results fail closed', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'mem-bad-')); const file=join(dir,'bad.jsonl');
+    try {
+      for(const content of ['{"type":', JSON.stringify({type:'response_item',payload:{type:'function_call_output',call_id:'missing'}})]) {
+        writeFileSync(file,content);
+        await expect((async()=>{for await(const _ of readCodexEvents(file)) {}})()).rejects.toThrow();
+      }
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+});
+
+
+describe('bounded recovery submission', () => {
+  test('restart repeats only unconfirmed records and never advances on HTTP acceptance alone', async () => {
+    const db = new Database(':memory:');
+    const event = (id: string) => ({contentSessionId:'s',toolUseId:id,toolName:'read',toolInput:{},toolResponse:'ok',cwd:'/repo',platformSource:'codex' as const,timestamp:'2026-09-08'});
+    const events = async function*(){ yield event('a'); yield event('b'); yield event('b'); };
+    try {
+      const ledger = new RecoveryLedger(db);
+      ledger.commit('s',['a'],'stored',()=>{});
+      const submit = mock(async()=>{});
+      const options = {completed:(e:any)=>isCompleted(db,e),select:()=>true,submit,waitForCompletion:async()=>false,limit:10};
+      await expect(replayUncompleted(events(),options)).rejects.toThrow('without durable completion');
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(ledger.has('s','b')).toBe(false);
+      const retry = await replayUncompleted(events(),{...options,waitForCompletion:async(e)=>{ledger.commit('s',[e.toolUseId],'stored',()=>{});return true;}});
+      expect(retry).toEqual({submitted:1,completed:1});
+      expect(await replayUncompleted(events(),options)).toEqual({submitted:0,completed:0});
+    } finally {db.close();}
   });
 });

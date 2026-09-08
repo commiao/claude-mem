@@ -1,3 +1,4 @@
+import { RecoveryLedger } from './RecoveryLedger.js';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
 import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationData } from '../worker-types.js';
@@ -172,6 +173,9 @@ export class SessionManager {
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
+
+    if (data.toolUseId && new RecoveryLedger(this.dbManager.getSessionStore().db)
+      .has(session.contentSessionId, data.toolUseId)) return;
 
     const message: PendingMessage = {
       type: 'observation',
