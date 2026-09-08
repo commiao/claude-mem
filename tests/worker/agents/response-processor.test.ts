@@ -1320,3 +1320,36 @@ describe('Codex hook recovery identity', () => {
     expect({status:result.status,error:result.stderr}).toEqual({status:0,error:result.stderr});
   });
 });
+
+describe('recovery CLI against a local receipt-capable worker', () => {
+  test('submits once, waits for durable receipt, and a second run submits nothing', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'mem-cli-recovery-'));
+    const dbFile=join(dir,'test.db'), transcript=join(dir,'rollout.jsonl');
+    const db=new Database(dbFile);const ledger=new RecoveryLedger(db);
+    let submissions=0;
+    const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(req){
+      if(new URL(req.url).pathname==='/api/health')return Response.json({pid:987654,initialized:true});
+      const body=await req.json() as any;
+      expect(body.tool_use_id).toBe('cli-call');expect(body.contentSessionId).toBe('cli-session');
+      submissions++;
+      ledger.commit(body.contentSessionId,[body.tool_use_id],'stored',()=>{});
+      return Response.json({status:'queued'});
+    }});
+    try {
+      writeFileSync(transcript,[
+        {type:'session_meta',payload:{id:'cli-session',cwd:'/repo'}},
+        {type:'response_item',payload:{type:'function_call',call_id:'cli-call',name:'Read',arguments:'{}'}},
+        {type:'response_item',timestamp:'2026-09-08T10:00:00Z',payload:{type:'function_call_output',call_id:'cli-call',output:'ok'}},
+      ].map(JSON.stringify).join('\n')+'\n');
+      const run=async(pid:string)=>{
+        const child=Bun.spawn([process.execPath,'src/services/transcripts/recover-codex.ts',dbFile,transcript,'--replay','--since','2026-09-08T00:00:00Z','--worker-pid',pid,'--port',String(server.port)],{cwd:process.cwd(),stdout:'pipe',stderr:'pipe'});
+        const [status,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+        return {status,out,err};
+      };
+      expect((await run('1')).status).not.toBe(0); expect(submissions).toBe(0);
+      const first=await run('987654');expect(first.status).toBe(0);expect(first.out).toContain('"submitted":1');
+      const second=await run('987654');expect(second.status).toBe(0);expect(second.out).toContain('"submitted":0');
+      expect(submissions).toBe(1);
+    } finally {server.stop(true);db.close();rmSync(dir,{recursive:true,force:true});}
+  });
+});

@@ -90,22 +90,95 @@ export async function replayUncompleted(
   return { submitted, completed };
 }
 
-// Audit only: no HTTP, no DB writes, no new copy of raw inputs. Actual submission
-// requires an established first-deployment boundary; historical IDs are unknown.
+/** Default is read-only audit. --replay is an explicit, bounded operation.
+ * --since must be an independently established boundary after receipt-enabled
+ * deployment; never use a guessed historical timestamp to seed a cursor.
+ */
 if (import.meta.main) {
-  const [dbPath, ...files] = process.argv.slice(2);
-  if (!dbPath || !files.length) throw new Error('Usage: bun recover-codex.ts DB_PATH TRANSCRIPT...');
+  const args = process.argv.slice(2);
+  const replay = args.includes('--replay');
+  const option = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    if (i < 0) return undefined;
+    if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(`Missing value: ${name}`);
+    return args[i + 1];
+  };
+  const since = option('--since');
+  const expectedPid = Number(option('--worker-pid'));
+  const port = Number(option('--port') ?? '37701');
+  const limit = Number(option('--limit') ?? '20');
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--replay') continue;
+    if (['--since','--worker-pid','--port','--limit'].includes(args[i])) { i++; continue; }
+    if (args[i].startsWith('--')) throw new Error(`Unknown option: ${args[i]}`);
+    positional.push(args[i]);
+  }
+  const [dbPath, ...files] = positional;
+  if (!dbPath || !files.length) throw new Error('Usage: bun recover-codex.ts DB_PATH TRANSCRIPT... [--replay --since ISO_DATE --worker-pid PID --limit N]');
+  const sinceEpoch = since ? Date.parse(since) : undefined;
+  if (since && !Number.isFinite(sinceEpoch)) throw new Error('Invalid --since timestamp');
+  if (replay && (!since || !Number.isInteger(expectedPid) || expectedPid < 1)) throw new Error('Replay requires a verified --since boundary and --worker-pid');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');
   const db = new Database(dbPath, { readonly: true });
+  const selected = (event: RecoveryEvent) => {
+    if (sinceEpoch === undefined) return true;
+    const time = Date.parse(event.timestamp);
+    if (!Number.isFinite(time)) throw new Error('Missing or invalid event timestamp');
+    return time >= sinceEpoch;
+  };
+  const events = async function* () { for (const file of files) yield* readCodexEvents(file); };
   const seen = new Set<string>();
   let completed = 0, unconfirmed = 0;
   try {
-    for (const file of files) for await (const event of readCodexEvents(file)) {
+    // Validate all source files before any submission. Unknown historical IDs
+    // remain unconfirmed; this program never silently seeds them as completed.
+    for await (const event of events()) {
+      if (!selected(event)) continue;
       const key = JSON.stringify([event.contentSessionId, event.toolUseId]);
       if (seen.has(key)) continue;
       seen.add(key);
       if (isCompleted(db, event)) completed++; else unconfirmed++;
     }
     console.log(JSON.stringify({ mode: 'audit', completed, unconfirmed,
-      warning: 'Unconfirmed includes historical events predating receipts; not a replay authorization.' }));
+      warning: 'Unconfirmed includes historical events predating receipts; not proof of missing observations.' }));
+    if (replay) {
+      if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observation_receipts'").get()) {
+        throw new Error('Receipt-enabled worker has not initialized this database; refusing replay');
+      }
+      const base = `http://127.0.0.1:${port}`;
+      const verifyWorker = async () => {
+        const response = await fetch(base + '/api/health', {signal: AbortSignal.timeout(5000)});
+        if (!response.ok) throw new Error('Worker health failed');
+        const health = await response.json() as {pid:number; initialized:boolean};
+        if (health.pid !== expectedPid || !health.initialized) throw new Error('Worker identity changed or is unready; stop and recheck recovery boundary');
+      };
+      await verifyWorker();
+      const result = await replayUncompleted(events(), {
+        completed: event => isCompleted(db,event), select:selected, limit,
+        submit: async event => {
+          await verifyWorker();
+          const response = await fetch(base + '/api/sessions/observations', {
+            method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(10000),
+            body:JSON.stringify({contentSessionId:event.contentSessionId,tool_use_id:event.toolUseId,
+              tool_name:event.toolName,tool_input:event.toolInput,tool_response:event.toolResponse,
+              cwd:event.cwd,platformSource:'codex'}),
+          });
+          if (!response.ok) throw new Error(`Observation submission failed: HTTP ${response.status}`);
+          const body = await response.json() as {status?:string};
+          if (body.status === 'skipped') throw new Error('Observation excluded by current policy; receipt remains unchanged');
+        },
+        waitForCompletion: async event => {
+          const deadline = Date.now() + 120000;
+          while (Date.now() < deadline) {
+            await verifyWorker();
+            if (isCompleted(db,event)) return true;
+            await new Promise(resolve=>setTimeout(resolve,1000));
+          }
+          return false;
+        },
+      });
+      console.log(JSON.stringify({mode:'replay',...result}));
+    }
   } finally { db.close(); }
 }
