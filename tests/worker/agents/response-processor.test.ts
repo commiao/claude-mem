@@ -1353,3 +1353,78 @@ describe('recovery CLI against a local receipt-capable worker', () => {
     } finally {server.stop(true);db.close();rmSync(dir,{recursive:true,force:true});}
   });
 });
+
+import { initializeSourceRecovery, registerSourcePointer, recoverSourcePass, startSourceRecovery } from '../../../src/services/worker/SourceRecovery.js';
+
+describe('durable source references and startup recovery',()=>{
+  for(const platform of ['codex','claude'])test(`${platform}: held event survives reopen and startup recovers only once`,async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'mem-source-')),file=join(dir,'source.jsonl'),dbFile=join(dir,'test.db');
+    let db=new Database(dbFile);let stop:(()=>void)|undefined;
+    try{
+      const entries=platform==='codex'?[
+        {type:'session_meta',payload:{id:'s',cwd:'/repo'}},
+        {type:'response_item',payload:{type:'function_call',call_id:'a',name:'Read',arguments:'{"secret":"source-only"}'}},
+        {type:'response_item',payload:{type:'function_call_output',call_id:'a',output:'source-only-result'}},
+      ]:[
+        {sessionId:'s',type:'assistant',message:{content:[{type:'tool_use',id:'a',name:'Read',input:{secret:'source-only'}}]}},
+        {sessionId:'s',type:'user',message:{content:[{type:'tool_result',tool_use_id:'a',content:'source-only-result'}]}},
+      ];
+      writeFileSync(file,entries.map(JSON.stringify).join('\n')+'\n');
+      initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+      expect(registerSourcePointer(db,{sessionId:'s',toolUseId:'a',transcriptPath:file,platform,cwd:'/repo'})).toBe('held');
+      expect(JSON.stringify(db.query('SELECT * FROM source_event_refs').all())).not.toContain('source-only');
+      db.close();db=new Database(dbFile);
+      let submitted=0;
+      const ingest=async(p:any)=>{submitted++;expect(p.toolInput).toEqual({secret:'source-only'});new RecoveryLedger(db).commit(p.contentSessionId,[p.toolUseId],'stored',()=>{});return {ok:true};};
+      stop=startSourceRecovery(db,ingest,e=>{throw e;});
+      for(let i=0;i<100 && !new RecoveryLedger(db).has('s','a');i++)await new Promise(r=>setTimeout(r,5));
+      expect(submitted).toBe(1);expect(new RecoveryLedger(db).has('s','a')).toBe(true);
+      stop();stop=undefined;
+      expect(await recoverSourcePass(db,ingest)).toEqual({selected:0,submitted:0,errors:0});
+      expect(submitted).toBe(1);
+    }finally{stop?.();db.close();rmSync(dir,{recursive:true,force:true});}
+  });
+  test('hold retains an incomplete source without model submission; a missing file never deletes the pointer',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'mem-source-missing-')),file=join(dir,'source.jsonl'),db=new Database(':memory:');
+    try{
+      initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+      writeFileSync(file,JSON.stringify({type:'response_item',payload:{type:'function_call',call_id:'a',name:'Read',arguments:'{}'}})+'\n');
+      const input={sessionId:'s',toolUseId:'a',transcriptPath:file,platform:'codex',cwd:'/repo'};
+      expect(registerSourcePointer(db,input)).toBe('held');expect(db.query('SELECT * FROM source_event_refs').all()).toHaveLength(1);
+      const incomplete=await recoverSourcePass(db,async()=>{throw new Error('must not submit before result');});
+      expect(incomplete.submitted).toBe(0);expect(new RecoveryLedger(db).has('s','a')).toBe(false);
+      rmSync(file);
+      const result=await recoverSourcePass(db,async()=>{throw new Error('must not submit');});
+      expect(result.errors).toBe(1);expect(db.query('SELECT * FROM source_event_refs').all()).toHaveLength(1);
+      expect(new RecoveryLedger(db).has('s','a')).toBe(false);
+    }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+  });
+});
+
+test('native Codex completed item IDs are recoverable independently of outer functions.exec IDs',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'mem-native-source-')),file=join(dir,'source.jsonl'),db=new Database(':memory:');
+  try{
+    writeFileSync(file,[{type:'session_meta',payload:{id:'s'}},
+      {type:'event_msg',payload:{type:'item_completed',item:{type:'CommandExecution',id:'exec-native',command:['sh','-c','echo test'],cwd:'/repo',stdout:'test',stderr:'',exit_code:0}}},
+      {type:'event_msg',payload:{type:'item_completed',item:{type:'McpToolCall',id:'mcp-native',server:'local',tool:'lookup',arguments:{query:'test'},result:{content:[]}}}},
+    ].map(JSON.stringify).join('\n')+'\n');
+    initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+    for(const id of ['exec-native','mcp-native'])expect(registerSourcePointer(db,{sessionId:'s',toolUseId:id,transcriptPath:file,platform:'codex',cwd:'/repo'})).toBe('held');
+    const ids:string[]=[];
+    const result=await recoverSourcePass(db,async p=>{ids.push(p.toolUseId);return {ok:true};});
+    expect(ids).toEqual(['exec-native','mcp-native']);expect(result.errors).toBe(0);
+  }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('native subagent transcript retains parent hook attribution while resolving child item IDs',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'mem-child-source-')),file=join(dir,'child.jsonl'),db=new Database(':memory:');
+  try{
+    writeFileSync(file,[{type:'session_meta',payload:{id:'copied-parent'}},{type:'session_meta',payload:{id:'child-session'}},
+      {type:'event_msg',payload:{type:'item_completed',item:{type:'CommandExecution',id:'exec-child',command:['echo','ok'],stdout:'ok',stderr:'',exit_code:0}}},
+    ].map(JSON.stringify).join('\n')+'\n');
+    initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+    registerSourcePointer(db,{sessionId:'parent-session',toolUseId:'exec-child',transcriptPath:file,platform:'codex',cwd:'/repo'});
+    let parent='';const result=await recoverSourcePass(db,async p=>{parent=p.contentSessionId;return {ok:true};});
+    expect(parent).toBe('parent-session');expect(result).toEqual({selected:1,submitted:1,errors:0});
+  }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+});

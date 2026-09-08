@@ -1,3 +1,6 @@
+import { registerSourcePointer } from '../../services/worker/SourceRecovery.js';
+import { openConfiguredSqliteDatabase } from '../../services/sqlite/connection.js';
+import { DB_PATH } from '../../shared/paths.js';
 // IO discipline (see src/shared/hook-io.ts): this handler is PURE. It returns a
 // HookResult and MUST NOT call process.stderr.write / process.stdout.write /
 // console.* / process.exit. logger.* calls are DIAGNOSTIC; thrown errors are
@@ -102,6 +105,13 @@ export const observationHandler: EventHandler = {
         }
       }
     }
+
+    const recoveryDb = openConfiguredSqliteDatabase(DB_PATH);
+    try {
+      if (registerSourcePointer(recoveryDb, {...input, platform: platformSource}) === 'held') {
+        return {continue: true, suppressOutput: true};
+      }
+    } finally { recoveryDb.close(); }
 
     return dispatchToWorker(input, platformSource);
   },

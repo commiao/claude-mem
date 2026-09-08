@@ -17,6 +17,7 @@ export const claudeCodeAdapter: PlatformAdapter = {
       cwd,
       prompt: r.prompt,
       toolName: r.tool_name,
+      toolUseId: typeof r.tool_use_id === 'string' ? r.tool_use_id : undefined,
       toolInput: r.tool_input,
       toolResponse: r.tool_response,
       toolUseId: typeof r.tool_use_id === 'string' ? r.tool_use_id : undefined,
