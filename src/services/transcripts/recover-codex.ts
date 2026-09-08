@@ -1,3 +1,4 @@
+import { readReferencedEvents } from '../worker/SourceRecovery.js';
 import { Database } from 'bun:sqlite';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -9,7 +10,7 @@ export interface RecoveryEvent {
   toolInput: unknown;
   toolResponse: unknown;
   cwd: string;
-  platformSource: 'codex';
+  platformSource: string;
   timestamp: string;
 }
 
@@ -127,7 +128,23 @@ if (import.meta.main) {
     if (!Number.isFinite(time)) throw new Error('Missing or invalid event timestamp');
     return time >= sinceEpoch;
   };
-  const events = async function* () { for (const file of files) yield* readCodexEvents(file); };
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('Replay limit must be 1..1000');
+  const events = async function* () {
+    for (const file of files) {
+      if (!replay) {yield* readCodexEvents(file);continue;}
+      // Native hook IDs can differ from outer functions.exec IDs. Manual
+      // replay must use the same registered source IDs as automatic recovery.
+      if (!db.query("SELECT 1 FROM sqlite_master WHERE name='source_event_refs'").get()) throw new Error('No registered source cursor; refusing historical replay');
+      if (!db.query('SELECT 1 FROM source_event_refs WHERE source_path=? LIMIT 1').get(file)) throw new Error('Source is not registered; reconcile historical input separately');
+      const rows=db.query(`SELECT r.* FROM source_event_refs r LEFT JOIN observation_receipts c USING(content_session_id,tool_use_id)
+        WHERE r.source_path=? AND r.registered_at>=? AND c.tool_use_id IS NULL ORDER BY r.registered_at LIMIT ?`).all(file,sinceEpoch??0,limit) as any[];
+      const mapped=new Map(rows.map(r=>[r.tool_use_id,r]));
+      const recovered:RecoveryEvent[]=[];
+      const count=await readReferencedEvents(rows,async p=>{recovered.push({...p,timestamp:new Date(mapped.get(p.toolUseId).registered_at).toISOString()});});
+      if(count!==rows.length)throw new Error('Some registered source results are unavailable; pointers retained');
+      yield* recovered;
+    }
+  };
   const seen = new Set<string>();
   let completed = 0, unconfirmed = 0;
   try {
@@ -162,7 +179,7 @@ if (import.meta.main) {
             method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(10000),
             body:JSON.stringify({contentSessionId:event.contentSessionId,tool_use_id:event.toolUseId,
               tool_name:event.toolName,tool_input:event.toolInput,tool_response:event.toolResponse,
-              cwd:event.cwd,platformSource:'codex'}),
+              cwd:event.cwd,platformSource:event.platformSource}),
           });
           if (!response.ok) throw new Error(`Observation submission failed: HTTP ${response.status}`);
           const body = await response.json() as {status?:string};

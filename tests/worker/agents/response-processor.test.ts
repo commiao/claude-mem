@@ -1341,6 +1341,8 @@ describe('recovery CLI against a local receipt-capable worker', () => {
         {type:'response_item',payload:{type:'function_call',call_id:'cli-call',name:'Read',arguments:'{}'}},
         {type:'response_item',timestamp:'2026-09-08T10:00:00Z',payload:{type:'function_call_output',call_id:'cli-call',output:'ok'}},
       ].map(JSON.stringify).join('\n')+'\n');
+      initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'active')");
+      registerSourcePointer(db,{sessionId:'cli-session',toolUseId:'cli-call',transcriptPath:transcript,platform:'codex',cwd:'/repo'});
       const run=async(pid:string)=>{
         const child=Bun.spawn([process.execPath,'src/services/transcripts/recover-codex.ts',dbFile,transcript,'--replay','--since','2026-09-08T00:00:00Z','--worker-pid',pid,'--port',String(server.port)],{cwd:process.cwd(),stdout:'pipe',stderr:'pipe'});
         const [status,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
@@ -1426,5 +1428,24 @@ test('native subagent transcript retains parent hook attribution while resolving
     registerSourcePointer(db,{sessionId:'parent-session',toolUseId:'exec-child',transcriptPath:file,platform:'codex',cwd:'/repo'});
     let parent='';const result=await recoverSourcePass(db,async p=>{parent=p.contentSessionId;return {ok:true};});
     expect(parent).toBe('parent-session');expect(result).toEqual({selected:1,submitted:1,errors:0});
+  }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('explicit source alias repairs a non-persisted hook ID while retaining its completion identity',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'mem-source-alias-')),file=join(dir,'source.jsonl'),db=new Database(':memory:');
+  try{
+    initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'active')");
+    writeFileSync(file,[{type:'session_meta',payload:{id:'s'}},
+      {type:'response_item',payload:{type:'custom_tool_call',call_id:'persisted-call',name:'exec',input:'readClock()'}},
+      {type:'response_item',payload:{type:'custom_tool_call_output',call_id:'persisted-call',output:'time'}},
+    ].map(JSON.stringify).join('\n')+'\n');
+    registerSourcePointer(db,{sessionId:'s',toolUseId:'ephemeral-hook-id',transcriptPath:file,platform:'codex',cwd:'/repo'});
+    let calls=0;
+    const ingest=async(p:any)=>{calls++;expect(p.toolUseId).toBe('ephemeral-hook-id');new RecoveryLedger(db).commit('s',[p.toolUseId],'stored',()=>{});return {ok:true};};
+    expect((await recoverSourcePass(db,ingest)).submitted).toBe(0);expect(calls).toBe(0);
+    db.query('UPDATE source_event_refs SET source_tool_id=? WHERE tool_use_id=?').run('persisted-call','ephemeral-hook-id');
+    expect((await recoverSourcePass(db,ingest)).submitted).toBe(1);
+    expect(new RecoveryLedger(db).has('s','ephemeral-hook-id')).toBe(true);
+    expect((await recoverSourcePass(db,ingest)).selected).toBe(0);expect(calls).toBe(1);
   }finally{db.close();rmSync(dir,{recursive:true,force:true});}
 });

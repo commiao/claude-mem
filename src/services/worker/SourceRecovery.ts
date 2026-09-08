@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { RecoveryLedger } from './RecoveryLedger.js';
 
 type SourceInput = {sessionId:string;toolUseId?:string;transcriptPath?:string;platform?:string;cwd:string};
-type SourceRow = {content_session_id:string;tool_use_id:string;source_path:string;platform:string;cwd:string};
+type SourceRow = {content_session_id:string;tool_use_id:string;source_path:string;platform:string;cwd:string;source_tool_id?:string|null};
 type Payload = {contentSessionId:string;toolUseId:string;toolName:string;toolInput:unknown;toolResponse:unknown;cwd:string;platformSource:string};
 type IngestResult = {ok:boolean;status?:string;reason?:string};
 
@@ -14,8 +14,10 @@ export function initializeSourceRecovery(db: Database): void {
   db.exec(`CREATE TABLE IF NOT EXISTS source_recovery_control (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL CHECK(mode IN ('hold','active')));
     CREATE TABLE IF NOT EXISTS source_event_refs (
       content_session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, source_path TEXT NOT NULL,
-      platform TEXT NOT NULL, cwd TEXT NOT NULL, registered_at INTEGER NOT NULL, last_attempt_at INTEGER NOT NULL DEFAULT 0,
+      platform TEXT NOT NULL, cwd TEXT NOT NULL, registered_at INTEGER NOT NULL, last_attempt_at INTEGER NOT NULL DEFAULT 0, source_tool_id TEXT,
       PRIMARY KEY(content_session_id, tool_use_id));`);
+  const columns=db.query('PRAGMA table_info(source_event_refs)').all() as {name:string}[];
+  if(!columns.some(c=>c.name==='source_tool_id'))db.exec('ALTER TABLE source_event_refs ADD COLUMN source_tool_id TEXT');
 }
 
 /** Called by hooks before worker submission. Holds contain pointers only. */
@@ -85,7 +87,7 @@ function parseInput(value: unknown): unknown {
 export async function readReferencedEvents(rows: SourceRow[], submit:(payload:Payload)=>Promise<void>): Promise<number> {
   if(!rows.length)return 0;
   const first=rows[0];
-  const wanted=new Map(rows.map(row=>[row.tool_use_id,row]));
+  const wanted=new Map(rows.map(row=>[row.source_tool_id??row.tool_use_id,row]));
   const calls=new Map<string,{name:string;input:unknown}>();
   const stream=createReadStream(first.source_path);
   const lines=createInterface({input:stream,crlfDelay:Infinity});
@@ -107,7 +109,7 @@ export async function readReferencedEvents(rows: SourceRow[], submit:(payload:Pa
         if(!wanted.has(id))continue;
         if(part.type==='source_complete'){
           const row=wanted.get(id)!;
-          await submit({contentSessionId:row.content_session_id,toolUseId:id,toolName:part.name,toolInput:part.input,toolResponse:part.output,cwd:row.cwd,platformSource:row.platform});
+          await submit({contentSessionId:row.content_session_id,toolUseId:row.tool_use_id,toolName:part.name,toolInput:part.input,toolResponse:part.output,cwd:row.cwd,platformSource:row.platform});
           wanted.delete(id);count++;if(!wanted.size)return count;
         } else if(['function_call','custom_tool_call','tool_use'].includes(part.type)) {
           calls.set(id,{name:part.name,input:parseInput(part.arguments??part.input)});
@@ -116,7 +118,7 @@ export async function readReferencedEvents(rows: SourceRow[], submit:(payload:Pa
           // Missing use may be a truncated/forked source. Keep the reference
           // pending instead of treating it as processed.
           if(!call)continue;
-          await submit({contentSessionId:row.content_session_id,toolUseId:id,toolName:call.name,
+          await submit({contentSessionId:row.content_session_id,toolUseId:row.tool_use_id,toolName:call.name,
             toolInput:call.input,toolResponse:part.output??part.content,cwd:row.cwd,platformSource:row.platform});
           wanted.delete(id);calls.delete(id);count++;
           if(!wanted.size)return count;
