@@ -424,6 +424,8 @@ export async function processAgentResponse(
     return;
   }
 
+  // Capture the validated identity before entering the storage callback.
+  const memorySessionId = session.memorySessionId;
   const { observations, summary } = parsed;
   const summaryForStore = normalizeSummaryForStorage(summary);
   const claimedMessages = sessionManager.getClaimedMessages(session.sessionDbId);
@@ -447,7 +449,7 @@ export async function processAgentResponse(
   let result: ReturnType<typeof sessionStore.storeObservations>;
   try {
     result = completeObservationBatch(sessionStore.db, session.contentSessionId, claimedMessages, 'stored', () => sessionStore.storeObservations(
-      session.memorySessionId,
+      memorySessionId,
       context.project,
       labeledObservations,
       summaryForStore,

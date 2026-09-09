@@ -1,5 +1,7 @@
 # T-0065：T-0064 已核实缺陷修复
 
+> 2026-09-09 后续复核已完成：SDK 固定为 0.3.261、6 项类型错误已修复、请求预算增加 JSON 转义和 UTF-8 字节校验。最新结果见文末“后续提交复核”；下方最初验证和上线缺口保留为历史记录，以文末更新为准。
+
 交付状态：可审查源码补丁与离线验证完成，**未部署，尚不满足直接上线条件**。保留主观察提炼和 Graphiti，没有采用已撤回的预压缩开关。
 
 ## 基线与范围
@@ -51,3 +53,68 @@ SDK API 依据：[官方 TypeScript SDK 参考](https://code.claude.com/docs/en/
 5. **回退保护**：旧代码不认识暂缓表，回退后自动来源回放可能重试这些身份；回退必须保留 DB 和暂缓数据、先暂停来源恢复，再恢复备份运行包。不能直接删除暂缓行或清空队列。
 
 没有重启 worker/容器、提高网关限额、启用 503 重试、发外部消息或修改父任务飞书文档。父任务主观察模型必要性的讨论不在本补丁内。
+
+## 后续提交复核（2026-09-09）
+
+核查结论：`cbdebe3` 后遗留的全部源码、测试和两个验证脚本都属于 T-0065 的预部署核验，不是其他任务混入。本次将这些内容纳入一个独立后续提交。没有 reset、checkout 或删除原有文件；未覆盖安装目录、重启服务、变更网关或调用真实模型。
+
+### 纳入理由与审查结论
+
+- `package.json`：把 SDK 范围固定为运行 bundle 中核实的 **0.3.261**。现有根 `node_modules` 是其他源码树的链接，未改写；验证和候选构建显式使用 `artifacts/predeploy/sdk-0.3.261/` 中的隔离安装。仓库根锁文件原本被忽略；此改动只固定 SDK，不宣称所有传递依赖已完整锁定。
+- `install.ts`：三个交互提示返回值中的 symbol 表示取消，按 `typeof === 'symbol'` 排除后保留正常选择的类型收窄，消除原有五项类型错误。
+- `ResponseProcessor.ts`：在已有空值检查之后捕获会话 ID，再交给事务回调，消除剩余一项 nullable 类型错误，不改变 receipt 事务边界。
+- `observer-request-budget.ts` 与 `ClaudeProvider.ts`：网关限制按序列化 messages 计数，原始字符串长度会漏算反斜杠等转义；多字节文字还可能先触达 1 MiB 请求限制。观察、总结以及独立字段压缩的预检计入 JSON 序列化和 UTF-8 字节；保留现有字符上限，额外预留 16 KiB 加每条消息 256 字节的 SDK 封装空间。超大字段压缩请求在 SDK 启动前以 `compression-input-over-budget` 暂缓。该预留是固定版本下的操作预算，**不是精确 token 计数或所有请求形态的上界证明**。
+- 测试：允许显式选择核实过的 SDK；扩大 history fixture 以保持原测试确实走 recycle 而不是单条暂缓；新增转义超限、UTF-8 超限、history 封装预算及压缩前置拒绝四项测试。
+- `scripts/audit-t0065-runtime.ts`：读取既有安装包、发布包和备份 manifest，输出本地比对报告；`scripts/build-t0065-candidate.mjs`：只构建隔离候选文件，显式选择 SDK 0.3.261 并记录输入哈希。二者是本机 T-0065 验证工具，路径依赖本次工作区，不是通用部署命令。
+
+### 已核实与仍待验证的部署条件
+
+- 14:22 的只读网关证据确定 `claude_mem.observation` 路由为 `qwen3.8-flash`，thinking disabled，最大输出 8192；配置中的输入限制为 400000 字符、请求体 1048576 字节。routes 文件 SHA256 为 `55db0e9028010352aec84591fedfb7d9bab28c5111a26f9cf44a5137ce046346`。SDK 别名返回的 200000 context / 32000 output 不代表后端真实容量。[模型官方容量文档](https://help.aliyun.com/en/model-studio/qwen3-8-flash)与网关操作限制需要分别理解。
+- 同次健康检查报告 `idempotency_outcome_unresolved` 和 `provider_state_write_failed`，`effective_limits` 为空；不能宣称网关健康或已完成线上有效限额验收。本轮未清理这些状态。
+- 已核实运行 SDK **0.3.261**、配置使用的 Claude CLI **2.1.126**。此前本地假 API 捕获这两者的实际请求，ASCII、反斜杠和中文三组输入都落在新增封装预留内；没有发送到真实模型。SDK 包自带的可选 CLI 与实际配置的 CLI 版本不同，因此证据以 `capture-live-cli-*` 为准。
+- 安装包仍为 `8ecaa147ff31bb11f3a71b8d277bee0c08139c9a1a2ea6ef4ab15ae8636fed47`，与记录的最终发布包一致。本次重新运行审计：原 7007 个顶层声明有 6998 个不变、9 个变更，另有 3 个恢复辅助声明；7 组备份 manifest 哈希均匹配。变更映射为 FIFO 槽位、Claude/Codex 原生工具 ID、dispatch 身份、来源指针 hook、SessionManager 去重、ResponseProcessor 原子 receipt、WorkerService 启停恢复；相关路径包含在下面的回归中。该结构比对加回归并非任意生产流量上的完全等价证明。
+- 质量灰度、精确 token 容量验收及回退保护仍然适用。当前交付是可审查代码与隔离候选包，**未部署**。
+
+### 本次复跑
+
+类型检查均返回 0：
+
+```sh
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/tsc --noEmit -p src/ui/viewer
+./node_modules/.bin/tsc --noEmit -p artifacts/predeploy/tsconfig-sdk-0261.json
+```
+
+第三条将 SDK 类型显式映射到隔离的 0.3.261 声明。回归使用该版本 SDK，并将测试子进程的 HOME 指向新建临时目录，避免写入真实 Cursor 数据；命令如下（完整命令与临时目录记录在 `artifacts/predeploy/review-test-command.txt`）：
+
+```sh
+T0065_SDK_ENTRY="$PWD/artifacts/predeploy/sdk-0.3.261/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs" bun test \
+  tests/install-non-tty.test.ts tests/install-disable-auto-memory.test.ts \
+  tests/transcripts/processor-codex-context.test.ts tests/transcripts/watcher-start-at-end.test.ts \
+  tests/transcripts/match-rule-negation.test.ts tests/transcripts/cli-dispatch.test.ts \
+  tests/transcripts/observed-model-extraction.test.ts tests/transcripts/cursor-extraction.test.ts \
+  tests/transcripts/config.test.ts tests/transcripts/grok-bot-config.test.ts \
+  tests/shared/observer-recycle.test.ts tests/shared/observer-request-budget.test.ts \
+  tests/sdk/prompts.test.ts tests/worker/field-optimizer.test.ts \
+  tests/worker/provider-classifiers.test.ts tests/worker/t0064-quality.test.ts \
+  tests/worker/overflow-recycle-resume.test.ts tests/worker/session-manager-null-prompt.test.ts \
+  tests/worker/session-manager-project.test.ts tests/supervisor \
+  tests/cli/adapters/claude-code-subagent.test.ts tests/cli/adapters/codex-file-context.test.ts \
+  tests/worker/agents/response-processor.test.ts tests/services/worker/session-message-buffer.test.ts
+```
+
+结果：**362 pass / 0 fail，29 文件，929 断言**。首次沙箱执行的 6 项失败来自 Cursor 测试目录写权限、进程身份读取及本地端口监听限制；允许测试所需权限并隔离 HOME 后全部通过。此处的 6 项测试环境失败与已修复的 6 项 TypeScript 基线错误是两回事。
+
+以下也全部成功：
+
+```sh
+node scripts/check-spawn-env-discipline.cjs
+bun scripts/audit-t0065-runtime.ts
+node scripts/build-t0065-candidate.mjs
+node --check artifacts/predeploy/candidate/scripts/worker-service.cjs
+git diff --check
+```
+
+历史 356 样本回放证据仍在：136 份规范化、19 份免压缩候选，旧 5 份二次截断反例为 4 暂缓 / 1 完整接纳；本次仅新增压缩输入预检测试，没有把历史回放说成新的线上调用。
+
+`artifacts/` 保留为未跟踪证据，包括先前补丁、历史回放、只读现场快照、假 API 捕获、SDK 隔离安装和构建产物。本次不将整个目录提交：其中含临时依赖、二进制和本机数据，源码审查不需要这些进入版本库。没有删除或覆盖原有报告日志；复跑结果使用 `review-*` 文件，构建和审计工具的固定输出路径会更新本地衍生产物。核心结果已写入本报告，原始输出可在本机复查。

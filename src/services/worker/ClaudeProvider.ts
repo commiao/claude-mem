@@ -1,3 +1,4 @@
+import { exceedsObservationRequestBudget } from '../../shared/observer-request-budget.js';
 import { createFieldProcessOwner } from './field-process-owner.js';
 import { ObservationPreparationError } from '../../sdk/observation-field.js';
 import { deferObservation } from './deferred-observations.js';
@@ -34,7 +35,6 @@ import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
 import { ClassifiedProviderError } from './provider-errors.js';
 import { resolveTierAlias } from './model-aliases.js';
 import {
-  shouldRecycleConversation,
   conversationChars,
   resolveConversationMaxChars,
 } from '../../shared/observer-recycle.js';
@@ -526,10 +526,14 @@ export class ClaudeProvider {
     claudePath: string,
     signal?: AbortSignal,
   ): Promise<string | null> {
+    const compressionPrompt = buildFieldCompressionPrompt(text, budgetChars);
+    if (exceedsObservationRequestBudget([], compressionPrompt, this.conversationMaxChars())) {
+      throw new ObservationPreparationError('compression-input-over-budget');
+    }
     const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
     const processOwner = createFieldProcessOwner();
     return runStandaloneFieldQuery(controller => query({
-      prompt: buildFieldCompressionPrompt(text, budgetChars),
+      prompt: compressionPrompt,
       options: {
         ...buildHardenedSdkOptions({
           source: 'Observer', sessionDbId: session.sessionDbId,
@@ -624,11 +628,11 @@ export class ClaudeProvider {
           deferObservation(this.dbManager.getSessionStore().db, session, this.sessionManager, message, error.reason);
           continue;
         }
-        if (initPrompt.length + obsPrompt.length >= this.conversationMaxChars()) {
+        if (exceedsObservationRequestBudget([{ role: 'user', content: initPrompt }], obsPrompt, this.conversationMaxChars())) {
           deferObservation(this.dbManager.getSessionStore().db, session, this.sessionManager, message, 'single-observation-exceeds-generation-budget');
           continue;
         }
-        if (shouldRecycleConversation(session.conversationHistory, this.conversationMaxChars(), obsPrompt)) {
+        if (exceedsObservationRequestBudget(session.conversationHistory, obsPrompt, this.conversationMaxChars())) {
           await recycleObserverConversation(session, this.sessionManager, worker, 'budget',
             `history plus incoming observation: ${conversationChars(session.conversationHistory) + obsPrompt.length} chars (operational limit)`);
           return;
@@ -657,7 +661,7 @@ export class ClaudeProvider {
           user_prompt: session.userPrompt,
           last_assistant_message: message.last_assistant_message || ''
         }, mode);
-        if (shouldRecycleConversation(session.conversationHistory, this.conversationMaxChars(), summaryPrompt)) {
+        if (exceedsObservationRequestBudget(session.conversationHistory, summaryPrompt, this.conversationMaxChars())) {
           await recycleObserverConversation(session, this.sessionManager, worker, 'budget', 'history plus incoming summary exceeds operational limit');
           return;
         }

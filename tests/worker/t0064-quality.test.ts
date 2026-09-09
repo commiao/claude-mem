@@ -13,6 +13,15 @@ import { initializeSourceRecovery, recoverSourcePass } from '../../src/services/
 import { RecoveryLedger } from '../../src/services/worker/RecoveryLedger.js';
 const ctx = { sessionDbId: 1, field: 'outcome', toolName: 'Bash', strict: true };
 const markers = ['approved plan must remain outside candidate-mounted directories', 'configuration publication requires durable current Compose identity'];
+it('rejects an oversized compression request before requiring SDK session or executable', async () => {
+  const { ClaudeProvider } = await import('../../src/services/worker/ClaudeProvider.js');
+  const provider = new ClaudeProvider({} as any, {} as any) as any;
+  provider.conversationMaxChars = () => 400000;
+  // Raw text fits; JSON escaping exceeds admission. No usable SDK context is
+  // supplied, so the typed preparation error must come from the preflight.
+  await expect(provider.compressField('\\'.repeat(210000), 12800, undefined, 'offline', '/nonexistent'))
+    .rejects.toThrow('compression-input-over-budget');
+});
 function prompt(value: unknown) {
   return buildObservationPrompt({ id: 1, tool_name: 'Bash', tool_input: '{}', tool_output: JSON.stringify(value), created_at_epoch: 0 } as any, true);
 }
@@ -158,14 +167,14 @@ describe('T-0064 actual Claude message generator', () => {
     const { ClaudeProvider } = await import('../../src/services/worker/ClaudeProvider.js');
     const db = new Database(':memory:');
     const session = { sessionDbId: 1, contentSessionId: 'budget-test', project: 'test', userPrompt: 'test', lastPromptNumber: 1,
-      conversationHistory: [{ role: 'assistant', content: 'h'.repeat(12000) }], claimedMessageIds: [42], abortController: new AbortController() } as any;
+      conversationHistory: [{ role: 'assistant', content: 'h'.repeat(50000) }], claimedMessageIds: [42], abortController: new AbortController() } as any;
     let reset = 0;
     const manager = { async *getMessageIterator() { yield { type: 'observation', _persistentId: 42, toolUseId: 'stable', tool_name: 'Bash', tool_input: {}, tool_response: 'result' }; },
       async resetProcessingToPending() { reset++; session.claimedMessageIds = []; } } as any;
     const provider = new ClaudeProvider({ getSessionStore: () => ({ db }) } as any, manager) as any;
     const generator = provider.createMessageGenerator(session, {}, { current: {} }, undefined, async () => null);
     const first = await generator.next();
-    provider.conversationMaxChars = () => first.value.message.content.length + 12001;
+    provider.conversationMaxChars = () => first.value.message.content.length + 50001;
     expect((await generator.next()).done).toBe(true);
     expect(reset).toBe(1); expect(session.abortReason).toBe('overflow:recycle');
     expect(new RecoveryLedger(db).has('budget-test', 'stable')).toBe(false);
@@ -216,7 +225,7 @@ it('does not remove a queued identity when persisting deferral fails', () => {
 });
 
 it('installed SDK cancellation reaps a real subprocess without contacting a model', async () => {
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const { query } = await import(process.env.T0065_SDK_ENTRY || '@anthropic-ai/claude-agent-sdk');
   const { createFieldProcessOwner } = await import('../../src/services/worker/field-process-owner.js');
   const owner = createFieldProcessOwner(), parent = new AbortController();
   let child: any;
@@ -225,7 +234,7 @@ it('installed SDK cancellation reaps a real subprocess without contacting a mode
       prompt: 'offline lifecycle test',
       options: {
         abortController: controller, pathToClaudeCodeExecutable: process.execPath,
-        spawnClaudeCodeProcess: options => {
+        spawnClaudeCodeProcess: (options: import('@anthropic-ai/claude-agent-sdk').SpawnOptions) => {
           child = owner.spawn({ ...options, command: process.execPath,
             args: ['-e', 'process.stdin.resume(); setInterval(() => {}, 1000)'] });
           return child;
