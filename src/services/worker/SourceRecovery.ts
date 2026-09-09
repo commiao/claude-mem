@@ -1,3 +1,4 @@
+import { initializeDeferredObservations } from './deferred-observations.js';
 import type { Database } from 'bun:sqlite';
 import { createReadStream, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
@@ -7,10 +8,11 @@ import { RecoveryLedger } from './RecoveryLedger.js';
 type SourceInput = {sessionId:string;toolUseId?:string;transcriptPath?:string;platform?:string;cwd:string};
 type SourceRow = {content_session_id:string;tool_use_id:string;source_path:string;platform:string;cwd:string;source_tool_id?:string|null};
 type Payload = {contentSessionId:string;toolUseId:string;toolName:string;toolInput:unknown;toolResponse:unknown;cwd:string;platformSource:string};
-type IngestResult = {ok:boolean;status?:string;reason?:string};
+type IngestResult = {ok:boolean;status?:string|number;reason?:string};
 
 export function initializeSourceRecovery(db: Database): void {
   new RecoveryLedger(db);
+  initializeDeferredObservations(db);
   db.exec(`CREATE TABLE IF NOT EXISTS source_recovery_control (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL CHECK(mode IN ('hold','active')));
     CREATE TABLE IF NOT EXISTS source_event_refs (
       content_session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, source_path TEXT NOT NULL,
@@ -132,7 +134,7 @@ export async function readReferencedEvents(rows: SourceRow[], submit:(payload:Pa
 export async function recoverSourcePass(db:Database,ingest:(p:Payload)=>Promise<IngestResult>,limit=100):Promise<{selected:number;submitted:number;errors:number}> {
   const rows=db.query(`SELECT r.* FROM source_event_refs r LEFT JOIN observation_receipts c
     ON c.content_session_id=r.content_session_id AND c.tool_use_id=r.tool_use_id
-    WHERE c.tool_use_id IS NULL ORDER BY r.last_attempt_at,r.registered_at,r.rowid LIMIT ?`).all(limit) as SourceRow[];
+    WHERE c.tool_use_id IS NULL AND NOT EXISTS (SELECT 1 FROM deferred_observations d WHERE d.content_session_id=r.content_session_id AND d.tool_use_id=r.tool_use_id) ORDER BY r.last_attempt_at,r.registered_at,r.rowid LIMIT ?`).all(limit) as SourceRow[];
   const groups=new Map<string,SourceRow[]>();
   for(const row of rows){const key=JSON.stringify([row.source_path,row.content_session_id]);const list=groups.get(key)??[];list.push(row);groups.set(key,list);}
   let submitted=0,errors=0;

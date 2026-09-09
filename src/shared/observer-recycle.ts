@@ -22,10 +22,9 @@ import type { ConversationMessage } from '../services/worker-types.js';
 /**
  * Character budget for one observer generation.
  *
- * ~4 chars/token puts 400k chars near 100k tokens — half of a 200k window, so a
- * generation retires with room to spare rather than discovering the ceiling by
- * being refused at it. Narrower-window models are covered by the reactive
- * overflow path, which recycles on the provider's actual refusal.
+ * Operational character limit only; this is NOT a model context capacity.
+ * Gateway aliases may route to models with different token windows. Model
+ * capacity must be established separately; chars/token ratios are not bounds.
  */
 export const OBSERVER_CONVERSATION_MAX_CHARS = 400_000;
 
@@ -48,8 +47,9 @@ export function conversationChars(history: ConversationMessage[]): number {
 export function shouldRecycleConversation(
   history: ConversationMessage[],
   maxChars: number = OBSERVER_CONVERSATION_MAX_CHARS,
+  incoming = '',
 ): boolean {
-  return conversationChars(history) >= maxChars;
+  return conversationChars(history) + incoming.length >= maxChars;
 }
 
 /**

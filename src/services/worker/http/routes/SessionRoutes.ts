@@ -1,3 +1,4 @@
+import { initializeDeferredObservations, retryDeferredObservation } from '../../deferred-observations.js';
 
 import express, { Request, Response } from 'express';
 import { z } from 'zod';
@@ -420,6 +421,28 @@ export class SessionRoutes extends BaseRouteHandler {
   }
 
   setupRoutes(app: express.Application): void {
+    app.get('/api/observations/deferred', (_req, res) => {
+      const db = this.dbManager.getSessionStore().db;
+      initializeDeferredObservations(db);
+      res.json(db.query('SELECT content_session_id, tool_use_id, reason, deferred_at FROM deferred_observations ORDER BY deferred_at LIMIT 100').all());
+    });
+    app.post('/api/observations/deferred/retry', validateBody(z.object({
+      sessionDbId: z.number().int().positive(), contentSessionId: z.string().min(1),
+      toolUseId: z.string().min(1), reviewedReason: z.string().min(1),
+    })), async (req, res) => {
+      try {
+        const { sessionDbId, contentSessionId, toolUseId, reviewedReason } = req.body;
+        const stored = this.dbManager.getSessionStore().getSessionById(sessionDbId);
+        if (!stored || stored.content_session_id !== contentSessionId) {
+          res.status(409).json({ error: 'Session identity mismatch' }); return;
+        }
+        const session = this.sessionManager.initializeSession(sessionDbId);
+        const messageId = retryDeferredObservation(this.dbManager.getSessionStore().db, session, this.sessionManager, toolUseId);
+        logger.info('SDK', 'Explicit deferred observation retry', { sessionId: sessionDbId, toolUseId, reviewedReason });
+        if (messageId) await this.ensureGeneratorRunning(sessionDbId, 'explicit-deferred-retry');
+        res.json({ messageId, status: messageId ? 'queued' : 'already-completed' });
+      } catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
+    });
     app.post(
       '/api/sessions/init',
       validateBody(SessionRoutes.sessionInitByClaudeIdSchema),

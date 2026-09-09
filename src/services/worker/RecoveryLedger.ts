@@ -22,6 +22,9 @@ export class RecoveryLedger {
       const result = store();
       const insert = this.db.query('INSERT OR IGNORE INTO observation_receipts VALUES (?, ?, ?, ?)');
       for (const id of new Set(toolIds)) insert.run(sessionId, id, outcome, Date.now());
+      if (this.db.query("SELECT 1 FROM sqlite_master WHERE name='deferred_observations'").get()) {
+        for (const id of new Set(toolIds)) this.db.query('DELETE FROM deferred_observations WHERE content_session_id=? AND tool_use_id=?').run(sessionId, id);
+      }
       return result;
     })();
   }
