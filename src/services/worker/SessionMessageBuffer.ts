@@ -70,6 +70,17 @@ export class SessionMessageBuffer {
     return id;
   }
 
+  /** Explicit recovery only: allow the same deferred identity back once.
+   * Existing queued/claimed work wins, so repeated operator actions are safe. */
+  restoreDeferred(sessionDbId: number, message: PendingMessage): number {
+    if (message.toolUseId) {
+      const existing = this.getList(sessionDbId).find(m => m.message.toolUseId === message.toolUseId);
+      if (existing) return existing.id;
+      this.getSeen(sessionDbId).delete(message.toolUseId);
+    }
+    return this.enqueue(sessionDbId, message);
+  }
+
   /** Remove a stored message by id. Returns 1 if found, 0 otherwise. */
   confirm(messageId: number): number {
     for (const list of this.buffers.values()) {

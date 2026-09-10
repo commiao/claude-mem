@@ -497,7 +497,9 @@ function getActiveSdkCount(): number {
 }
 
 function notifySlotAvailable(): void {
-  const waiter = slotWaiters.shift();
+  // Keep the oldest waiter at the head until it is granted or aborted.
+  // Periodic capacity checks must not rotate a full pool's queue.
+  const waiter = slotWaiters[0];
   if (waiter) waiter();
 }
 
@@ -544,8 +546,6 @@ export async function waitForSlot(maxConcurrent: number, signal?: AbortSignal): 
       if (count < maxConcurrent) {
         cleanup();
         resolve(takeSlotReservation());
-      } else {
-        slotWaiters.push(onSlot);
       }
     };
 

@@ -1,4 +1,5 @@
-import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
+import { SessionManager as RealSessionManager } from '../../../src/services/worker/SessionManager.js';
+import { describe, test, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
 import { existsSync, readFileSync } from 'fs';
 import { logger } from '../../../src/utils/logger.js';
 
@@ -109,6 +110,7 @@ let claimedMessages: Array<{
   type: 'observation' | 'summarize';
   tool_name?: string;
   tool_input?: unknown;
+  toolUseId?: string;
 }> = [];
 let mockGetClaimedMessages: ReturnType<typeof mock>;
 
@@ -533,12 +535,51 @@ describe('ResponseProcessor', () => {
     });
   });
 
+  describe('durable completion integration', () => {
+    it('commits receipts with actual response output and deduplicates after SessionManager restart', async () => {
+      const db = new Database(':memory:');
+      try {
+        db.exec('CREATE TABLE outputs(id)');
+        const store = { ...mockDbManager.getSessionStore(), db,
+          storeObservations: () => { db.run('INSERT INTO outputs VALUES (1)'); return {observationIds: [],summaryId:null,createdAtEpoch:Date.now()}; } };
+        mockDbManager.getSessionStore = () => store as any;
+        claimedMessages = [{type:'observation',toolUseId:'durable-call'}];
+        const session = createMockSession();
+        await processAgentResponse('<observation><type>discovery</type><title>Durable test</title><narrative>Recorded.</narrative></observation>',
+          session,mockDbManager,mockSessionManager,undefined,0,null,'TestAgent');
+        expect(new RecoveryLedger(db).has(session.contentSessionId,'durable-call')).toBe(true);
+        expect(db.query('SELECT * FROM outputs').all()).toHaveLength(1);
+        const restarted = new RealSessionManager(mockDbManager);
+        spyOn(restarted,'initializeSession').mockReturnValue(session);
+        await restarted.queueObservation(1,{tool_name:'Read',tool_input:'{}',tool_response:'{}',prompt_number:1,cwd:'/repo',toolUseId:'durable-call'});
+        expect(restarted.getMessageBuffer().getTotalDepth()).toBe(0);
+      } finally { db.close(); }
+    });
+    it('does not confirm in-memory work if receipt persistence fails', async () => {
+      const db = new Database(':memory:');
+      try {
+        new RecoveryLedger(db);
+        db.exec("CREATE TABLE outputs(id); CREATE TRIGGER reject_receipt BEFORE INSERT ON observation_receipts BEGIN SELECT RAISE(ABORT, 'failure'); END");
+        const store = {...mockDbManager.getSessionStore(),db,storeObservations:()=>{
+          db.run('INSERT INTO outputs VALUES (1)'); return {observationIds:[],summaryId:null,createdAtEpoch:Date.now()};
+        }};
+        mockDbManager.getSessionStore=()=>store as any;
+        claimedMessages=[{type:'observation',toolUseId:'failed-call'}];
+        await expect(processAgentResponse('<observation><type>discovery</type><title>Test</title><narrative>Test</narrative></observation>',
+          createMockSession(),mockDbManager,mockSessionManager,undefined,0,null,'TestAgent')).rejects.toThrow();
+        expect(db.query('SELECT * FROM outputs').all()).toHaveLength(0);
+        expect(mockSessionManager.confirmClaimedMessages).not.toHaveBeenCalled();
+      } finally { db.close(); }
+    });
+  });
+
   describe('non-XML observer responses', () => {
     it('warns and clears pending work when the observer returns non-XML prose', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
       } as unknown as SessionManager;
 
@@ -574,6 +615,7 @@ describe('ResponseProcessor', () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
         resetProcessingToPending,
       } as unknown as SessionManager;
@@ -908,6 +950,7 @@ describe('ResponseProcessor', () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
       } as unknown as SessionManager;
 
@@ -929,6 +972,7 @@ describe('ResponseProcessor', () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        getClaimedMessages: mockGetClaimedMessages,
         confirmClaimedMessages,
       } as unknown as SessionManager;
 
@@ -1141,4 +1185,267 @@ describe('ResponseProcessor', () => {
       expect(session.lastSummaryStored).toBe(false);
     });
   });
+});
+
+import { Database } from 'bun:sqlite';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RecoveryLedger, completeObservationBatch } from '../../../src/services/worker/RecoveryLedger.js';
+import { readCodexEvents, isCompleted, replayUncompleted } from '../../../src/services/transcripts/recover-codex.js';
+
+describe('durable observation completion cursor', () => {
+  test('result and receipt both roll back when storage fails; only committed IDs survive reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-recovery-'));
+    const file = join(dir, 'test.db');
+    let db = new Database(file);
+    try {
+      db.exec('CREATE TABLE outputs (id TEXT PRIMARY KEY)');
+      const ledger = new RecoveryLedger(db);
+      expect(() => ledger.commit('s', ['a'], 'stored', () => {
+        db.run("INSERT INTO outputs VALUES ('a')"); throw new Error('crash before commit');
+      })).toThrow('crash before commit');
+      expect(ledger.has('s', 'a')).toBe(false);
+      expect(db.query('SELECT * FROM outputs').all()).toHaveLength(0);
+      ledger.commit('s', ['b'], 'stored', () => db.transaction(() => db.run("INSERT INTO outputs VALUES ('b')"))());
+      db.close(); db = new Database(file);
+      const restored = new RecoveryLedger(db);
+      expect(restored.has('s', 'a')).toBe(false);
+      expect(restored.has('s', 'b')).toBe(true);
+      expect(restored.has('other', 'b')).toBe(false);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('receipt write failure rolls back already stored output', () => {
+    const db = new Database(':memory:');
+    try {
+      const ledger = new RecoveryLedger(db);
+      db.exec("CREATE TABLE outputs(id); CREATE TRIGGER fail_receipt BEFORE INSERT ON observation_receipts BEGIN SELECT RAISE(ABORT, 'disk failure'); END");
+      expect(() => ledger.commit('s', ['a'], 'stored', () => db.run('INSERT INTO outputs VALUES (1)'))).toThrow();
+      expect(db.query('SELECT * FROM outputs').all()).toHaveLength(0);
+    } finally { db.close(); }
+  });
+
+  test('skips are durable; no-ID and summary inputs do not invent completion IDs', () => {
+    const db = new Database(':memory:');
+    try {
+      completeObservationBatch(db, 's', [{type:'observation',toolUseId:'a'}, {type:'summarize',toolUseId:'z'}, {type:'observation'}], 'skipped', () => {});
+      const ledger = new RecoveryLedger(db);
+      expect(ledger.has('s', 'a')).toBe(true); expect(ledger.has('s', 'z')).toBe(false);
+      expect(db.query('SELECT outcome FROM observation_receipts').get()).toEqual({outcome:'skipped'});
+    } finally { db.close(); }
+  });
+
+  test('restart scan reconstructs pairs and leaves earlier unfinished holes despite later completion', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-transcript-'));
+    const file = join(dir,'rollout.jsonl'); const db = new Database(':memory:');
+    try {
+      writeFileSync(file, [
+        {type:'session_meta',payload:{id:'s',cwd:'/repo'}},
+        {type:'response_item',payload:{type:'function_call',call_id:'a',name:'read',arguments:'{"path":"中文"}'}},
+        {type:'response_item',payload:{type:'custom_tool_call',call_id:'b',name:'patch',input:'patch text'}},
+        {type:'response_item',timestamp:'2026-09-08',payload:{type:'custom_tool_call_output',call_id:'b',output:'ok'}},
+        {type:'response_item',timestamp:'2026-09-08',payload:{type:'function_call_output',call_id:'a',output:'data'}},
+      ].map(x=>JSON.stringify(x)).join('\n')+'\n');
+      new RecoveryLedger(db).commit('s',['b'],'stored',()=>{});
+      const remaining = [];
+      for await(const e of readCodexEvents(file)) if(!isCompleted(db,e)) remaining.push(e);
+      expect(remaining).toHaveLength(1); expect(remaining[0].toolUseId).toBe('a');
+      expect(remaining[0].toolInput).toEqual({path:'中文'});
+    } finally { db.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  test('malformed tail and unpaired results fail closed', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'mem-bad-')); const file=join(dir,'bad.jsonl');
+    try {
+      for(const content of ['{"type":', JSON.stringify({type:'response_item',payload:{type:'function_call_output',call_id:'missing'}})]) {
+        writeFileSync(file,content);
+        await expect((async()=>{for await(const _ of readCodexEvents(file)) {}})()).rejects.toThrow();
+      }
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+});
+
+
+describe('bounded recovery submission', () => {
+  test('restart repeats only unconfirmed records and never advances on HTTP acceptance alone', async () => {
+    const db = new Database(':memory:');
+    const event = (id: string) => ({contentSessionId:'s',toolUseId:id,toolName:'read',toolInput:{},toolResponse:'ok',cwd:'/repo',platformSource:'codex' as const,timestamp:'2026-09-08'});
+    const events = async function*(){ yield event('a'); yield event('b'); yield event('b'); };
+    try {
+      const ledger = new RecoveryLedger(db);
+      ledger.commit('s',['a'],'stored',()=>{});
+      const submit = mock(async()=>{});
+      const options = {completed:(e:any)=>isCompleted(db,e),select:()=>true,submit,waitForCompletion:async()=>false,limit:10};
+      await expect(replayUncompleted(events(),options)).rejects.toThrow('without durable completion');
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(ledger.has('s','b')).toBe(false);
+      const retry = await replayUncompleted(events(),{...options,waitForCompletion:async(e)=>{ledger.commit('s',[e.toolUseId],'stored',()=>{});return true;}});
+      expect(retry).toEqual({submitted:1,completed:1});
+      expect(await replayUncompleted(events(),options)).toEqual({submitted:0,completed:0});
+    } finally {db.close();}
+  });
+});
+
+import { spawnSync } from 'node:child_process';
+import { codexAdapter } from '../../../src/cli/adapters/codex.js';
+
+describe('Codex hook recovery identity', () => {
+  test('preserves explicit tool ID or call ID without inventing IDs for legacy input', () => {
+    const base={session_id:'s',cwd:'/repo',hook_event_name:'PostToolUse',tool_name:'Read'};
+    expect(codexAdapter.normalizeInput({...base,tool_use_id:'tool-a',call_id:'call-b'}).toolUseId).toBe('tool-a');
+    expect(codexAdapter.normalizeInput({...base,call_id:'call-b'}).toolUseId).toBe('call-b');
+    expect(codexAdapter.normalizeInput(base).toolUseId).toBeUndefined();
+  });
+
+  test('passes the original ID through actual adapter and observation handler to worker HTTP', () => {
+    // Separate process avoids process-global mock.module contamination.
+    const result=spawnSync(process.execPath,['-e',`
+      import {mock} from 'bun:test';
+      const root=process.cwd();
+      let sent;
+      mock.module(root+'/src/services/hooks/server-client.ts',()=>({isServerClientError:()=>false}));
+      mock.module(root+'/src/shared/worker-utils.ts',()=>({
+        executeWithWorkerFallback:async(route,method,body)=>{sent={route,method,body};return {};},
+        isWorkerFallback:()=>false,
+      }));
+      mock.module(root+'/src/shared/should-track-project.ts',()=>({shouldTrackProject:()=>true}));
+      mock.module(root+'/src/services/hooks/runtime-selector.ts',()=>({resolveRuntimeContext:()=>({runtime:'worker'}),logServerFallback:()=>{}}));
+      const {codexAdapter}=await import(root+'/src/cli/adapters/codex.ts');
+      const {observationHandler}=await import(root+'/src/cli/handlers/observation.ts');
+      const input=codexAdapter.normalizeInput({session_id:'s',cwd:'/repo',tool_name:'Read',tool_input:{path:'test'},tool_response:'ok',tool_use_id:'original-call'});
+      await observationHandler.execute({...input,platform:'codex'});
+      if(sent?.route!=='/api/sessions/observations'||sent?.body?.tool_use_id!=='original-call'||sent?.body?.contentSessionId!=='s')throw new Error('Hook lost identity');
+    `],{cwd:process.cwd(),encoding:'utf8',timeout:20000});
+    expect({status:result.status,error:result.stderr}).toEqual({status:0,error:result.stderr});
+  });
+});
+
+describe('recovery CLI against a local receipt-capable worker', () => {
+  test('submits once, waits for durable receipt, and a second run submits nothing', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'mem-cli-recovery-'));
+    const dbFile=join(dir,'test.db'), transcript=join(dir,'rollout.jsonl');
+    const db=new Database(dbFile);const ledger=new RecoveryLedger(db);
+    let submissions=0;
+    const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(req){
+      if(new URL(req.url).pathname==='/api/health')return Response.json({pid:987654,initialized:true});
+      const body=await req.json() as any;
+      expect(body.tool_use_id).toBe('cli-call');expect(body.contentSessionId).toBe('cli-session');
+      submissions++;
+      ledger.commit(body.contentSessionId,[body.tool_use_id],'stored',()=>{});
+      return Response.json({status:'queued'});
+    }});
+    try {
+      writeFileSync(transcript,[
+        {type:'session_meta',payload:{id:'cli-session',cwd:'/repo'}},
+        {type:'response_item',payload:{type:'function_call',call_id:'cli-call',name:'Read',arguments:'{}'}},
+        {type:'response_item',timestamp:'2026-09-08T10:00:00Z',payload:{type:'function_call_output',call_id:'cli-call',output:'ok'}},
+      ].map(JSON.stringify).join('\n')+'\n');
+      initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'active')");
+      registerSourcePointer(db,{sessionId:'cli-session',toolUseId:'cli-call',transcriptPath:transcript,platform:'codex',cwd:'/repo'});
+      const run=async(pid:string)=>{
+        const child=Bun.spawn([process.execPath,'src/services/transcripts/recover-codex.ts',dbFile,transcript,'--replay','--since','2026-09-08T00:00:00Z','--worker-pid',pid,'--port',String(server.port)],{cwd:process.cwd(),stdout:'pipe',stderr:'pipe'});
+        const [status,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+        return {status,out,err};
+      };
+      expect((await run('1')).status).not.toBe(0); expect(submissions).toBe(0);
+      const first=await run('987654');expect(first.status).toBe(0);expect(first.out).toContain('"submitted":1');
+      const second=await run('987654');expect(second.status).toBe(0);expect(second.out).toContain('"submitted":0');
+      expect(submissions).toBe(1);
+    } finally {server.stop(true);db.close();rmSync(dir,{recursive:true,force:true});}
+  });
+});
+
+import { initializeSourceRecovery, registerSourcePointer, recoverSourcePass, startSourceRecovery } from '../../../src/services/worker/SourceRecovery.js';
+
+describe('durable source references and startup recovery',()=>{
+  for(const platform of ['codex','claude'])test(`${platform}: held event survives reopen and startup recovers only once`,async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'mem-source-')),file=join(dir,'source.jsonl'),dbFile=join(dir,'test.db');
+    let db=new Database(dbFile);let stop:(()=>void)|undefined;
+    try{
+      const entries=platform==='codex'?[
+        {type:'session_meta',payload:{id:'s',cwd:'/repo'}},
+        {type:'response_item',payload:{type:'function_call',call_id:'a',name:'Read',arguments:'{"secret":"source-only"}'}},
+        {type:'response_item',payload:{type:'function_call_output',call_id:'a',output:'source-only-result'}},
+      ]:[
+        {sessionId:'s',type:'assistant',message:{content:[{type:'tool_use',id:'a',name:'Read',input:{secret:'source-only'}}]}},
+        {sessionId:'s',type:'user',message:{content:[{type:'tool_result',tool_use_id:'a',content:'source-only-result'}]}},
+      ];
+      writeFileSync(file,entries.map(JSON.stringify).join('\n')+'\n');
+      initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+      expect(registerSourcePointer(db,{sessionId:'s',toolUseId:'a',transcriptPath:file,platform,cwd:'/repo'})).toBe('held');
+      expect(JSON.stringify(db.query('SELECT * FROM source_event_refs').all())).not.toContain('source-only');
+      db.close();db=new Database(dbFile);
+      let submitted=0;
+      const ingest=async(p:any)=>{submitted++;expect(p.toolInput).toEqual({secret:'source-only'});new RecoveryLedger(db).commit(p.contentSessionId,[p.toolUseId],'stored',()=>{});return {ok:true};};
+      stop=startSourceRecovery(db,ingest,e=>{throw e;});
+      for(let i=0;i<100 && !new RecoveryLedger(db).has('s','a');i++)await new Promise(r=>setTimeout(r,5));
+      expect(submitted).toBe(1);expect(new RecoveryLedger(db).has('s','a')).toBe(true);
+      stop();stop=undefined;
+      expect(await recoverSourcePass(db,ingest)).toEqual({selected:0,submitted:0,errors:0});
+      expect(submitted).toBe(1);
+    }finally{stop?.();db.close();rmSync(dir,{recursive:true,force:true});}
+  });
+  test('hold retains an incomplete source without model submission; a missing file never deletes the pointer',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'mem-source-missing-')),file=join(dir,'source.jsonl'),db=new Database(':memory:');
+    try{
+      initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+      writeFileSync(file,JSON.stringify({type:'response_item',payload:{type:'function_call',call_id:'a',name:'Read',arguments:'{}'}})+'\n');
+      const input={sessionId:'s',toolUseId:'a',transcriptPath:file,platform:'codex',cwd:'/repo'};
+      expect(registerSourcePointer(db,input)).toBe('held');expect(db.query('SELECT * FROM source_event_refs').all()).toHaveLength(1);
+      const incomplete=await recoverSourcePass(db,async()=>{throw new Error('must not submit before result');});
+      expect(incomplete.submitted).toBe(0);expect(new RecoveryLedger(db).has('s','a')).toBe(false);
+      rmSync(file);
+      const result=await recoverSourcePass(db,async()=>{throw new Error('must not submit');});
+      expect(result.errors).toBe(1);expect(db.query('SELECT * FROM source_event_refs').all()).toHaveLength(1);
+      expect(new RecoveryLedger(db).has('s','a')).toBe(false);
+    }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+  });
+});
+
+test('native Codex completed item IDs are recoverable independently of outer functions.exec IDs',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'mem-native-source-')),file=join(dir,'source.jsonl'),db=new Database(':memory:');
+  try{
+    writeFileSync(file,[{type:'session_meta',payload:{id:'s'}},
+      {type:'event_msg',payload:{type:'item_completed',item:{type:'CommandExecution',id:'exec-native',command:['sh','-c','echo test'],cwd:'/repo',stdout:'test',stderr:'',exit_code:0}}},
+      {type:'event_msg',payload:{type:'item_completed',item:{type:'McpToolCall',id:'mcp-native',server:'local',tool:'lookup',arguments:{query:'test'},result:{content:[]}}}},
+    ].map(JSON.stringify).join('\n')+'\n');
+    initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+    for(const id of ['exec-native','mcp-native'])expect(registerSourcePointer(db,{sessionId:'s',toolUseId:id,transcriptPath:file,platform:'codex',cwd:'/repo'})).toBe('held');
+    const ids:string[]=[];
+    const result=await recoverSourcePass(db,async p=>{ids.push(p.toolUseId);return {ok:true};});
+    expect(ids).toEqual(['exec-native','mcp-native']);expect(result.errors).toBe(0);
+  }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('native subagent transcript retains parent hook attribution while resolving child item IDs',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'mem-child-source-')),file=join(dir,'child.jsonl'),db=new Database(':memory:');
+  try{
+    writeFileSync(file,[{type:'session_meta',payload:{id:'copied-parent'}},{type:'session_meta',payload:{id:'child-session'}},
+      {type:'event_msg',payload:{type:'item_completed',item:{type:'CommandExecution',id:'exec-child',command:['echo','ok'],stdout:'ok',stderr:'',exit_code:0}}},
+    ].map(JSON.stringify).join('\n')+'\n');
+    initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'hold')");
+    registerSourcePointer(db,{sessionId:'parent-session',toolUseId:'exec-child',transcriptPath:file,platform:'codex',cwd:'/repo'});
+    let parent='';const result=await recoverSourcePass(db,async p=>{parent=p.contentSessionId;return {ok:true};});
+    expect(parent).toBe('parent-session');expect(result).toEqual({selected:1,submitted:1,errors:0});
+  }finally{db.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('explicit source alias repairs a non-persisted hook ID while retaining its completion identity',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'mem-source-alias-')),file=join(dir,'source.jsonl'),db=new Database(':memory:');
+  try{
+    initializeSourceRecovery(db);db.run("INSERT INTO source_recovery_control VALUES(1,'active')");
+    writeFileSync(file,[{type:'session_meta',payload:{id:'s'}},
+      {type:'response_item',payload:{type:'custom_tool_call',call_id:'persisted-call',name:'exec',input:'readClock()'}},
+      {type:'response_item',payload:{type:'custom_tool_call_output',call_id:'persisted-call',output:'time'}},
+    ].map(JSON.stringify).join('\n')+'\n');
+    registerSourcePointer(db,{sessionId:'s',toolUseId:'ephemeral-hook-id',transcriptPath:file,platform:'codex',cwd:'/repo'});
+    let calls=0;
+    const ingest=async(p:any)=>{calls++;expect(p.toolUseId).toBe('ephemeral-hook-id');new RecoveryLedger(db).commit('s',[p.toolUseId],'stored',()=>{});return {ok:true};};
+    expect((await recoverSourcePass(db,ingest)).submitted).toBe(0);expect(calls).toBe(0);
+    db.query('UPDATE source_event_refs SET source_tool_id=? WHERE tool_use_id=?').run('persisted-call','ephemeral-hook-id');
+    expect((await recoverSourcePass(db,ingest)).submitted).toBe(1);
+    expect(new RecoveryLedger(db).has('s','ephemeral-hook-id')).toBe(true);
+    expect((await recoverSourcePass(db,ingest)).selected).toBe(0);expect(calls).toBe(1);
+  }finally{db.close();rmSync(dir,{recursive:true,force:true});}
 });

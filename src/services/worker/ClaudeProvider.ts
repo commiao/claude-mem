@@ -1,3 +1,8 @@
+import { exceedsObservationRequestBudget } from '../../shared/observer-request-budget.js';
+import { createFieldProcessOwner } from './field-process-owner.js';
+import { ObservationPreparationError } from '../../sdk/observation-field.js';
+import { deferObservation } from './deferred-observations.js';
+import { runStandaloneFieldQuery } from './standalone-field-query.js';
 
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
@@ -30,7 +35,6 @@ import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
 import { ClassifiedProviderError } from './provider-errors.js';
 import { resolveTierAlias } from './model-aliases.js';
 import {
-  shouldRecycleConversation,
   conversationChars,
   resolveConversationMaxChars,
 } from '../../shared/observer-recycle.js';
@@ -214,8 +218,8 @@ export class ClaudeProvider {
     session.lastResultTotalCostUsd = null;
 
     const activeResponseContext = { current: snapshotResponseContext(session) };
-    const compressField: FieldCompressor = (text, budgetChars) =>
-      this.compressField(text, budgetChars, session, modelId, claudePath);
+    const compressField: FieldCompressor = (text, budgetChars, signal) =>
+      this.compressField(text, budgetChars, session, modelId, claudePath, signal);
     const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField);
 
     if (session.memorySessionId) {
@@ -287,6 +291,7 @@ export class ClaudeProvider {
         }),
       });
 
+      let contextMetadataLogged = false;
       for await (const message of queryResult) {
         // Quota-aware wall-clock guard (#2234): the SDK pushes
         // `rate_limit_event` messages carrying live subscription quota state
@@ -429,6 +434,15 @@ export class ClaudeProvider {
         }
 
         if (message.type === 'result') {
+          if (!contextMetadataLogged) {
+            contextMetadataLogged = true;
+            logger.info('SDK', 'Observer SDK context metadata (gateway capacity requires separate verification)', {
+              sessionId: session.sessionDbId, configuredModel: modelId,
+              models: Object.entries((message as any).modelUsage ?? {}).map(([model, usage]: [string, any]) => ({
+                model, contextWindow: usage.contextWindow, maxOutputTokens: usage.maxOutputTokens,
+              })), operationalMaxChars: this.conversationMaxChars(),
+            });
+          }
           // The result message carries the turn's finalized usage (per-turn,
           // not cumulative — verified empirically against the SDK) plus a
           // CUMULATIVE total_cost_usd; per-compression cost is the delta
@@ -510,35 +524,27 @@ export class ClaudeProvider {
     session: ActiveSession,
     modelId: string,
     claudePath: string,
+    signal?: AbortSignal,
   ): Promise<string | null> {
+    const compressionPrompt = buildFieldCompressionPrompt(text, budgetChars);
+    if (exceedsObservationRequestBudget([], compressionPrompt, this.conversationMaxChars())) {
+      throw new ObservationPreparationError('compression-input-over-budget');
+    }
     const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
-    const result = query({
-      prompt: buildFieldCompressionPrompt(text, budgetChars),
+    const processOwner = createFieldProcessOwner();
+    return runStandaloneFieldQuery(controller => query({
+      prompt: compressionPrompt,
       options: {
         ...buildHardenedSdkOptions({
-          source: 'Observer',
-          sessionDbId: session.sessionDbId,
-          contentSessionId: session.contentSessionId,
-          project: session.project,
-          model: modelId,
-          env: isolatedEnv,
-          pathToClaudeCodeExecutable: claudePath,
-          abortController: session.abortController,
+          source: 'Observer', sessionDbId: session.sessionDbId,
+          contentSessionId: session.contentSessionId, project: session.project,
+          model: modelId, env: isolatedEnv, pathToClaudeCodeExecutable: claudePath,
+          abortController: controller,
         }),
         maxTurns: 1,
+        spawnClaudeCodeProcess: processOwner.spawn,
       },
-    });
-
-    let out = '';
-    for await (const message of result) {
-      if (message.type === 'assistant') {
-        const content = (message as any).message.content;
-        out += Array.isArray(content)
-          ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-          : typeof content === 'string' ? content : '';
-      }
-    }
-    return out || null;
+    }), session.abortController.signal, signal, processOwner.close);
   }
 
   private async *createMessageGenerator(
@@ -596,40 +602,41 @@ export class ClaudeProvider {
           session.lastPromptNumber = message.prompt_number;
         }
 
-        // Retire a full generation BEFORE yielding. The SDK holds the real
-        // conversation server-side, but conversationHistory tracks every prompt
-        // fed into it, so its size is the proxy for how close that conversation
-        // is to the ceiling (#3800).
-        if (shouldRecycleConversation(session.conversationHistory, this.conversationMaxChars())) {
-          await recycleObserverConversation(
-            session,
-            this.sessionManager,
-            worker,
-            'budget',
-            `conversation reached ${conversationChars(session.conversationHistory)} chars`,
-          );
-          return;
-        }
-
         // An oversized payload is condensed by a bounded model pass before the
         // prompt is built, so the observation carries a summary of the whole
         // field rather than a head/tail slice with the middle cut out (#3800).
-        const optimized = compressField
-          ? await optimizeObservationFields(
-              { toolInput: message.tool_input, toolOutput: message.tool_response },
-              compressField,
-              { sessionDbId: session.sessionDbId, toolName: message.tool_name },
-            )
-          : { toolInput: message.tool_input, toolOutput: message.tool_response };
+        let obsPrompt: string;
+        try {
+          const optimized = compressField
+            ? await optimizeObservationFields(
+                { toolInput: message.tool_input, toolOutput: message.tool_response },
+                compressField,
+                { sessionDbId: session.sessionDbId, toolName: message.tool_name, strict: true },
+              )
+            : { toolInput: message.tool_input, toolOutput: message.tool_response };
 
-        const obsPrompt = buildObservationPrompt({
-          id: 0, // Not used in prompt
-          tool_name: message.tool_name!,
-          tool_input: JSON.stringify(optimized.toolInput),
-          tool_output: JSON.stringify(optimized.toolOutput),
-          created_at_epoch: Date.now(),
-          cwd: message.cwd
-        });
+          obsPrompt = buildObservationPrompt({
+            id: 0, // Not used in prompt
+            tool_name: message.tool_name!,
+            tool_input: JSON.stringify(optimized.toolInput),
+            tool_output: JSON.stringify(optimized.toolOutput),
+            created_at_epoch: Date.now(),
+            cwd: message.cwd
+          }, true);
+        } catch (error) {
+          if (!(error instanceof ObservationPreparationError)) throw error;
+          deferObservation(this.dbManager.getSessionStore().db, session, this.sessionManager, message, error.reason);
+          continue;
+        }
+        if (exceedsObservationRequestBudget([{ role: 'user', content: initPrompt }], obsPrompt, this.conversationMaxChars())) {
+          deferObservation(this.dbManager.getSessionStore().db, session, this.sessionManager, message, 'single-observation-exceeds-generation-budget');
+          continue;
+        }
+        if (exceedsObservationRequestBudget(session.conversationHistory, obsPrompt, this.conversationMaxChars())) {
+          await recycleObserverConversation(session, this.sessionManager, worker, 'budget',
+            `history plus incoming observation: ${conversationChars(session.conversationHistory) + obsPrompt.length} chars (operational limit)`);
+          return;
+        }
         activeResponseContext.current = snapshotResponseContext(session);
 
         session.conversationHistory.push({ role: 'user', content: obsPrompt });
@@ -654,6 +661,10 @@ export class ClaudeProvider {
           user_prompt: session.userPrompt,
           last_assistant_message: message.last_assistant_message || ''
         }, mode);
+        if (exceedsObservationRequestBudget(session.conversationHistory, summaryPrompt, this.conversationMaxChars())) {
+          await recycleObserverConversation(session, this.sessionManager, worker, 'budget', 'history plus incoming summary exceeds operational limit');
+          return;
+        }
         activeResponseContext.current = snapshotResponseContext(session);
 
         session.conversationHistory.push({ role: 'user', content: summaryPrompt });

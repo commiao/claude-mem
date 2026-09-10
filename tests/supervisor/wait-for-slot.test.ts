@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, spyOn } from 'bun:test';
 import {
   getProcessRegistry,
   waitForSlot,
@@ -151,5 +151,32 @@ describe('waitForSlot reservations (#3287)', () => {
     // The slot freed by the release must be grantable despite the abort.
     const again = await acquire(1);
     again.release();
+  });
+});
+
+
+describe('waitForSlot FIFO fairness', () => {
+  it('preserves arrival order when a timer rechecks a still-full pool', async () => {
+    const callbacks: Array<() => void> = [];
+    const originalInterval = globalThis.setInterval;
+    const intervalSpy = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void) => {
+      callbacks.push(callback);
+      return originalInterval(callback, 60_000);
+    }) as typeof setInterval);
+    const held = await waitForSlot(1);
+    const order: string[] = [];
+    const first = waitForSlot(1).then(slot => { order.push('first'); slot.release(); });
+    const second = waitForSlot(1).then(slot => { order.push('second'); slot.release(); });
+    try {
+      // A periodic check while capacity is still exhausted must not rotate
+      // the oldest waiter to the tail (the production starvation case).
+      callbacks[0]();
+      held.release();
+      await Promise.all([first, second]);
+      expect(order).toEqual(['first', 'second']);
+    } finally {
+      held.release();
+      intervalSpy.mockRestore();
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { isObservationDeferred } from '../deferred-observations.js';
 
 import { logger } from '../../../utils/logger.js';
 import type { SessionManager } from '../SessionManager.js';
@@ -92,6 +93,9 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
   }
 
   const store = dbManager.getSessionStore();
+  if (payload.toolUseId && isObservationDeferred(store.db, payload.contentSessionId, payload.toolUseId)) {
+    return { ok: false, status: 409, reason: 'explicit_recovery_required' };
+  }
 
   let sessionDbId: number;
   let promptNumber: number;

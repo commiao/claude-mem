@@ -1,3 +1,4 @@
+import { startSourceRecovery } from './worker/SourceRecovery.js';
 
 import path from 'path';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
@@ -92,7 +93,7 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
-import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
+import { setIngestContext, attachIngestGeneratorStarter, ingestObservation } from './worker/http/shared.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, filterNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
 import { SyncApply } from './sync/SyncApply.js';
@@ -226,6 +227,7 @@ export class WorkerService implements WorkerRef {
 
   private chromaMcpManager: ChromaMcpManager | null = null;
   private transcriptWatcher: TranscriptWatcher | null = null;
+  private stopSourceRecovery?: () => void;
   private syncClient: SyncClient | null = null;
   private initializationComplete: Promise<void>;
   private resolveInitialization!: () => void;
@@ -615,6 +617,8 @@ export class WorkerService implements WorkerRef {
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
       logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+      this.stopSourceRecovery = startSourceRecovery(this.dbManager.getSessionStore().db, ingestObservation,
+        error => logger.error('TRANSCRIPT', 'Source recovery remains pending', {}, error instanceof Error ? error : new Error(String(error))));
 
       // Lifecycle telemetry (person profile = anonymous install UUID). ide is
       // this install's dominant client read from session history — a bounded
@@ -822,6 +826,7 @@ export class WorkerService implements WorkerRef {
       isShuttingDown: () => this.isShuttingDown,
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
+        this.stopSourceRecovery?.();
         if (this.transcriptWatcher) {
           this.transcriptWatcher.stop();
           this.transcriptWatcher = null;

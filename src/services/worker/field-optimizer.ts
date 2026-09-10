@@ -1,24 +1,7 @@
-/**
- * Condense oversized observation fields instead of cutting them (#3800).
- *
- * A single Read or Bash result can be far larger than one observation prompt is
- * allowed to carry. The existing guard, `truncateObservationField`, keeps a head
- * and a tail and drops the middle — the discarded range is gone, and the
- * observer is told only that *something* was elided. For a memory product that
- * is the wrong trade: the whole point is to end up with a compressed record of
- * what happened, not a record with holes in it.
- *
- * So an oversized field is handed to a small, bounded model pass that rewrites
- * it into something that fits, and the observation is then built and sent with
- * that. Nothing is dropped on the floor; it is summarised.
- *
- * The pass is deliberately hard to turn into a loop, because unbounded retry is
- * the class of bug this whole change exists to remove:
- *  - one attempt per field, never a retry ladder;
- *  - a wall-clock timeout, so a hung compressor cannot stall the observer;
- *  - any failure — throw, timeout, empty, or output that still does not fit —
- *    falls through to the existing truncation, so an observation is degraded
- *    rather than lost.
+import { serializeObservationField, normalizeToolResult, ObservationPreparationError } from '../../sdk/observation-field.js';
+/** Bounded field preparation. Claude uses strict admission: failure is
+ * deferred durably by its caller, never treated as a complete observation.
+ * Legacy providers retain their existing fallback until independently migrated.
  */
 
 import { OBS_PROMPT_FIELD_MAX_CHARS } from '../../sdk/prompts.js';
@@ -29,7 +12,7 @@ import { logger } from '../../utils/logger.js';
  * Returns null when the provider cannot do it. Supplied by each provider so
  * this module stays free of provider wiring and is testable on its own.
  */
-export type FieldCompressor = (text: string, budgetChars: number) => Promise<string | null>;
+export type FieldCompressor = (text: string, budgetChars: number, signal?: AbortSignal) => Promise<string | null>;
 
 /** How long one compression pass may run before the observer gives up on it. */
 export const FIELD_OPTIMIZE_TIMEOUT_MS = 30_000;
@@ -46,7 +29,8 @@ export function buildFieldCompressionPrompt(text: string, budgetChars: number): 
 
 It is going into an observation record, so preserve everything that carries
 signal: file paths, identifiers, commands, counts, error text, status codes, and
-any concrete values a later reader would need. Drop repetition, boilerplate and
+any concrete values a later reader would need. Preserve release constraints,
+negations, uncertainty, and conditions attached to conclusions. Drop repetition, boilerplate and
 filler. Keep the original ordering.
 
 Reply with the condensed payload only — no preamble, no commentary, no code
@@ -57,16 +41,34 @@ ${text}
 </payload>`;
 }
 
-async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | null> {
+async function withTimeout<T>(work: Promise<T>, ms: number, controller: AbortController): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       work,
       new Promise<null>(resolve => {
-        timer = setTimeout(() => resolve(null), ms);
+        timer = setTimeout(() => { controller.abort(); resolve(null); }, ms);
         timer.unref?.();
       }),
     ]);
+    if (controller.signal.aborted) {
+      // Cancellation must settle before admission returns. Bounded grace is a
+      // visible failure, not permission to accept a late answer or retry.
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          work.catch(error => {
+            if (error instanceof ObservationPreparationError && error.reason === 'compression-cleanup-unconfirmed') throw error;
+            return null;
+          }),
+          new Promise<never>((_, reject) => {
+            cleanupTimer = setTimeout(() => reject(new ObservationPreparationError('compression-cleanup-unconfirmed')), 5000);
+          }),
+        ]);
+      } finally { if (cleanupTimer) clearTimeout(cleanupTimer); }
+      return null;
+    }
+    return result;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -75,26 +77,28 @@ async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | null> {
 /**
  * Condense one field if it is over budget.
  *
- * Returns the original value untouched when it already fits or when the
- * compression pass does not produce something usable — in which case the
- * caller's existing truncation still applies.
+ * Strict callers get an explicit error for unusable summaries. Legacy callers
+ * retain their original-value fallback. Both measure final serialized output.
  */
 export async function optimizeField(
   value: unknown,
   compress: FieldCompressor,
-  context: { sessionDbId: number; field: string; toolName?: string },
+  context: { sessionDbId: number; field: string; toolName?: string; strict?: boolean; timeoutMs?: number },
   maxChars: number = OBS_PROMPT_FIELD_MAX_CHARS,
 ): Promise<unknown> {
-  const raw = JSON.stringify(value, null, 2) ?? '';
+  if (context.field === 'outcome') value = normalizeToolResult(value);
+  const raw = serializeObservationField(value);
   if (raw.length <= maxChars) {
     return value;
   }
 
   const budget = Math.floor(maxChars * FIELD_OPTIMIZE_TARGET_RATIO);
   let condensed: string | null = null;
+  const controller = new AbortController();
   try {
-    condensed = await withTimeout(compress(raw, budget), FIELD_OPTIMIZE_TIMEOUT_MS);
+    condensed = await withTimeout(compress(raw, budget, controller.signal), context.timeoutMs ?? FIELD_OPTIMIZE_TIMEOUT_MS, controller);
   } catch (error) {
+    if (context.strict) throw error instanceof ObservationPreparationError ? error : new ObservationPreparationError('compression-failed');
     logger.warn('SDK', 'Oversized field compression failed; falling back to truncation', {
       sessionId: context.sessionDbId,
       field: context.field,
@@ -105,7 +109,9 @@ export async function optimizeField(
   }
 
   const trimmed = condensed?.trim();
-  if (!trimmed || trimmed.length > maxChars) {
+  const wrapped = `<condensed original_size_chars="${raw.length}" reason="oversize">\n${trimmed ?? ''}\n</condensed>`;
+  if (!trimmed || serializeObservationField(wrapped).length > maxChars) {
+    if (context.strict) throw new ObservationPreparationError(controller.signal.aborted ? 'compression-timeout' : !trimmed ? 'compression-empty' : 'compressed-field-over-budget');
     logger.warn('SDK', 'Oversized field compression unusable; falling back to truncation', {
       sessionId: context.sessionDbId,
       field: context.field,
@@ -125,9 +131,8 @@ export async function optimizeField(
     condensedChars: trimmed.length,
   });
 
-  // Marked as condensed, not elided: the observer should treat this as a
-  // faithful summary of the whole field rather than a fragment with a gap.
-  return `<condensed original_size_chars="${raw.length}" reason="oversize">\n${trimmed}\n</condensed>`;
+  // This labels a model summary, not a proof of semantic completeness.
+  return wrapped;
 }
 
 /**
@@ -137,12 +142,14 @@ export async function optimizeField(
 export async function optimizeObservationFields(
   fields: { toolInput: unknown; toolOutput: unknown },
   compress: FieldCompressor,
-  context: { sessionDbId: number; toolName?: string },
+  context: { sessionDbId: number; toolName?: string; strict?: boolean; timeoutMs?: number },
   maxChars: number = OBS_PROMPT_FIELD_MAX_CHARS,
 ): Promise<{ toolInput: unknown; toolOutput: unknown }> {
-  const [toolInput, toolOutput] = await Promise.all([
+  const results = await Promise.allSettled([
     optimizeField(fields.toolInput, compress, { ...context, field: 'parameters' }, maxChars),
     optimizeField(fields.toolOutput, compress, { ...context, field: 'outcome' }, maxChars),
   ]);
+  for (const result of results) if (result.status === 'rejected') throw result.reason;
+  const [toolInput, toolOutput] = results.map(result => (result as PromiseFulfilledResult<unknown>).value);
   return { toolInput, toolOutput };
 }
