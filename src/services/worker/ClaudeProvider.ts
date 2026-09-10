@@ -39,6 +39,7 @@ import {
   resolveConversationMaxChars,
 } from '../../shared/observer-recycle.js';
 import { recycleObserverConversation, loadSessionStartContext } from './session/recycle-conversation.js';
+import { registerProviderMemorySessionId } from './session/memory-session-identity.js';
 import { optimizeObservationFields, buildFieldCompressionPrompt, type FieldCompressor } from './field-optimizer.js';
 import { telemetryBuffer } from '../telemetry/buffer.js';
 import { captureEvent } from '../telemetry/telemetry.js';
@@ -222,15 +223,6 @@ export class ClaudeProvider {
       this.compressField(text, budgetChars, session, modelId, claudePath, signal);
     const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField);
 
-    if (session.memorySessionId) {
-      // Observer spawns intentionally opt out of Claude transcript persistence.
-      // A carried session_id from an earlier no-persist spawn is therefore not
-      // safe to feed back into `resume` on a later fresh process.
-      this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, null);
-      session.memorySessionId = null;
-    }
-
-    const hasRealMemorySessionId = false;
     const shouldResume = false;
 
     if (session.forceInit) {
@@ -257,7 +249,7 @@ export class ClaudeProvider {
         sessionDbId: session.sessionDbId,
         contentSessionId: session.contentSessionId,
         memorySessionId: session.memorySessionId ?? undefined,
-        hasRealMemorySessionId,
+        hasStoredMemorySessionId: Boolean(session.memorySessionId),
         shouldResume,
         resume_parameter: shouldResume ? session.memorySessionId : '(none - fresh start)',
         lastPromptNumber: session.lastPromptNumber,
@@ -265,13 +257,9 @@ export class ClaudeProvider {
       });
 
       if (session.lastPromptNumber > 1) {
-        logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${session.memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | shouldResume=${shouldResume} | resumeWith=${shouldResume ? session.memorySessionId : 'NONE'}`);
+        logger.debug('SDK', `[ALIGNMENT] Fresh no-persistence query | contentSessionId=${session.contentSessionId} | storageMemorySessionId=${session.memorySessionId} | prompt#=${session.lastPromptNumber} | shouldResume=${shouldResume} | resumeWith=${shouldResume ? session.memorySessionId : 'NONE'}`);
       } else {
-        const hasStaleMemoryId = hasRealMemorySessionId;
-        logger.debug('SDK', `[ALIGNMENT] First Prompt (INIT) | contentSessionId=${session.contentSessionId} | prompt#=${session.lastPromptNumber} | hasStaleMemoryId=${hasStaleMemoryId} | action=START_FRESH | Will capture new memorySessionId from SDK response`);
-        if (hasStaleMemoryId) {
-          logger.warn('SDK', `Skipping resume for INIT prompt despite existing memorySessionId=${session.memorySessionId} - SDK context was lost (worker restart or crash recovery)`);
-        }
+        logger.debug('SDK', `[ALIGNMENT] First fresh provider query | contentSessionId=${session.contentSessionId} | prompt#=${session.lastPromptNumber} | storageMemorySessionId=${session.memorySessionId ?? '(none yet)'} | action=START_FRESH`);
       }
 
       ensureDir(OBSERVER_SESSIONS_DIR);
@@ -336,29 +324,15 @@ export class ClaudeProvider {
           }
         }
 
-        if (message.session_id && message.session_id !== session.memorySessionId) {
-          const previousId = session.memorySessionId;
-          session.memorySessionId = message.session_id;
-          this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
-            session.sessionDbId,
-            message.session_id
+        if (message.session_id) {
+          const identityOutcome = registerProviderMemorySessionId(
+            session,
+            message.session_id,
+            this.dbManager.getSessionStore(),
           );
-          const verification = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
-          const dbVerified = verification?.memory_session_id === message.session_id;
-          const logMessage = previousId
-            ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
-            : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
-          logger.info('SESSION', logMessage, {
-            sessionId: session.sessionDbId,
-            memorySessionId: message.session_id,
-            previousId
-          });
-          if (!dbVerified) {
-            logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
-              sessionId: session.sessionDbId
-            });
+          if (identityOutcome === 'captured') {
+            logger.debug('SDK', `[ALIGNMENT] Captured | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id}`);
           }
-          logger.debug('SDK', `[ALIGNMENT] ${previousId ? 'Updated' : 'Captured'} | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id} | Future prompts will resume with this ID`);
         }
 
         if (message.type === 'assistant') {

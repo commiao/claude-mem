@@ -93,10 +93,10 @@ export class SessionManager {
     });
 
     if (dbSession.memory_session_id) {
-      logger.warn('SESSION', `Discarding stale memory_session_id from previous worker instance (Issue #817)`, {
+      logger.debug('SESSION', 'Restoring established memory_session_id as the durable storage identity', {
         sessionDbId,
-        staleMemorySessionId: dbSession.memory_session_id,
-        reason: 'SDK context lost on worker restart - will capture new ID'
+        memorySessionId: dbSession.memory_session_id,
+        reason: 'observer session persistence is disabled, so it will not be used to resume Claude'
       });
     }
 
@@ -119,7 +119,9 @@ export class SessionManager {
     session = {
       sessionDbId,
       contentSessionId: dbSession.content_session_id,
-      memorySessionId: null,  // Always start fresh - SDK will capture new ID
+      // This is the FK-backed storage identity, not a Claude resume token.
+      // ClaudeProvider always starts a fresh no-persistence process.
+      memorySessionId: dbSession.memory_session_id,
       project: suppliedProject || dbSession.project,
       platformSource: dbSession.platform_source,
       observedModel: dbSession.observed_model ?? undefined,
@@ -143,11 +145,11 @@ export class SessionManager {
       pendingAgentType: null
     };
 
-    logger.debug('SESSION', 'Creating new session object (memorySessionId cleared to prevent stale resume)', {
+    logger.debug('SESSION', 'Creating new session object with its durable storage identity', {
       sessionDbId,
       contentSessionId: dbSession.content_session_id,
       dbMemorySessionId: dbSession.memory_session_id || '(none in DB)',
-      memorySessionId: '(cleared - will capture fresh from SDK)',
+      memorySessionId: dbSession.memory_session_id || '(will capture the first provider ID)',
       lastPromptNumber: promptNumber || this.dbManager.getSessionStore().getPromptNumberFromUserPrompts(dbSession.content_session_id, sessionDbId)
     });
 
