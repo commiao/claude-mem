@@ -4,7 +4,6 @@ export interface NormalizedHookInput {
   platform?: string;   
   prompt?: string;
   toolName?: string;
-  toolUseId?: string;
   toolInput?: unknown;
   toolResponse?: unknown;
   /**
