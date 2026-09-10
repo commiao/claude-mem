@@ -18,6 +18,16 @@ export interface DrainOptions {
   idleTimeoutMs?: number;
 }
 
+export interface ObservationQueueLimits {
+  maxPerSession: number;
+  maxTotal: number;
+}
+
+export type ObservationQueueAdmission =
+  | { status: 'queued'; messageId: number }
+  | { status: 'duplicate' }
+  | { status: 'held'; reason: 'per_session_capacity' | 'global_capacity' };
+
 /**
  * Per-session in-RAM observation buffer. This replaces the durable
  * `pending_messages` SQLite queue (and the BullMQ engine that mirrored it).
@@ -68,6 +78,26 @@ export class SessionMessageBuffer {
     this.onMutate?.();
     this.signal(sessionDbId);
     return id;
+  }
+
+  /**
+   * Normal observation ingress is bounded. A `held` result keeps the source
+   * record recoverable without creating an unbounded in-memory backlog.
+   * Explicit operator recovery deliberately uses restoreDeferred() instead.
+   */
+  admitObservation(
+    sessionDbId: number,
+    message: PendingMessage,
+    limits: ObservationQueueLimits,
+  ): ObservationQueueAdmission {
+    if (this.getPendingCount(sessionDbId) >= limits.maxPerSession) {
+      return { status: 'held', reason: 'per_session_capacity' };
+    }
+    if (this.getTotalDepth() >= limits.maxTotal) {
+      return { status: 'held', reason: 'global_capacity' };
+    }
+    const messageId = this.enqueue(sessionDbId, message);
+    return messageId === 0 ? { status: 'duplicate' } : { status: 'queued', messageId };
   }
 
   /** Explicit recovery only: allow the same deferred identity back once.

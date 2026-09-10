@@ -2,7 +2,7 @@ import { RecoveryLedger } from './RecoveryLedger.js';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
 import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationData } from '../worker-types.js';
-import { SessionMessageBuffer } from './SessionMessageBuffer.js';
+import { SessionMessageBuffer, type ObservationQueueAdmission, type ObservationQueueLimits } from './SessionMessageBuffer.js';
 import { getSdkProcessForSession, ensureSdkProcessExit } from '../../supervisor/process-registry.js';
 import { getSupervisor } from '../../supervisor/index.js';
 import { telemetryBuffer } from '../telemetry/buffer.js';
@@ -168,14 +168,18 @@ export class SessionManager {
     return this.sessions.get(sessionDbId);
   }
 
-  async queueObservation(sessionDbId: number, data: ObservationData): Promise<void> {
+  async queueObservation(
+    sessionDbId: number,
+    data: ObservationData,
+    limits: ObservationQueueLimits,
+  ): Promise<ObservationQueueAdmission> {
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
 
     if (data.toolUseId && new RecoveryLedger(this.dbManager.getSessionStore().db)
-      .has(session.contentSessionId, data.toolUseId)) return;
+      .has(session.contentSessionId, data.toolUseId)) return { status: 'duplicate' };
 
     const message: PendingMessage = {
       type: 'observation',
@@ -189,18 +193,23 @@ export class SessionManager {
       toolUseId: data.toolUseId,
     };
 
-    const messageId = this.buffer.enqueue(sessionDbId, message);
+    const admission = this.buffer.admitObservation(sessionDbId, message, limits);
     const queueDepth = this.buffer.getPendingCount(sessionDbId);
     const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
-    if (messageId === 0) {
+    if (admission.status === 'held') {
+      logger.warn('QUEUE', `HELD | sessionDbId=${sessionDbId} | type=observation | tool=${toolSummary} | reason=${admission.reason} | depth=${queueDepth}`, {
+        sessionId: sessionDbId,
+      });
+    } else if (admission.status === 'duplicate') {
       logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=observation | tool=${toolSummary} | toolUseId=${data.toolUseId ?? 'null'} | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
     } else {
-      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
+      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${admission.messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
     }
+    return admission;
   }
 
   async queueSummarize(sessionDbId: number, lastAssistantMessage?: string): Promise<void> {

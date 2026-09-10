@@ -533,8 +533,8 @@ export class SessionRoutes extends BaseRouteHandler {
       return;
     }
 
-    if ('status' in result && result.status === 'skipped') {
-      res.json({ status: 'skipped', reason: result.reason });
+    if ('status' in result && (result.status === 'skipped' || result.status === 'held')) {
+      res.json({ status: result.status, reason: result.reason });
       return;
     }
 

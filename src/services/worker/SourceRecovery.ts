@@ -10,6 +10,8 @@ type SourceRow = {content_session_id:string;tool_use_id:string;source_path:strin
 type Payload = {contentSessionId:string;toolUseId:string;toolName:string;toolInput:unknown;toolResponse:unknown;cwd:string;platformSource:string};
 type IngestResult = {ok:boolean;status?:string|number;reason?:string};
 
+class SourceRecoveryHeld extends Error {}
+
 export function initializeSourceRecovery(db: Database): void {
   new RecoveryLedger(db);
   initializeDeferredObservations(db);
@@ -139,15 +141,22 @@ export async function recoverSourcePass(db:Database,ingest:(p:Payload)=>Promise<
   for(const row of rows){const key=JSON.stringify([row.source_path,row.content_session_id]);const list=groups.get(key)??[];list.push(row);groups.set(key,list);}
   let submitted=0,errors=0;
   for(const group of groups.values()){
-    for(const row of group)db.query('UPDATE source_event_refs SET last_attempt_at=? WHERE content_session_id=? AND tool_use_id=?').run(Date.now(),row.content_session_id,row.tool_use_id);
+    let held=false,submittedBeforeHold=0;
     try {
     const count=await readReferencedEvents(group,async payload=>{
       const result=await ingest(payload);
       if(!result.ok)throw new Error('Source recovery ingestion failed');
+      if(result.status==='held') { held=true; throw new SourceRecoveryHeld(); }
+      db.query('UPDATE source_event_refs SET last_attempt_at=? WHERE content_session_id=? AND tool_use_id=?').run(Date.now(),payload.contentSessionId,payload.toolUseId);
       if(result.status==='skipped')new RecoveryLedger(db).commit(payload.contentSessionId,[payload.toolUseId],'skipped',()=>{});
+      submittedBeforeHold++;
     });
     submitted+=count;if(count<group.length)errors++;
-    } catch {errors++;}
+    } catch (error) {
+      if (error instanceof SourceRecoveryHeld) { submitted+=submittedBeforeHold; break; }
+      errors++;
+    }
+    if (held) break;
   }
   return {selected:rows.length,submitted,errors};
 }

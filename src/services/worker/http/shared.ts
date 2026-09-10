@@ -41,7 +41,13 @@ function requireContext(): IngestContext {
 export type IngestResult =
   | { ok: true; sessionDbId: number; messageId?: number }
   | { ok: true; status: 'skipped'; reason: string }
+  | { ok: true; status: 'held'; reason: string }
   | { ok: false; reason: string; status?: number };
+
+function positiveSetting(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 export interface ObservationPayload {
   contentSessionId: string;
@@ -166,7 +172,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     }
   }
 
-  await sessionManager.queueObservation(sessionDbId, {
+  const admission = await sessionManager.queueObservation(sessionDbId, {
     tool_name: payload.toolName,
     tool_input: cleanedToolInput,
     tool_response: cleanedToolResponse,
@@ -181,10 +187,17 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     agentId: typeof payload.agentId === 'string' ? payload.agentId : undefined,
     agentType: typeof payload.agentType === 'string' ? payload.agentType : undefined,
     toolUseId: typeof payload.toolUseId === 'string' ? payload.toolUseId : undefined,
+  }, {
+    maxPerSession: positiveSetting(settings.CLAUDE_MEM_OBSERVER_MAX_PENDING_PER_SESSION, 64),
+    maxTotal: positiveSetting(settings.CLAUDE_MEM_OBSERVER_MAX_PENDING_TOTAL, 256),
   });
+
+  if (admission.status === 'held') {
+    return { ok: true, status: 'held', reason: `queue_${admission.reason}` };
+  }
 
   await ensureGeneratorRunning?.(sessionDbId, 'observation');
   eventBroadcaster.broadcastObservationQueued(sessionDbId);
 
-  return { ok: true, sessionDbId };
+  return { ok: true, sessionDbId, ...(admission.status === 'queued' ? { messageId: admission.messageId } : {}) };
 }
