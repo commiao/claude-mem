@@ -776,11 +776,18 @@ export class ClaudeProvider {
           : { toolInput: message.tool_input, toolOutput: message.tool_response };
 
         const obsPrompt = buildObservationPrompt({
-          id: 0, // Not used in prompt
+          // 这条观测的持久身份。用它，同一行的重投才会生成同一份提示。
+          id: message._persistentId,
           tool_name: message.tool_name!,
           tool_input: JSON.stringify(optimized.toolInput),
           tool_output: JSON.stringify(optimized.toolOutput),
-          created_at_epoch: Date.now(),
+          // 曾经是 `Date.now()`，也就是「我们轮到处理它的时刻」。那让同一条观测
+          // 每重投一次就生成一份不同的提示，于是下游连「这两次是同一件事」都看
+          // 不出来 —— 上面那个 id 也就白给了。
+          // OpenAICompatibleProvider 那条路径本来就用的是原始时间戳
+          // （`originalTimestamp ?? Date.now()`），只有 Claude 这条落下了。
+          // 顺带，<occurred_at> 的语义本来就该是「它发生的时刻」。
+          created_at_epoch: message._originalTimestamp,
           cwd: message.cwd
         });
         activeResponseContext.current = snapshotResponseContext(session);
