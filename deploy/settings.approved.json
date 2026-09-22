@@ -1,0 +1,20 @@
+{
+  "CLAUDE_MEM_RUNTIME": "worker",
+  "CLAUDE_MEM_PROVIDER": "claude",
+  "CLAUDE_CODE_PATH": "/Users/mac/.npm-global/bin/claude",
+  "CLAUDE_MEM_CLAUDE_AUTH_METHOD": "gateway",
+  "CLAUDE_MEM_MODEL": "claude_mem.observation",
+  "CLAUDE_MEM_WORKER_PORT": "37701",
+  "CLAUDE_MEM_WORKER_HOST": "127.0.0.1",
+  "CLAUDE_MEM_EXCLUDED_PROJECTS": "13.*",
+  "ANTHROPIC_BASE_URL": "http://127.0.0.1:39001",
+  "ANTHROPIC_MODEL": "claude_mem.observation",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude_mem.observation",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude_mem.observation",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude_mem.observation",
+  "CLAUDE_MEM_TIER_ROUTING_ENABLED": "false",
+  "CLAUDE_MEM_TIER_SIMPLE_MODEL": "claude_mem.observation",
+  "CLAUDE_MEM_TIER_FAST_MODEL": "claude_mem.observation",
+  "CLAUDE_MEM_TIER_SMART_MODEL": "claude_mem.observation",
+  "CLAUDE_MEM_TIER_SUMMARY_MODEL": "claude_mem.observation"
+}
