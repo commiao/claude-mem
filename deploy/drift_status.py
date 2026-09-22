@@ -61,6 +61,28 @@ def run(script, extra):
     return verdict_for(proc.returncode), (tail[-1].strip() if tail else "（无输出）")
 
 
+def serving_commit(patch_root=None):
+    """生产在跑的那个 bundle 出自哪个 commit（读 claude-mem-patch 的 PROVENANCE）。
+
+    为什么判决里必须带这个 sha：fleet-ops 的**发布回退巡检**
+    （`bin/check-release-regression.py`）从这行判决里正则取 commit，取不到就报
+    「这个服务不在覆盖范围内」——而「没覆盖」和「没问题」在输出上长得一模一样。
+
+    带的是 **bundle 的 commit 而不是本仓库的**：能悄悄倒退、且倒退了会真出事的，
+    是生产在跑的那份 3.2MB 产物（2026-09-22 credvault 网关就被换回过一个更早的
+    commit，抹掉一项刚上线的额度保护，而三道判据全绿）。
+    """
+    root = Path(patch_root or "~/.local/share/claude-mem-patch").expanduser()
+    try:
+        text = (root / "current" / "PROVENANCE").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("commit="):
+            return line.split("=", 1)[1].strip()[:12]
+    return None
+
+
 def combine(results):
     """results: [(name, verdict, detail)]"""
     if any(v == DRIFT for _, v, _ in results):
@@ -91,6 +113,8 @@ def main(argv=None):
     parser.add_argument("--repo", required=True,
                         help="被检查的 claude-mem-fork 工作树（检查器自己跑发布产物）")
     parser.add_argument("--status", default=str(STATUS_DEFAULT))
+    parser.add_argument("--patch-root", default=None,
+                        help="bundle 产物根（默认 ~/.local/share/claude-mem-patch）")
     args = parser.parse_args(argv)
 
     results = [
@@ -98,6 +122,12 @@ def main(argv=None):
         ("插件目录",) + run("check_plugin_drift.py", ["--repo", args.repo]),
     ]
     verdict, detail = combine(results)
+    sha = serving_commit(args.patch_root)
+    if sha:
+        detail = "%s %s" % (sha, detail)
+    else:
+        # 取不到就说出来：没有 sha 的那行会让发布回退巡检默默不覆盖这个服务。
+        detail = "（取不到线上 bundle 的 commit）%s" % detail
     stamp = write_status(Path(args.status), verdict, detail)
     print("%s\t%s\t%s" % (stamp, verdict, detail))
     # 作业本身总是成功退出：它的职责是**写下判决**，不是替巡检做判断。

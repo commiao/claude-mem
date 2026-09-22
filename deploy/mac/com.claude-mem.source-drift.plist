@@ -43,9 +43,12 @@
   </dict>
   <key>ProcessType</key>
   <string>Background</string>
+  <!-- err 与 out 必须分开：指向同一个文件时「文件增长」不等于「失败」，
+       作业失败巡检就判不了（准则 9：健康检查要量干活，不量活着）。
+       实跑本机巡检时它当场点名了这一条，而 credvault 那两份模板正带着这个毛病。 -->
   <key>StandardOutPath</key>
-  <string>/Users/mac/Library/Logs/claude-mem/source-drift.log</string>
+  <string>/Users/mac/Library/Logs/claude-mem/source-drift.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/mac/Library/Logs/claude-mem/source-drift.log</string>
+  <string>/Users/mac/Library/Logs/claude-mem/source-drift.err.log</string>
 </dict>
 </plist>
