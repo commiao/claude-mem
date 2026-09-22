@@ -109,6 +109,12 @@ TARGETS = {
             ("不用原子 rename，留下临时文件",
              "    os.replace(str(tmp), str(path))",
              '    path.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")'),
+            ("PROVENANCE 缺失时崩掉而不是返回 None",
+             "    except OSError:\n        return None",
+             "    except OSError:\n        raise"),
+            ("commit 不截断到 12 位（判决行里塞进整串 sha）",
+             '            return line.split("=", 1)[1].strip()[:12]',
+             '            return line.split("=", 1)[1].strip()'),
         ],
     },
 }

@@ -89,6 +89,32 @@ class WriteTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+class ServingCommitTests(unittest.TestCase):
+    """判决里必须带线上 bundle 的 commit，否则发布回退巡检默默不覆盖这个服务。
+
+    fleet-ops 的 check-release-regression.py 从判决行里正则取 commit，取不到就报
+    「不在覆盖范围内」——而「没覆盖」和「没问题」在输出上长得一模一样。
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="cm-patchroot-"))
+        (self.dir / "current").mkdir(parents=True)
+
+    def _prov(self, body):
+        (self.dir / "current" / "PROVENANCE").write_text(body, encoding="utf-8")
+
+    def test_reads_commit_and_truncates_to_twelve(self):
+        self._prov("commit=d03b78efb0655ae74789bd3fcd4cbad4952112c3\nsha256=x\n")
+        self.assertEqual(ds.serving_commit(self.dir), "d03b78efb065")
+
+    def test_missing_provenance_returns_none_not_a_crash(self):
+        self.assertIsNone(ds.serving_commit(self.dir / "nope"))
+
+    def test_provenance_without_commit_line_returns_none(self):
+        self._prov("sha256=x\nbuilt_at=y\n")
+        self.assertIsNone(ds.serving_commit(self.dir))
+
+
 class SandboxSelfCheck(unittest.TestCase):
     def test_real_status_not_written_by_tests(self):
         if not REAL_STATUS.exists():
