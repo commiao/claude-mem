@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- claude-mem 源码/配置漂移巡检：每天写一行判决到状态文件，
+       由 fleet-ops 的 SessionStart 巡检读（DRIFT_SERVICES 表）。
+
+       ProgramArguments[1] 指发布产物 current/，不是开发工作树（准则 20）；
+       后面那个 repo 参数指的是被检查的那棵树，两者是不同的东西。
+
+       解释器写死 /usr/bin/python3：作业跑的就是它，不是手敲时 PATH 里那个
+       pyenv 3.13（准则 36）。
+
+       注意：本注释刻意不写连字符成对的命令行开关 —— XML 注释里不允许出现
+       两个连字符，而 plutil -lint 会放过这种非法 plist，plistlib 当场拒绝
+       （准则 27）。写这份文件时就真撞了一次。 -->
+  <key>Label</key>
+  <string>com.claude-mem.source-drift</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/mac/.local/share/claude-mem/current/deploy/drift_status.py</string>
+    <string>--repo</string>
+    <string>/Users/mac/workspace_claudeCode/claude-mem-fork</string>
+    <string>--status</string>
+    <string>/Users/mac/.cache/claude-mem/source-drift.status</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/mac</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>35</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/mac/Library/Logs/claude-mem/source-drift.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mac/Library/Logs/claude-mem/source-drift.log</string>
+</dict>
+</plist>
