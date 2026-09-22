@@ -45,10 +45,26 @@ PATCHED_FILES = {"scripts/worker-service.cjs"}
 
 # 已登记的已知偏差。每条都要写**为什么**，否则它就是个静音开关。
 # 登记不是豁免：这些仍然会被打印，只是不计入退出码。
+#
+# ⚠️ 两条都已查实（2026-09-22），措辞刻意写成「不要动它」而不是「待查」——
+# 初版写的是「待确认为什么禁的」，那等于在邀请下一个人去把它恢复，而恢复
+# .mcp.json 就是把 22 个进程放回来。**一条含糊的登记比没有登记更危险。**
 KNOWN = {
-    ".mcp.json": "本机刻意禁用（安装目录里是 .mcp.json.disabled）——待确认这是谁、何时、为什么禁的",
-    "scripts/transcript-watcher.cjs": "三个安装根彼此一致而与 fork 记录不符（266428 vs 266386 字节），"
-                                      "疑似 marketplace 发行版与 fork 里那份构建产物不同；待查实",
+    ".mcp.json": (
+        "【刻意禁用，不要恢复】T-0071：这个文件把 mcp-server.cjs 注册第二遍"
+        "（另一遍走 muxcp），于是每会话各起一份「壳 36MB + 本体 25MB」。"
+        "关掉插件侧这三份声明后搜索进程 23 → 1，统一走 muxcp 共享单实例。"
+        "安装目录里现为 .mcp.json.disabled，且 mcp-guard 的防复活自愈在维持它"
+        "（插件升级会带回新的 .mcp.json，已接住 4 次）。恢复它 = 撤销 T-0071。"
+    ),
+    "scripts/transcript-watcher.cjs": (
+        "【良性，结构性】生产多出的 42 字节是 bundle 里 vendored 的 posthog-js "
+        '多一个枚举成员 r.SurveysInProgress="surveys_in_progress"（差异始于第 81881 字节）。'
+        "即 marketplace 发行的构建产物所用依赖版本比 fork 里那份 committed 的新一点，"
+        "不是我们的代码。96 个被跟踪文件里只有这一个不同。"
+        "不提交生产那份来「对齐」——那会把 marketplace 的构建产物塞进 fork 的源码树，"
+        "下次插件升级还要再来一遍。"
+    ),
 }
 
 EXIT_OK, EXIT_DRIFT, EXIT_CANNOT = 0, 1, 2
