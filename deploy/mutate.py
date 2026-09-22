@@ -90,6 +90,27 @@ TARGETS = {
              "        if False:"),
         ],
     },
+    "status": {
+        "src": "drift_status.py",
+        "tests": "test_drift_status.py",
+        "mutations": [
+            ("drift 不再压过 cannot（真结论被「查不了」藏掉）",
+             "    if any(v == DRIFT for _, v, _ in results):",
+             "    if False:"),
+            ("cannot 不再压过 ok（没拿到指纹却说「没漂」）",
+             "    elif any(v == CANNOT for _, v, _ in results):",
+             "    elif False:"),
+            ("意料之外的退出码落到 ok 而不是 cannot",
+             "    return BY_CODE.get(returncode, CANNOT)",
+             "    return BY_CODE.get(returncode, OK)"),
+            ("详情里的 TAB 不清理（把三段格式撑成四段，读取侧判读不懂）",
+             'return worst, detail.replace("\\t", " ")',
+             "return worst, detail"),
+            ("不用原子 rename，留下临时文件",
+             "    os.replace(str(tmp), str(path))",
+             '    path.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")'),
+        ],
+    },
 }
 
 
