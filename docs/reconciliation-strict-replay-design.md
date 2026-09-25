@@ -51,8 +51,8 @@ Worker SQLite, in the same database as `observer_tasks`:
 * `observer_replay_source(task_id PRIMARY KEY, source_payload,
   original_occurred_at_epoch, prepared_observation_prompt,
   prepared_prompt_digest, model_id, mode_version)`; this must be captured
-  before the first SDK yield. Current `observer_tasks.payload` lacks the
-  exact RAM enqueue timestamp and prepared prompt.
+  before the first SDK yield. The original `observer_tasks.payload` lacked
+  those values; the new task timestamp and prepared-prompt table cover them.
 * `observer_replay_step(task_id, model_step_id, request_digest,
   original_idempotency_key, gateway_identity, ordinal, gateway_phase,
   http_request_started_at, http_request_deadline_at, response_cache_state)`.
@@ -73,6 +73,16 @@ Forwarder durable store, scoped by authenticated caller and business key:
 The gateway remains the authority for whether an HTTP request started, its
 deadline, current in-flight state, and whether an old response is replayable.
 An unknown or expired cache entry cannot be treated as a safe prior result.
+
+The worker now stores the first enqueue timestamp in `observer_tasks` and the
+exact observation prompt in `observer_task_prepared_prompts` before the SDK
+yield. `SessionManager.queuePreparedReplay()` is a dormant reconstruction
+method: the runtime has no replay gate implementation, its flag defaults off,
+and it only places one task into the existing RAM queue without starting a
+generator. It does not imply that the SDK init prompt or standalone compression
+calls are safely replayable. The gateway has added a cache-only `task-response`
+lookup, but the forwarder permit core does not yet bind its returned response
+to a prefix step; it still rejects all nonempty prefixes.
 
 ## One manual action protocol
 
@@ -124,6 +134,10 @@ An unknown or expired cache entry cannot be treated as a safe prior result.
   conflict) or a fresh key (unbounded extra call). Reject before the gateway.
 * A cached prior step with missing/unknown gateway response cannot be
   recomputed as part of this one-step retry. Keep the task for operator work.
+* If a durable source or exact step identity is permanently missing, move it
+  through an explicit operator-reviewed unrecoverable state into the failed
+  task list. Transient status-query outages do not prove permanent loss and
+  must not terminalize the task.
 
 ## SDK automatic retry audit
 

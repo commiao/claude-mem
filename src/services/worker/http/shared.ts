@@ -144,11 +144,14 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
   // a failed persistence means this request did not enter the business queue.
   const taskStore = dbManager.getObserverTaskStore();
   let recoveryTaskId: string;
+  let originalTimestamp: number;
   try {
+    const firstEnqueueTime = Date.now();
     recoveryTaskId = taskStore.create({
       sessionDbId,
       contentSessionId: payload.contentSessionId,
       sourceId: payload.toolUseId || null,
+      enqueuedAtEpoch: firstEnqueueTime,
       payload: JSON.stringify({
         tool_name: payload.toolName,
         tool_input: cleanedToolInput,
@@ -161,6 +164,8 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
       }),
     });
     const task = taskStore.get(recoveryTaskId);
+    if (!task?.enqueuedAtEpoch) throw new Error('observer_task_enqueue_time_missing');
+    originalTimestamp = task.enqueuedAtEpoch;
     if (task?.state !== 'queued') {
       return { ok: true, status: 'skipped', reason: `observer_task_${task?.state ?? 'missing'}` };
     }
@@ -224,6 +229,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     agentType: typeof payload.agentType === 'string' ? payload.agentType : undefined,
     toolUseId: typeof payload.toolUseId === 'string' ? payload.toolUseId : undefined,
     recoveryTaskId,
+    originalTimestamp,
   });
 
   await ensureGeneratorRunning?.(sessionDbId, 'observation');

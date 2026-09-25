@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
 
 export type ObserverTaskState = 'queued' | 'reconciliation' | 'retry_authorized' | 'succeeded' | 'skipped' | 'failed';
@@ -8,14 +8,23 @@ export interface ObserverTaskInput {
   contentSessionId: string;
   sourceId: string | null;
   payload: string;
+  enqueuedAtEpoch?: number;
 }
 
-export interface ObserverTaskRow extends ObserverTaskInput {
+export interface ObserverTaskRow extends Omit<ObserverTaskInput, 'enqueuedAtEpoch'> {
   id: string;
   state: ObserverTaskState;
   actualCalls: number;
   version: number;
   outcome: string | null;
+  enqueuedAtEpoch: number | null;
+}
+
+export interface PreparedObserverPrompt {
+  taskId: string;
+  prompt: string;
+  promptDigest: string;
+  enqueuedAtEpoch: number;
 }
 
 export interface RetryDecision {
@@ -45,6 +54,7 @@ export class ObserverTaskStore {
       actual_calls INTEGER NOT NULL DEFAULT 0,
       version INTEGER NOT NULL DEFAULT 1,
       outcome TEXT,
+      enqueued_at_epoch INTEGER,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(session_db_id, source_id)
@@ -54,6 +64,16 @@ export class ObserverTaskStore {
     if (!columns.some(column => column.name === 'version')) {
       db.run('ALTER TABLE observer_tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
     }
+    if (!columns.some(column => column.name === 'enqueued_at_epoch')) {
+      db.run('ALTER TABLE observer_tasks ADD COLUMN enqueued_at_epoch INTEGER');
+    }
+    db.run(`CREATE TABLE IF NOT EXISTS observer_task_prepared_prompts (
+      task_id TEXT PRIMARY KEY,
+      prompt TEXT NOT NULL,
+      prompt_digest TEXT NOT NULL,
+      enqueued_at_epoch INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
     db.run(`CREATE TABLE IF NOT EXISTS observer_task_commands (
       command_id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -94,11 +114,13 @@ export class ObserverTaskStore {
 
   create(input: ObserverTaskInput): string {
     const id = randomUUID();
+    const epoch = input.enqueuedAtEpoch ?? Date.now();
+    if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error('invalid_observer_enqueue_time');
     this.db.prepare(`INSERT INTO observer_tasks
-      (id, session_db_id, content_session_id, source_id, payload)
-      VALUES (?, ?, ?, ?, ?)
+      (id, session_db_id, content_session_id, source_id, payload, enqueued_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_db_id, source_id) DO NOTHING`)
-      .run(id, input.sessionDbId, input.contentSessionId, input.sourceId, input.payload);
+      .run(id, input.sessionDbId, input.contentSessionId, input.sourceId, input.payload, epoch);
     if (input.sourceId) {
       const row = this.db.prepare('SELECT id, payload FROM observer_tasks WHERE session_db_id = ? AND source_id = ?')
         .get(input.sessionDbId, input.sourceId) as { id: string; payload: string };
@@ -113,8 +135,43 @@ export class ObserverTaskStore {
   get(id: string): ObserverTaskRow | null {
     const row = this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
       content_session_id AS contentSessionId, source_id AS sourceId, payload,
-      state, actual_calls AS actualCalls, version, outcome FROM observer_tasks WHERE id = ?`)
+      state, actual_calls AS actualCalls, version, outcome,
+      enqueued_at_epoch AS enqueuedAtEpoch FROM observer_tasks WHERE id = ?`)
       .get(id) as ObserverTaskRow | undefined;
+    return row ?? null;
+  }
+
+  /** Save the exact prompt before handing it to the SDK for its first send. */
+  recordPreparedPrompt(taskId: string, prompt: string, enqueuedAtEpoch: number): PreparedObserverPrompt {
+    if (!prompt || !Number.isSafeInteger(enqueuedAtEpoch) || enqueuedAtEpoch <= 0) {
+      throw new Error('invalid_prepared_observer_prompt');
+    }
+    const promptDigest = createHash('sha256').update(prompt).digest('hex');
+    return this.db.transaction(() => {
+      const task = this.get(taskId);
+      if (!task || task.enqueuedAtEpoch !== enqueuedAtEpoch) {
+        throw new Error('observer_task_enqueue_time_changed');
+      }
+      const existing = this.getPreparedPrompt(taskId);
+      if (existing) {
+        if (existing.prompt !== prompt || existing.promptDigest !== promptDigest ||
+            existing.enqueuedAtEpoch !== enqueuedAtEpoch) {
+          throw new Error('observer_task_prepared_prompt_changed');
+        }
+        return existing;
+      }
+      this.db.prepare(`INSERT INTO observer_task_prepared_prompts
+        (task_id, prompt, prompt_digest, enqueued_at_epoch) VALUES (?, ?, ?, ?)`)
+        .run(taskId, prompt, promptDigest, enqueuedAtEpoch);
+      return { taskId, prompt, promptDigest, enqueuedAtEpoch };
+    })();
+  }
+
+  getPreparedPrompt(taskId: string): PreparedObserverPrompt | null {
+    const row = this.db.prepare(`SELECT task_id AS taskId, prompt,
+      prompt_digest AS promptDigest, enqueued_at_epoch AS enqueuedAtEpoch
+      FROM observer_task_prepared_prompts WHERE task_id = ?`)
+      .get(taskId) as PreparedObserverPrompt | undefined;
     return row ?? null;
   }
 

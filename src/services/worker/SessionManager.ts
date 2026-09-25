@@ -9,6 +9,14 @@ import { deliverSessionWrapup, type TelegramWrapupFormatter } from '../integrati
 
 export const SESSION_END_WRAPUP_GRACE_MS = 5_000;
 
+export interface ManualReplayGate {
+  verify(input: { taskId: string; promptDigest: string; expectedVersion: number }): Promise<{
+    permitId: string;
+    cacheOnlyPrefixReady: true;
+    taskWideHttpGateReady: true;
+  }>;
+}
+
 export class SessionManager {
   private dbManager: DatabaseManager;
   private sessions: Map<number, ActiveSession> = new Map();
@@ -16,8 +24,57 @@ export class SessionManager {
   private telegramWrapupFormatter: TelegramWrapupFormatter | null = null;
   private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.());
 
-  constructor(dbManager: DatabaseManager) {
+  constructor(dbManager: DatabaseManager, private readonly manualReplayGate: ManualReplayGate | null = null) {
     this.dbManager = dbManager;
+  }
+
+  /** Dormant queue reconstruction; deliberately does not start a generator. */
+  async queuePreparedReplay(taskId: string, expectedVersion: number): Promise<boolean> {
+    if (process.env.CLAUDE_MEM_EXPERIMENTAL_REPLAY_QUEUE !== 'enabled' || !this.manualReplayGate) {
+      return false;
+    }
+    const taskStore = this.dbManager.getObserverTaskStore();
+    const task = taskStore.get(taskId);
+    const prepared = taskStore.getPreparedPrompt(taskId);
+    if (!task || task.state !== 'reconciliation' || task.version !== expectedVersion ||
+        !task.enqueuedAtEpoch || !prepared ||
+        task.enqueuedAtEpoch !== prepared.enqueuedAtEpoch ||
+        this.buffer.getPendingCount(task.sessionDbId) !== 0) return false;
+    const admission = await this.manualReplayGate.verify({
+      taskId, promptDigest: prepared.promptDigest, expectedVersion,
+    });
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(admission.permitId) ||
+        admission.cacheOnlyPrefixReady !== true || admission.taskWideHttpGateReady !== true) return false;
+    // An asynchronous permit check may race a business outcome or new queue
+    // item. Re-read local state before the only mutation in this method.
+    const current = taskStore.get(taskId);
+    const stillPrepared = taskStore.getPreparedPrompt(taskId);
+    if (!current || current.state !== 'reconciliation' || current.version !== expectedVersion ||
+        stillPrepared?.promptDigest !== prepared.promptDigest ||
+        this.buffer.getPendingCount(current.sessionDbId) !== 0) return false;
+    const session = this.sessions.get(current.sessionDbId);
+    const sdkProcess = getSdkProcessForSession(current.sessionDbId);
+    if (session?.generatorPromise || (sdkProcess && !sdkProcess.process.killed && sdkProcess.process.exitCode === null)) {
+      return false;
+    }
+    let source: Record<string, unknown>;
+    try { source = JSON.parse(current.payload) as Record<string, unknown>; }
+    catch { return false; }
+    if (typeof source.tool_name !== 'string' || typeof source.tool_input !== 'string' ||
+        typeof source.tool_response !== 'string' || !Number.isSafeInteger(source.prompt_number)) return false;
+    this.initializeSession(current.sessionDbId);
+    this.buffer.enqueuePreparedReplay(current.sessionDbId, {
+      type: 'observation', tool_name: source.tool_name,
+      tool_input: source.tool_input, tool_response: source.tool_response,
+      prompt_number: source.prompt_number as number,
+      cwd: typeof source.cwd === 'string' ? source.cwd : undefined,
+      agentId: typeof source.agentId === 'string' ? source.agentId : undefined,
+      agentType: typeof source.agentType === 'string' ? source.agentType : undefined,
+      toolUseId: typeof source.toolUseId === 'string' ? source.toolUseId : undefined,
+      recoveryTaskId: taskId, originalTimestamp: prepared.enqueuedAtEpoch,
+      manualReplayPermitId: admission.permitId,
+    });
+    return true;
   }
 
   recoverStrandedObserverTasks(): number {
@@ -264,6 +321,7 @@ export class SessionManager {
       agentType: data.agentType,
       toolUseId: data.toolUseId,
       recoveryTaskId: data.recoveryTaskId,
+      originalTimestamp: data.originalTimestamp,
     };
 
     const messageId = this.buffer.enqueue(sessionDbId, message);

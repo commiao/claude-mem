@@ -156,4 +156,23 @@ describe('ObserverTaskStore', () => {
       expect(tasks.getBusinessFailureCount(id, 'a'.repeat(64))).toBe(0);
     } finally { db.close(); }
   });
+
+  it('keeps the first enqueue time and exact prepared prompt across reconstruction', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 12, contentSessionId: 's12', sourceId: 'toolu12',
+        payload: '{"tool":"Read"}', enqueuedAtEpoch: 1_700_000_000_123 });
+      const first = tasks.recordPreparedPrompt(id, '<observed>exact</observed>', 1_700_000_000_123);
+      expect(first.promptDigest).toMatch(/^[a-f0-9]{64}$/);
+      const reopened = new ObserverTaskStore(db);
+      expect(reopened.get(id)?.enqueuedAtEpoch).toBe(1_700_000_000_123);
+      expect(reopened.getPreparedPrompt(id)).toEqual(first);
+      expect(reopened.recordPreparedPrompt(id, first.prompt, first.enqueuedAtEpoch)).toEqual(first);
+      expect(() => reopened.recordPreparedPrompt(id, '<observed>drift</observed>', first.enqueuedAtEpoch))
+        .toThrow('observer_task_prepared_prompt_changed');
+      expect(() => reopened.recordPreparedPrompt(id, first.prompt, first.enqueuedAtEpoch + 1))
+        .toThrow('observer_task_enqueue_time_changed');
+    } finally { db.close(); }
+  });
 });

@@ -66,6 +66,9 @@ describe('ingestObservation dual-write to tool_uses', () => {
     expect(queued).toHaveLength(1);
     expect(queued[0].data.tool_name).toBe('Read');
     expect(queued[0].data.toolUseId).toBe('toolu_dual_01');
+    expect(queued[0].data.originalTimestamp).toBe(
+      new ObserverTaskStore(store!.db).get(queued[0].data.recoveryTaskId)?.enqueuedAtEpoch,
+    );
 
     // The durable backup row exists with the raw payload.
     const rows = store!.queryToolUses({ contentSessionId: 'content-session-1' });

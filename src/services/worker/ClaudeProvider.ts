@@ -784,6 +784,17 @@ export class ClaudeProvider {
           created_at_epoch: message._originalTimestamp,
           cwd: message.cwd
         });
+        if (message.recoveryTaskId) {
+          try {
+            this.dbManager.getObserverTaskStore().recordPreparedPrompt(
+              message.recoveryTaskId, obsPrompt, message._originalTimestamp);
+          } catch (error) {
+            // Never send a rebuilt prompt with a different body under the same
+            // durable business task. Reconciliation must inspect this drift.
+            this.dbManager.getObserverTaskStore().needsReconciliation([message.recoveryTaskId]);
+            throw error;
+          }
+        }
         activeResponseContext.current = snapshotResponseContext(session);
 
         session.conversationHistory.push({ role: 'user', content: obsPrompt });
