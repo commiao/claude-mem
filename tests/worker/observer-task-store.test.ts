@@ -146,4 +146,14 @@ describe('ObserverTaskStore', () => {
       expect(tasks.get(id)?.state).toBe('failed');
     } finally { db.close(); }
   });
+
+  it('does not record timeout failures while the business task is still queued', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 11, contentSessionId: 's11', sourceId: 'toolu11', payload: '{}' });
+      expect(tasks.recordExpiredBusinessAttempt(id, 'a'.repeat(64), 'b'.repeat(64))).toBe(0);
+      expect(tasks.getBusinessFailureCount(id, 'a'.repeat(64))).toBe(0);
+    } finally { db.close(); }
+  });
 });

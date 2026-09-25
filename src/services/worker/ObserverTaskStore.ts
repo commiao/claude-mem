@@ -318,7 +318,7 @@ export class ObserverTaskStore {
     return this.db.transaction(() => {
       const task = this.get(taskId);
       if (!task) throw new Error('observer_task_not_found');
-      if (task.state === 'succeeded' || task.state === 'skipped' || task.state === 'failed') {
+      if (task.state !== 'reconciliation') {
         return this.getBusinessFailureCount(taskId, modelStepId);
       }
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO observer_task_attempt_failures
