@@ -139,6 +139,39 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     ? stripMemoryTags(JSON.stringify(payload.toolResponse))
     : '{}';
 
+  // Persist the complete, cleaned source before acknowledging ingress or
+  // placing it in the process-local generator buffer. No best-effort write:
+  // a failed persistence means this request did not enter the business queue.
+  const taskStore = dbManager.getObserverTaskStore();
+  let recoveryTaskId: string;
+  try {
+    recoveryTaskId = taskStore.create({
+      sessionDbId,
+      contentSessionId: payload.contentSessionId,
+      sourceId: payload.toolUseId || null,
+      payload: JSON.stringify({
+        tool_name: payload.toolName,
+        tool_input: cleanedToolInput,
+        tool_response: cleanedToolResponse,
+        prompt_number: promptNumber,
+        cwd,
+        agentId: payload.agentId,
+        agentType: payload.agentType,
+        toolUseId: payload.toolUseId,
+      }),
+    });
+    const task = taskStore.get(recoveryTaskId);
+    if (task?.state !== 'queued') {
+      return { ok: true, status: 'skipped', reason: `observer_task_${task?.state ?? 'missing'}` };
+    }
+  } catch (error) {
+    logger.error('INGEST', 'Failed to persist observer task', {
+      sessionId: sessionDbId,
+      toolName: payload.toolName,
+    }, error instanceof Error ? error : new Error(String(error)));
+    return { ok: false, reason: 'observer_task_persist_failed', status: 500 };
+  }
+
   // Dual-write: the durable `tool_uses` side index (v51) alongside — never
   // instead of — the pending_messages → generator queue below. This is the one
   // choke point both the PostToolUse hook route and the transcript-watch
@@ -190,6 +223,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     agentId: typeof payload.agentId === 'string' ? payload.agentId : undefined,
     agentType: typeof payload.agentType === 'string' ? payload.agentType : undefined,
     toolUseId: typeof payload.toolUseId === 'string' ? payload.toolUseId : undefined,
+    recoveryTaskId,
   });
 
   await ensureGeneratorRunning?.(sessionDbId, 'observation');

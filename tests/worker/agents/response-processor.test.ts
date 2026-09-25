@@ -161,6 +161,8 @@ describe('ResponseProcessor', () => {
     } as unknown as DatabaseManager;
 
     mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
       getMessageIterator: async function* () {
         yield* [];
       },
@@ -567,6 +569,8 @@ describe('ResponseProcessor', () => {
     it('warns and clears pending work when the observer returns non-XML prose', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -604,6 +608,8 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -633,6 +639,8 @@ describe('ResponseProcessor', () => {
 
     it('pauses the generator with a preserving abort reason on transport failure', async () => {
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages: mock(() => Promise.resolve(0)),
@@ -667,6 +675,8 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -697,6 +707,8 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -728,6 +740,8 @@ describe('ResponseProcessor', () => {
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1062,6 +1076,8 @@ describe('ResponseProcessor', () => {
     it('clears pending work and does NOT call storeObservations on empty response', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1083,6 +1099,8 @@ describe('ResponseProcessor', () => {
     it('clears pending work and does NOT call storeObservations on plain-text response', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
         confirmClaimedMessages,
@@ -1230,6 +1248,8 @@ describe('ResponseProcessor', () => {
     it('should reset processing work if memorySessionId is missing from session', async () => {
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         resetProcessingToPending,
       } as unknown as SessionManager;
@@ -1266,6 +1286,8 @@ describe('ResponseProcessor', () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(1));
       mockSessionManager = {
+        markClaimedNeedsReconciliation: mock(() => {}),
+        markClaimedSkipped: mock(() => {}),
         getMessageIterator: async function* () { yield* []; },
         confirmClaimedMessages,
         resetProcessingToPending,

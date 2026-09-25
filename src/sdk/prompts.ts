@@ -6,6 +6,7 @@ export const SUMMARY_MODE_MARKER = 'MODE SWITCH: PROGRESS SUMMARY';
 
 export interface Observation {
   id: number;
+  recoveryTaskId?: string;
   tool_name: string;
   tool_input: string;
   tool_output: string;
@@ -248,19 +249,11 @@ export function buildObservationPrompt(obs: Observation): string {
     toolOutput = obs.tool_output;
   }
 
-  // 队列行 id 随提示一起进请求体，让下游能证明「字节相同 = 同一条观测的重投」。
-  //
-  // 这一句是给 credvault 的 claude_mem_forwarder 看的，不是给模型看的。它要回答
-  // 的是 forwarder 一直答不上的那个问题：字节完全相同的两个请求，是同一个业务操作
-  // 吗？以前答不上，所以每次重投都得当作新操作、新幂等键、**再付一次钱**
-  // （2026-09-18 实测 180 秒内 5 次链路中断对 5 次重复提交，严格 1:1）。
-  //
-  // pending_messages.id 在重投之间不变（行只在成功消费后才删），且有唯一索引
-  // ux_pending_session_tool —— 它就是这条观测的持久身份。
-  //
-  // 放在根元素的属性上：模型的输出契约是返回 <observation> 或 <skip_summary>，
-  // 不复述输入，所以这里不会污染结果。
-  const operationMarker = obs.id > 0 ? ` op="[[cm-op:${obs.id}]]"` : '';
+  // Forwarder correlation uses the durable task UUID. The numeric buffer id
+  // below remains for legacy callers only and resets whenever the worker dies.
+  const operationMarker = obs.recoveryTaskId
+    ? ` op="[[cm-task:${obs.recoveryTaskId}]]"`
+    : obs.id > 0 ? ` op="[[cm-op:${obs.id}]]"` : '';
   return `<observed_from_primary_session${operationMarker}>
   <what_happened>${obs.tool_name}</what_happened>
   <occurred_at>${new Date(obs.created_at_epoch).toISOString()}</occurred_at>${obs.cwd ? `\n  <working_directory>${obs.cwd}</working_directory>` : ''}

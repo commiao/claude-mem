@@ -99,6 +99,8 @@ export interface PendingMessage {
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  /** UUID of the durable observer task, independent of this process's queue id. */
+  recoveryTaskId?: string;
 }
 
 export interface PendingMessageWithId extends PendingMessage {
@@ -115,6 +117,7 @@ export interface ObservationData {
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  recoveryTaskId?: string;
 }
 
 export interface SSEEvent {

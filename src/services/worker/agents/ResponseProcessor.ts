@@ -384,13 +384,14 @@ export async function processAgentResponse(
     if (isTransportFailureObserverOutput(text)) {
       session.consecutiveInvalidOutputs = 0;
 
-      await sessionManager.resetProcessingToPending(session.sessionDbId);
+      sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);
       session.abortReason = 'transport:observer_text';
       try {
         session.abortController.abort();
       } catch {
         // best-effort; AbortController.abort() should not throw in normal use.
       }
+      await sessionManager.resetProcessingToPending(session.sessionDbId);
       worker?.broadcastProcessingStatus?.();
       logger.error('PARSER', `${agentName} could not reach the provider; queued batch preserved for retry`, {
         sessionId: session.sessionDbId,
@@ -424,8 +425,10 @@ export async function processAgentResponse(
       consecutiveContextOverflows: session.consecutiveContextOverflows,
     });
 
-    // Plain-text skip responses are intentionally ignored. Re-queueing them
-    // creates an observer loop where the same low-signal batch is retried.
+    // Ordinary prose is the legacy low-signal skip decision. Persist that
+    // decision so reconciliation does not mislabel a completed no-op as a
+    // missing model response. Transport/API failures returned above.
+    sessionManager.markClaimedSkipped(session.sessionDbId, outputClass);
     await sessionManager.confirmClaimedMessages(session.sessionDbId);
     session.earliestPendingTimestamp = null;
     return;
@@ -494,7 +497,11 @@ export async function processAgentResponse(
       context.promptNumber,
       discoveryTokens,
       originalTimestamp ?? undefined,
-      modelId
+      modelId,
+      stored => sessionManager.markClaimedPersistedOutcome(
+        session.sessionDbId,
+        JSON.stringify({ observationIds: stored.observationIds, summaryId: stored.summaryId }),
+      ),
     );
   } finally {
     session.pendingAgentId = null;

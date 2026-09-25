@@ -145,6 +145,8 @@ function createHarness(session: ActiveSession) {
     return confirmed;
   });
   const resetProcessingToPending = mock(async () => 0);
+  const markClaimedNeedsReconciliation = mock(() => {});
+  const markClaimedSkipped = mock(() => {});
   const storeObservations = mock(() => ({
     observationIds: [7],
     summaryId: null,
@@ -154,6 +156,8 @@ function createHarness(session: ActiveSession) {
   const sessionManager = {
     confirmClaimedMessages,
     resetProcessingToPending,
+    markClaimedNeedsReconciliation,
+    markClaimedSkipped,
     getClaimedMessages: () => claimedMessages,
     getMessageIterator: async function* () {},
   };

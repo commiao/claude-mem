@@ -556,6 +556,7 @@ export class WorkerService implements WorkerRef {
 
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
+      this.sessionManager.recoverStrandedObserverTasks();
 
       // A SessionEnd hook gets a tiny host budget and persists its identifier
       // when the worker is unavailable. Drain that idempotent spool as soon as

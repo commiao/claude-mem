@@ -20,6 +20,12 @@ export class SessionManager {
     this.dbManager = dbManager;
   }
 
+  recoverStrandedObserverTasks(): number {
+    // An interrupted process cannot distinguish a never-dispatched task from
+    // an in-flight model call. Hold both for read-only reconciliation.
+    return this.dbManager.getObserverTaskStore().markStrandedQueuedForReconciliation();
+  }
+
   setOnPendingMutate(cb: () => void): void {
     this.onPendingMutate = cb;
   }
@@ -257,6 +263,7 @@ export class SessionManager {
       agentId: data.agentId,
       agentType: data.agentType,
       toolUseId: data.toolUseId,
+      recoveryTaskId: data.recoveryTaskId,
     };
 
     const messageId = this.buffer.enqueue(sessionDbId, message);
@@ -327,6 +334,31 @@ export class SessionManager {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];
     return this.buffer.getMessagesByIds(sessionDbId, claimedIds);
+  }
+
+  markClaimedNeedsReconciliation(sessionDbId: number): void {
+    const ids = this.getClaimedMessages(sessionDbId)
+      .map(message => message.recoveryTaskId)
+      .filter((id): id is string => !!id);
+    this.dbManager.getObserverTaskStore().needsReconciliation(ids);
+  }
+
+  markClaimedPersistedOutcome(sessionDbId: number, outcome: string): void {
+    const ids = this.getClaimedMessages(sessionDbId)
+      .map(message => message.recoveryTaskId)
+      .filter((id): id is string => !!id);
+    this.dbManager.getObserverTaskStore().recordPersistedOutcome(ids, outcome);
+  }
+
+  markClaimedSkipped(sessionDbId: number, reason: string): void {
+    const ids = this.getClaimedMessages(sessionDbId)
+      .map(message => message.recoveryTaskId)
+      .filter((id): id is string => !!id);
+    this.dbManager.getObserverTaskStore().recordSkipped(ids, reason);
+  }
+
+  hasUnresolvedObserverTasks(sessionDbId: number): boolean {
+    return this.dbManager.getObserverTaskStore().hasUnresolved(sessionDbId);
   }
 
   async deleteSession(sessionDbId: number): Promise<void> {
