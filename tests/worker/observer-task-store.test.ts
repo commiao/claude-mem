@@ -108,4 +108,23 @@ describe('ObserverTaskStore', () => {
       db.close();
     }
   });
+
+  it('replays a completed read-only check command without running it again', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 9, contentSessionId: 's9', sourceId: 'toolu9', payload: '{}' });
+      expect(tasks.beginCheckCommand('check-9', id, '0'.repeat(64)))
+        .toMatchObject({ duplicate: false, finished: false });
+      tasks.finishCheckCommand('check-9', id, 'reconciliation', 1, 'no_exact_step_evidence');
+      expect(tasks.beginCheckCommand('check-9', id, '0'.repeat(64))).toEqual({
+        duplicate: true, finished: true, resultState: 'reconciliation',
+        resultVersion: 1, resultReason: 'no_exact_step_evidence',
+      });
+      expect(() => tasks.beginCheckCommand('check-9', 'different-task', '0'.repeat(64)))
+        .toThrow('observer_command_identity_conflict');
+    } finally {
+      db.close();
+    }
+  });
 });

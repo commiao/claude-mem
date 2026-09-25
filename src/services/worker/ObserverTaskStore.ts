@@ -60,9 +60,20 @@ export class ObserverTaskStore {
       model_step_id TEXT,
       action TEXT NOT NULL CHECK(action IN ('check', 'retry')),
       state TEXT NOT NULL CHECK(state IN ('accepted', 'started', 'finished')),
+      result_state TEXT,
+      result_version INTEGER,
+      result_reason TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`);
+    const commandColumns = db.prepare('PRAGMA table_info(observer_task_commands)').all() as Array<{ name: string }>;
+    for (const [name, declaration] of [
+      ['result_state', 'TEXT'], ['result_version', 'INTEGER'], ['result_reason', 'TEXT'],
+    ] as const) {
+      if (!commandColumns.some(column => column.name === name)) {
+        db.run(`ALTER TABLE observer_task_commands ADD COLUMN ${name} ${declaration}`);
+      }
+    }
     db.run(`CREATE TABLE IF NOT EXISTS observer_task_steps (
       task_id TEXT NOT NULL,
       model_step_id TEXT NOT NULL,
@@ -227,6 +238,70 @@ export class ObserverTaskStore {
     })();
   }
 
+  /** Claim a mailbox command locally. Re-delivery returns its saved result. */
+  beginCheckCommand(commandId: string, taskId: string, modelStepId: string):
+    { duplicate: boolean; finished: boolean; resultState: string | null; resultVersion: number | null; resultReason: string | null } {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT task_id AS taskId, model_step_id AS modelStepId,
+        action, state, result_state AS resultState, result_version AS resultVersion,
+        result_reason AS resultReason FROM observer_task_commands WHERE command_id = ?`)
+        .get(commandId) as {
+          taskId: string; modelStepId: string; action: string; state: string;
+          resultState: string | null; resultVersion: number | null; resultReason: string | null;
+        } | undefined;
+      if (row) {
+        if (row.taskId !== taskId || row.modelStepId !== modelStepId || row.action !== 'check') {
+          throw new Error('observer_command_identity_conflict');
+        }
+        return { duplicate: true, finished: row.state === 'finished',
+          resultState: row.resultState, resultVersion: row.resultVersion, resultReason: row.resultReason };
+      }
+      this.db.prepare(`INSERT INTO observer_task_commands
+        (command_id, task_id, model_step_id, action, state) VALUES (?, ?, ?, 'check', 'accepted')`)
+        .run(commandId, taskId, modelStepId);
+      return { duplicate: false, finished: false, resultState: null, resultVersion: null, resultReason: null };
+    })();
+  }
+
+  finishCheckCommand(commandId: string, taskId: string, resultState: string,
+    resultVersion: number, resultReason: string): void {
+    const result = this.db.prepare(`UPDATE observer_task_commands SET state = 'finished',
+      result_state = ?, result_version = ?, result_reason = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ? AND task_id = ? AND action = 'check' AND state = 'accepted'`)
+      .run(resultState, resultVersion, resultReason, commandId, taskId);
+    if (result.changes !== 1) throw new Error('observer_check_command_not_claimed');
+  }
+
+  rejectUnverifiableRetry(commandId: string, taskId: string, modelStepId: string): void {
+    this.db.transaction(() => {
+      const prior = this.db.prepare(`SELECT task_id AS taskId, model_step_id AS modelStepId,
+        action FROM observer_task_commands WHERE command_id = ?`)
+        .get(commandId) as { taskId: string; modelStepId: string; action: string } | undefined;
+      if (prior) {
+        if (prior.taskId !== taskId || prior.modelStepId !== modelStepId || prior.action !== 'retry') {
+          throw new Error('observer_command_identity_conflict');
+        }
+        return;
+      }
+      const task = this.get(taskId);
+      this.db.prepare(`INSERT INTO observer_task_commands
+        (command_id, task_id, model_step_id, action, state,
+         result_state, result_version, result_reason)
+        VALUES (?, ?, ?, 'retry', 'finished', ?, ?, 'retry_identity_unproven')`)
+        .run(commandId, taskId, modelStepId, task?.state ?? 'reconciliation', task?.version ?? 0);
+    })();
+  }
+
+  getCommandResult(commandId: string):
+    { state: string; version: number; reason: string } | null {
+    const row = this.db.prepare(`SELECT result_state AS state, result_version AS version,
+      result_reason AS reason FROM observer_task_commands
+      WHERE command_id = ? AND state = 'finished'`).get(commandId) as
+      { state: string | null; version: number | null; reason: string | null } | undefined;
+    if (!row || row.state === null || row.version === null || row.reason === null) return null;
+    return { state: row.state, version: row.version, reason: row.reason };
+  }
+
   hasUnresolved(sessionDbId: number): boolean {
     return !!this.db.prepare(`SELECT 1 FROM observer_tasks
       WHERE session_db_id = ? AND state = 'reconciliation' LIMIT 1`).get(sessionDbId);
@@ -237,5 +312,14 @@ export class ObserverTaskStore {
       content_session_id AS contentSessionId, source_id AS sourceId, payload,
       state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
       WHERE state = ? ORDER BY created_at, id LIMIT ?`).all(state, Math.min(Math.max(limit, 1), 500)) as ObserverTaskRow[];
+  }
+
+  listReportableAfter(afterId: string, limit = 20): ObserverTaskRow[] {
+    return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
+      content_session_id AS contentSessionId, source_id AS sourceId, payload,
+      state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
+      WHERE state IN ('reconciliation', 'succeeded', 'skipped', 'failed')
+        AND id > ? ORDER BY id LIMIT ?`)
+      .all(afterId, Math.min(Math.max(limit, 1), 100)) as ObserverTaskRow[];
   }
 }

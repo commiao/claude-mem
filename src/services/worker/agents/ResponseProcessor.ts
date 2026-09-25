@@ -498,10 +498,16 @@ export async function processAgentResponse(
       discoveryTokens,
       originalTimestamp ?? undefined,
       modelId,
-      stored => sessionManager.markClaimedPersistedOutcome(
-        session.sessionDbId,
-        JSON.stringify({ observationIds: stored.observationIds, summaryId: stored.summaryId }),
-      ),
+      stored => {
+        if (stored.observationIds.length === 0 && stored.summaryId === null) {
+          sessionManager.markClaimedSkipped(session.sessionDbId, 'valid_empty_model_decision');
+        } else {
+          sessionManager.markClaimedPersistedOutcome(
+            session.sessionDbId,
+            JSON.stringify({ observationIds: stored.observationIds, summaryId: stored.summaryId }),
+          );
+        }
+      },
     );
   } finally {
     session.pendingAgentId = null;
