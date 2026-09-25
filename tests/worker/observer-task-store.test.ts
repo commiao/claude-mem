@@ -51,4 +51,61 @@ describe('ObserverTaskStore', () => {
       db.close();
     }
   });
+
+  it('accepts one manual retry command with compare-and-swap and never starts it twice', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 5, contentSessionId: 's5', sourceId: 'toolu5', payload: '{}' });
+      tasks.needsReconciliation([id]);
+      const command = {
+        commandId: 'command-5', taskId: id, modelStepId: 'step-5', expectedVersion: 2,
+        verifiedStepCalls: 1, noInFlight: true,
+      };
+      tasks.recordStepWitness(id, command.modelStepId, 1);
+      expect(tasks.reserveManualRetry({ ...command, noInFlight: false }))
+        .toEqual({ accepted: false, reason: 'in_flight' });
+      expect(tasks.reserveManualRetry(command)).toEqual({ accepted: true, version: 3, duplicate: false });
+      expect(tasks.reserveManualRetry(command)).toEqual({ accepted: true, version: 3, duplicate: true });
+      expect(tasks.startManualRetry(command.commandId, id)).toBe(true);
+      expect(tasks.startManualRetry(command.commandId, id)).toBe(false);
+      expect(tasks.get(id)).toMatchObject({ state: 'queued', actualCalls: 1, version: 4 });
+      expect(tasks.markStrandedQueuedForReconciliation()).toBe(1);
+      expect(tasks.get(id)?.state).toBe('reconciliation');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('marks a failed model step terminal after three witnessed calls', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 7, contentSessionId: 's7', sourceId: 'toolu7', payload: '{}' });
+      tasks.needsReconciliation([id]);
+      tasks.recordStepWitness(id, 'step-a', 3);
+      expect(tasks.get(id)?.state).toBe('failed');
+      expect(() => tasks.recordStepWitness(id, 'step-a', 2)).toThrow('model_step_call_count_regressed');
+      tasks.recordStepWitness(id, 'step-b', 1);
+      expect(db.prepare('SELECT actual_calls FROM observer_task_steps WHERE task_id = ? AND model_step_id = ?')
+        .get(id, 'step-b')).toEqual({ actual_calls: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps the three-call task ceiling when calls span different model steps', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 8, contentSessionId: 's8', sourceId: 'toolu8', payload: '{}' });
+      tasks.needsReconciliation([id]);
+      tasks.recordStepWitness(id, 'step-one', 2);
+      expect(tasks.get(id)).toMatchObject({ actualCalls: 2, state: 'reconciliation' });
+      tasks.recordStepWitness(id, 'step-two', 1);
+      expect(tasks.get(id)).toMatchObject({ actualCalls: 3, state: 'failed' });
+    } finally {
+      db.close();
+    }
+  });
 });

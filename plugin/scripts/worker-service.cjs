@@ -2002,24 +2002,64 @@ For more info: https://docs.claude-mem.ai/antigravity-cli/setup
       source_id TEXT,
       payload TEXT NOT NULL,
       state TEXT NOT NULL DEFAULT 'queued',
-      actual_calls INTEGER NOT NULL DEFAULT 0 CHECK(actual_calls BETWEEN 0 AND 3),
+      actual_calls INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1,
       outcome TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(session_db_id, source_id)
-    )`),e.run("CREATE INDEX IF NOT EXISTS idx_observer_tasks_state ON observer_tasks(state, session_db_id)")}db;create(e){let r=(0,Sie.randomUUID)();if(this.db.prepare(`INSERT INTO observer_tasks
+    )`),e.run("CREATE INDEX IF NOT EXISTS idx_observer_tasks_state ON observer_tasks(state, session_db_id)"),e.prepare("PRAGMA table_info(observer_tasks)").all().some(n=>n.name==="version")||e.run("ALTER TABLE observer_tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1"),e.run(`CREATE TABLE IF NOT EXISTS observer_task_commands (
+      command_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      model_step_id TEXT,
+      action TEXT NOT NULL CHECK(action IN ('check', 'retry')),
+      state TEXT NOT NULL CHECK(state IN ('accepted', 'started', 'finished')),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),e.run(`CREATE TABLE IF NOT EXISTS observer_task_steps (
+      task_id TEXT NOT NULL,
+      model_step_id TEXT NOT NULL,
+      actual_calls INTEGER NOT NULL DEFAULT 0 CHECK(actual_calls BETWEEN 0 AND 3),
+      state TEXT NOT NULL DEFAULT 'reconciliation' CHECK(state IN ('reconciliation', 'succeeded', 'failed')),
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(task_id, model_step_id)
+    )`)}db;create(e){let r=(0,Sie.randomUUID)();if(this.db.prepare(`INSERT INTO observer_tasks
       (id, session_db_id, content_session_id, source_id, payload)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(session_db_id, source_id) DO NOTHING`).run(r,e.sessionDbId,e.contentSessionId,e.sourceId,e.payload),e.sourceId){let n=this.db.prepare("SELECT id, payload FROM observer_tasks WHERE session_db_id = ? AND source_id = ?").get(e.sessionDbId,e.sourceId);if(n.payload!==e.payload)throw new Error("observer_task_source_payload_changed");return n.id}return r}get(e){return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
       content_session_id AS contentSessionId, source_id AS sourceId, payload,
-      state, actual_calls AS actualCalls, outcome FROM observer_tasks WHERE id = ?`).get(e)??null}needsReconciliation(e){let r=this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',
+      state, actual_calls AS actualCalls, version, outcome FROM observer_tasks WHERE id = ?`).get(e)??null}needsReconciliation(e){let r=this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',
       updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'queued'`);this.db.transaction(()=>{for(let n of e)r.run(n)})()}recordPersistedOutcome(e,r){let n=this.db.prepare(`UPDATE observer_tasks SET state = 'succeeded', outcome = ?,
       updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state IN ('queued', 'reconciliation')`);this.db.transaction(()=>{for(let s of e)n.run(r,s)})()}recordSkipped(e,r){let n=this.db.prepare(`UPDATE observer_tasks SET state = 'skipped', outcome = ?,
       updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'queued'`);this.db.transaction(()=>{for(let s of e)n.run(r,s)})()}markStrandedQueuedForReconciliation(){return this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',
-      updated_at = CURRENT_TIMESTAMP WHERE state = 'queued'`).run().changes}hasUnresolved(e){return!!this.db.prepare(`SELECT 1 FROM observer_tasks
+      version = version + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE state IN ('queued', 'retry_authorized')`).run().changes}recordStepWitness(e,r,n){if(!r||!Number.isInteger(n)||n<0)throw new Error("invalid_model_step_witness");this.db.transaction(()=>{if(!this.get(e))throw new Error("observer_task_not_found");let s=this.db.prepare(`SELECT actual_calls AS actualCalls, state
+        FROM observer_task_steps WHERE task_id = ? AND model_step_id = ?`).get(e,r);if(s&&n<s.actualCalls)throw new Error("model_step_call_count_regressed");if(n>3){this.db.prepare(`INSERT INTO observer_task_steps
+          (task_id, model_step_id, actual_calls, state) VALUES (?, ?, 3, 'failed')
+          ON CONFLICT(task_id, model_step_id) DO UPDATE SET
+          actual_calls = 3, state = 'failed', updated_at = CURRENT_TIMESTAMP`).run(e,r),this.db.prepare(`UPDATE observer_tasks SET state = 'failed', version = version + 1,
+          actual_calls = 3, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND state = 'reconciliation'`).run(e);return}let i=n>=3?"failed":s?.state==="succeeded"?"succeeded":"reconciliation";this.db.prepare(`INSERT INTO observer_task_steps
+        (task_id, model_step_id, actual_calls, state) VALUES (?, ?, ?, ?)
+        ON CONFLICT(task_id, model_step_id) DO UPDATE SET
+        actual_calls = excluded.actual_calls, state = excluded.state,
+        updated_at = CURRENT_TIMESTAMP`).run(e,r,n,i),i==="failed"&&this.db.prepare(`UPDATE observer_tasks SET state = 'failed', version = version + 1,
+          updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'reconciliation'`).run(e);let o=this.db.prepare(`SELECT COALESCE(SUM(actual_calls), 0) AS calls
+        FROM observer_task_steps WHERE task_id = ?`).get(e);this.applyVerifiedCallCount(e,o.calls)})()}applyVerifiedCallCount(e,r){if(!Number.isInteger(r)||r<0)throw new Error("invalid_actual_call_count");return this.db.prepare(`UPDATE observer_tasks SET actual_calls = ?,
+      state = CASE WHEN ? >= 3 AND state = 'reconciliation' THEN 'failed' ELSE state END,
+      version = version + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND state IN ('reconciliation', 'failed') AND actual_calls != ?`).run(Math.min(r,3),r,e,Math.min(r,3)),this.get(e)}reserveManualRetry(e){return this.db.transaction(()=>{let r=this.db.prepare("SELECT task_id AS taskId, model_step_id AS modelStepId, action, state FROM observer_task_commands WHERE command_id = ?").get(e.commandId);if(r){if(r.taskId!==e.taskId||r.modelStepId!==e.modelStepId||r.action!=="retry")return{accepted:!1,reason:"version_conflict"};let i=this.get(e.taskId);return i?{accepted:!0,version:i.version,duplicate:!0}:{accepted:!1,reason:"not_found"}}let n=this.get(e.taskId);if(!n)return{accepted:!1,reason:"not_found"};if(n.version!==e.expectedVersion)return{accepted:!1,reason:"version_conflict"};if(n.state!=="reconciliation")return{accepted:!1,reason:"not_reconciling"};if(!e.modelStepId||!Number.isInteger(e.verifiedStepCalls)||e.verifiedStepCalls<0)return{accepted:!1,reason:"uncertain_calls"};let s=this.db.prepare(`SELECT actual_calls AS actualCalls, state
+        FROM observer_task_steps WHERE task_id = ? AND model_step_id = ?`).get(e.taskId,e.modelStepId);return!s||s.actualCalls!==e.verifiedStepCalls||s.state!=="reconciliation"?{accepted:!1,reason:"uncertain_calls"}:e.noInFlight?e.verifiedStepCalls>=3?{accepted:!1,reason:"exhausted"}:n.actualCalls>=3?{accepted:!1,reason:"exhausted"}:(this.db.prepare(`UPDATE observer_tasks SET state = 'retry_authorized',
+        version = version + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND state = 'reconciliation' AND version = ?`).run(e.taskId,e.expectedVersion),this.db.prepare(`INSERT INTO observer_task_commands (command_id, task_id, model_step_id, action, state)
+        VALUES (?, ?, ?, 'retry', 'accepted')`).run(e.commandId,e.taskId,e.modelStepId),{accepted:!0,version:e.expectedVersion+1,duplicate:!1}):{accepted:!1,reason:"in_flight"}})()}startManualRetry(e,r){return this.db.transaction(()=>{if(this.db.prepare(`UPDATE observer_task_commands SET state = 'started',
+        updated_at = CURRENT_TIMESTAMP WHERE command_id = ? AND task_id = ?
+        AND action = 'retry' AND state = 'accepted'`).run(e,r).changes!==1)return!1;if(this.db.prepare(`UPDATE observer_tasks SET state = 'queued',
+        version = version + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND state = 'retry_authorized'`).run(r).changes!==1)throw new Error("manual_retry_task_state_changed");return!0})()}hasUnresolved(e){return!!this.db.prepare(`SELECT 1 FROM observer_tasks
       WHERE session_db_id = ? AND state = 'reconciliation' LIMIT 1`).get(e)}list(e,r=100){return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
       content_session_id AS contentSessionId, source_id AS sourceId, payload,
-      state, actual_calls AS actualCalls, outcome FROM observer_tasks
+      state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
       WHERE state = ? ORDER BY created_at, id LIMIT ?`).all(e,Math.min(Math.max(r,1),500))}};var C$=require("bun:sqlite");Ue();se();T$();Jt();Wo();var zT=class t{db;static MISSING_SEARCH_INPUT_MESSAGE="Either query or filters required for search";constructor(e=fs){e instanceof C$.Database?this.db=e:(Rn(tt),this.db=new C$.Database(e)),Ml(this.db),this._fts5Available=this.isFts5Available(),this.ensureFTSTables()}_fts5Available;ensureFTSTables(){if(!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all().some(n=>n.name==="observations_fts"||n.name==="session_summaries_fts")){if(!this.isFts5Available()){y.warn("DB","FTS5 not available on this platform \u2014 skipping FTS table creation (search uses ChromaDB)");return}y.info("DB","Creating FTS5 tables");try{this.createFTSTablesAndTriggers(),y.info("DB","FTS5 tables created successfully")}catch(n){this._fts5Available=!1,y.warn("DB","FTS5 table creation failed \u2014 search will use ChromaDB and LIKE queries",{},n instanceof Error?n:void 0)}}}isFts5Available(){try{return this.db.run("CREATE VIRTUAL TABLE _fts5_probe USING fts5(test_column)"),this.db.run("DROP TABLE _fts5_probe"),!0}catch(e){return y.debug("DB","FTS5 probe failed \u2014 FTS5 unavailable on this platform",void 0,e instanceof Error?e:new Error(String(e))),!1}}createFTSTablesAndTriggers(){this.db.run(`
       CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
         title,
