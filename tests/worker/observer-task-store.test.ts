@@ -127,4 +127,23 @@ describe('ObserverTaskStore', () => {
       db.close();
     }
   });
+
+  it('makes the third expired business attempt terminal only for the same exact step', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 10, contentSessionId: 's10', sourceId: 'toolu10', payload: '{}' });
+      tasks.needsReconciliation([id]);
+      const first = 'a'.repeat(64);
+      const second = 'b'.repeat(64);
+      expect(tasks.recordExpiredBusinessAttempt(id, first, '1'.repeat(64))).toBe(1);
+      expect(tasks.recordExpiredBusinessAttempt(id, first, '1'.repeat(64))).toBe(1);
+      expect(tasks.recordExpiredBusinessAttempt(id, second, '2'.repeat(64))).toBe(1);
+      expect(tasks.get(id)?.state).toBe('reconciliation');
+      expect(tasks.recordExpiredBusinessAttempt(id, first, '3'.repeat(64))).toBe(2);
+      expect(tasks.get(id)?.state).toBe('reconciliation');
+      expect(tasks.recordExpiredBusinessAttempt(id, first, '4'.repeat(64))).toBe(3);
+      expect(tasks.get(id)?.state).toBe('failed');
+    } finally { db.close(); }
+  });
 });

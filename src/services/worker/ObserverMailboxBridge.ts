@@ -15,6 +15,15 @@ interface MailboxCommand {
   lease_token: string;
 }
 
+interface GatewayAttempt {
+  model_step_id: string;
+  identity: string;
+  phase: string;
+  in_flight: boolean | null;
+  deadline_at: string | null;
+  provider_call_started: boolean | null;
+}
+
 type Post = (path: string, body: Record<string, unknown>) => Promise<unknown>;
 
 /** Read-only business reconciliation over the owner-authenticated loopback forwarder. */
@@ -78,6 +87,43 @@ export class ObserverMailboxBridge {
         row.state === 'skipped' ? 'valid_business_skip' :
         row.state === 'failed' ? 'terminal_failure_persisted' : 'model_step_identity_unproven',
     });
+    for (const step of this.tasks.listBusinessFailureCounts(row.id)) {
+      await this.post('/v1/reconciliation/report', {
+        business_key: BUSINESS_KEY, task_id: row.id, model_step_id: step.modelStepId,
+        state: this.state(row), version: row.version,
+        failed_attempts: Math.min(step.failedAttempts, 3), max_attempts: 3,
+        retryable: false,
+        reason: row.state === 'failed' ? 'three_failed_business_attempts' :
+          'deadline_expired_without_business_result',
+      });
+    }
+  }
+
+  private recordExpiredAttempts(taskId: string, status: unknown): number {
+    const result = status as { task_id?: string; attempts?: GatewayAttempt[]; external_calls?: number };
+    if (result.external_calls !== 0 || result.task_id !== taskId || !Array.isArray(result.attempts)) {
+      throw new Error('invalid_observer_status_query');
+    }
+    let recorded = 0;
+    const now = Date.now();
+    for (const attempt of result.attempts) {
+      // `provider_call_started` is an admission witness, not proof of socket
+      // activity or billing. A completed deadline and no business result are
+      // enough to fail this business attempt, with no model call here.
+      if (attempt.provider_call_started !== true ||
+          !['admitted', 'completed', 'failed'].includes(attempt.phase) ||
+          attempt.in_flight !== false || !attempt.deadline_at ||
+          !Number.isFinite(Date.parse(attempt.deadline_at)) ||
+          Date.parse(attempt.deadline_at) > now) continue;
+      if (!STEP_ID.test(attempt.model_step_id) || !STEP_ID.test(attempt.identity)) {
+        throw new Error('invalid_observer_gateway_attempt');
+      }
+      const before = this.tasks.getBusinessFailureCount(taskId, attempt.model_step_id);
+      const after = this.tasks.recordExpiredBusinessAttempt(
+        taskId, attempt.model_step_id, attempt.identity);
+      if (after > before) recorded++;
+    }
+    return recorded;
   }
 
   async tick(): Promise<void> {
@@ -126,12 +172,13 @@ export class ObserverMailboxBridge {
           // substitute for a persisted business outcome or stable retry identity.
           const status = await this.post('/v1/task-attempts', {
             business_key: BUSINESS_KEY, task_id: command.task_id,
-          }) as { external_calls?: number };
-          if (status.external_calls !== 0) throw new Error('observer_status_query_not_zero_call');
-          reason = 'business_result_unconfirmed';
+          });
+          const newlyFailed = this.recordExpiredAttempts(command.task_id, status);
+          reason = newlyFailed ? 'deadline_expired_without_business_result' : 'business_result_unconfirmed';
         }
+        const current = this.tasks.get(command.task_id);
         this.tasks.finishCheckCommand(command.command_id, command.task_id,
-          this.state(row), row?.version ?? 0, reason);
+          this.state(current), current?.version ?? 0, reason);
       }
     }
     const saved = this.tasks.getCommandResult(command.command_id);

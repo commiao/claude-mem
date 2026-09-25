@@ -82,6 +82,14 @@ export class ObserverTaskStore {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(task_id, model_step_id)
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS observer_task_attempt_failures (
+      task_id TEXT NOT NULL,
+      model_step_id TEXT NOT NULL,
+      gateway_identity TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(task_id, model_step_id, gateway_identity)
+    )`);
   }
 
   create(input: ObserverTaskInput): string {
@@ -300,6 +308,44 @@ export class ObserverTaskStore {
       { state: string | null; version: number | null; reason: string | null } | undefined;
     if (!row || row.state === null || row.version === null || row.reason === null) return null;
     return { state: row.state, version: row.version, reason: row.reason };
+  }
+
+  /** A timed-out admitted request is a failed business attempt, independent of billing. */
+  recordExpiredBusinessAttempt(taskId: string, modelStepId: string, gatewayIdentity: string): number {
+    if (!/^[a-f0-9]{64}$/.test(modelStepId) || !/^[a-f0-9]{64}$/.test(gatewayIdentity)) {
+      throw new Error('invalid_gateway_attempt_identity');
+    }
+    return this.db.transaction(() => {
+      const task = this.get(taskId);
+      if (!task) throw new Error('observer_task_not_found');
+      if (task.state === 'succeeded' || task.state === 'skipped' || task.state === 'failed') {
+        return this.getBusinessFailureCount(taskId, modelStepId);
+      }
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO observer_task_attempt_failures
+        (task_id, model_step_id, gateway_identity, reason)
+        VALUES (?, ?, ?, 'deadline_expired_without_business_result')`)
+        .run(taskId, modelStepId, gatewayIdentity).changes;
+      const count = (this.db.prepare(`SELECT COUNT(*) AS count FROM observer_task_attempt_failures
+        WHERE task_id = ? AND model_step_id = ?`).get(taskId, modelStepId) as { count: number }).count;
+      if (inserted && task.state === 'reconciliation') {
+        this.db.prepare(`UPDATE observer_tasks SET version = version + 1,
+          state = CASE WHEN ? >= 3 THEN 'failed' ELSE state END,
+          updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'reconciliation'`)
+          .run(count, taskId);
+      }
+      return count;
+    })();
+  }
+
+  getBusinessFailureCount(taskId: string, modelStepId: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS count FROM observer_task_attempt_failures
+      WHERE task_id = ? AND model_step_id = ?`).get(taskId, modelStepId) as { count: number }).count;
+  }
+
+  listBusinessFailureCounts(taskId: string): Array<{ modelStepId: string; failedAttempts: number }> {
+    return this.db.prepare(`SELECT model_step_id AS modelStepId, COUNT(*) AS failedAttempts
+      FROM observer_task_attempt_failures WHERE task_id = ? GROUP BY model_step_id
+      ORDER BY model_step_id`).all(taskId) as Array<{ modelStepId: string; failedAttempts: number }>;
   }
 
   hasUnresolved(sessionDbId: number): boolean {
