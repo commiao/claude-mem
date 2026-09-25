@@ -133,4 +133,52 @@ describe('ObserverMailboxBridge', () => {
       expect(tasks.get(taskId)?.state).toBe('reconciliation');
     } finally { db.close(); }
   });
+
+  it('does not count a completed gateway model response as an HTTP failure', async () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const taskId = tasks.create({ sessionDbId: 6, contentSessionId: 's', sourceId: 'tool-6', payload: '{}' });
+      tasks.needsReconciliation([taskId]);
+      const step = 'c'.repeat(64);
+      const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/claim')) return { command: {
+          command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
+          action: 'check', expected_version: 1, lease_token: 'lease',
+        } };
+        if (path.endsWith('/task-attempts')) return { task_id: taskId, external_calls: 0,
+          attempts: [{ model_step_id: step, identity: '2'.repeat(64), phase: 'completed',
+            http_request_started_at: '2019-12-31T23:00:00Z', in_flight: false,
+            http_request_deadline_at: '2020-01-01T00:00:00Z' }] };
+        return {};
+      });
+      await bridge.tick();
+      expect(tasks.getBusinessFailureCount(taskId, step)).toBe(0);
+      expect(tasks.get(taskId)?.state).toBe('reconciliation');
+    } finally { db.close(); }
+  });
+
+  it('counts a terminal HTTP failure immediately without waiting for its deadline', async () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const taskId = tasks.create({ sessionDbId: 7, contentSessionId: 's', sourceId: 'tool-7', payload: '{}' });
+      tasks.needsReconciliation([taskId]);
+      const step = 'd'.repeat(64);
+      const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/claim')) return { command: {
+          command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
+          action: 'check', expected_version: 1, lease_token: 'lease',
+        } };
+        if (path.endsWith('/task-attempts')) return { task_id: taskId, external_calls: 0,
+          attempts: [{ model_step_id: step, identity: '3'.repeat(64), phase: 'failed',
+            http_request_started_at: '2020-01-01T00:00:00Z', in_flight: false,
+            http_request_deadline_at: '2099-01-01T00:00:00Z' }] };
+        return {};
+      });
+      await bridge.tick();
+      expect(tasks.getBusinessFailureCount(taskId, step)).toBe(1);
+      expect(tasks.get(taskId)?.state).toBe('reconciliation');
+    } finally { db.close(); }
+  });
 });

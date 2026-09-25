@@ -108,13 +108,15 @@ export class ObserverMailboxBridge {
     const now = Date.now();
     for (const attempt of result.attempts) {
       // The transport-start witness proves a concrete HTTP request began.
-      // Deadline expiry without a business result is a failed business attempt
-      // regardless of whether the provider charged or later returned bytes.
+      // A completed gateway response may still need business-result
+      // reconciliation, but it is not a failed model HTTP request. A terminal
+      // HTTP error fails immediately; an unresolved request needs its deadline.
       if (!attempt.http_request_started_at ||
+          !['admitted', 'failed', 'unknown'].includes(attempt.phase) ||
           !Number.isFinite(Date.parse(attempt.http_request_started_at)) ||
           attempt.in_flight !== false || !attempt.http_request_deadline_at ||
           !Number.isFinite(Date.parse(attempt.http_request_deadline_at)) ||
-          Date.parse(attempt.http_request_deadline_at) > now) continue;
+          (attempt.phase !== 'failed' && Date.parse(attempt.http_request_deadline_at) > now)) continue;
       if (!STEP_ID.test(attempt.model_step_id) || !STEP_ID.test(attempt.identity)) {
         throw new Error('invalid_observer_gateway_attempt');
       }
