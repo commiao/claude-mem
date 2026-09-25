@@ -20,8 +20,8 @@ interface GatewayAttempt {
   identity: string;
   phase: string;
   in_flight: boolean | null;
-  deadline_at: string | null;
-  provider_call_started: boolean | null;
+  http_request_started_at: string | null;
+  http_request_deadline_at: string | null;
 }
 
 type Post = (path: string, body: Record<string, unknown>) => Promise<unknown>;
@@ -107,14 +107,14 @@ export class ObserverMailboxBridge {
     let recorded = 0;
     const now = Date.now();
     for (const attempt of result.attempts) {
-      // `provider_call_started` is an admission witness, not proof of socket
-      // activity or billing. A completed deadline and no business result are
-      // enough to fail this business attempt, with no model call here.
-      if (attempt.provider_call_started !== true ||
-          !['admitted', 'completed', 'failed'].includes(attempt.phase) ||
-          attempt.in_flight !== false || !attempt.deadline_at ||
-          !Number.isFinite(Date.parse(attempt.deadline_at)) ||
-          Date.parse(attempt.deadline_at) > now) continue;
+      // The transport-start witness proves a concrete HTTP request began.
+      // Deadline expiry without a business result is a failed business attempt
+      // regardless of whether the provider charged or later returned bytes.
+      if (!attempt.http_request_started_at ||
+          !Number.isFinite(Date.parse(attempt.http_request_started_at)) ||
+          attempt.in_flight !== false || !attempt.http_request_deadline_at ||
+          !Number.isFinite(Date.parse(attempt.http_request_deadline_at)) ||
+          Date.parse(attempt.http_request_deadline_at) > now) continue;
       if (!STEP_ID.test(attempt.model_step_id) || !STEP_ID.test(attempt.identity)) {
         throw new Error('invalid_observer_gateway_attempt');
       }

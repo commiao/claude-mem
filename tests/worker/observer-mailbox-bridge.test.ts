@@ -59,7 +59,7 @@ describe('ObserverMailboxBridge', () => {
     } finally { db.close(); }
   });
 
-  it('counts an expired admitted business attempt once, independent of billing evidence', async () => {
+  it('counts an expired started HTTP request once, independent of billing evidence', async () => {
     const db = new Database(':memory:');
     try {
       const tasks = new ObserverTaskStore(db);
@@ -75,8 +75,8 @@ describe('ObserverMailboxBridge', () => {
         } };
         if (path.endsWith('/task-attempts')) return { task_id: taskId, external_calls: 0,
           attempts: [{ model_step_id: step, identity: 'c'.repeat(64), phase: 'admitted',
-            provider_call_started: true, in_flight: false,
-            deadline_at: '2020-01-01T00:00:00Z' }] };
+            http_request_started_at: '2019-12-31T23:00:00Z', in_flight: false,
+            http_request_deadline_at: '2020-01-01T00:00:00Z' }] };
         return {};
       });
       await bridge.tick();
@@ -100,8 +100,32 @@ describe('ObserverMailboxBridge', () => {
         } };
         if (path.endsWith('/task-attempts')) return { task_id: taskId, external_calls: 0,
           attempts: [{ model_step_id: step, identity: 'e'.repeat(64), phase: 'admitted',
-            provider_call_started: true, in_flight: true,
-            deadline_at: '2020-01-01T00:00:00Z' }] };
+            http_request_started_at: '2019-12-31T23:00:00Z', in_flight: true,
+            http_request_deadline_at: '2020-01-01T00:00:00Z' }] };
+        return {};
+      });
+      await bridge.tick();
+      expect(tasks.getBusinessFailureCount(taskId, step)).toBe(0);
+      expect(tasks.get(taskId)?.state).toBe('reconciliation');
+    } finally { db.close(); }
+  });
+
+  it('does not count provider admission without a transport-start witness', async () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const taskId = tasks.create({ sessionDbId: 5, contentSessionId: 's', sourceId: 'tool-5', payload: '{}' });
+      tasks.needsReconciliation([taskId]);
+      const step = 'f'.repeat(64);
+      const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/claim')) return { command: {
+          command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
+          action: 'check', expected_version: 1, lease_token: 'lease',
+        } };
+        if (path.endsWith('/task-attempts')) return { task_id: taskId, external_calls: 0,
+          attempts: [{ model_step_id: step, identity: '1'.repeat(64), phase: 'admitted',
+            provider_admitted: true, http_request_started_at: null, in_flight: false,
+            http_request_deadline_at: null }] };
         return {};
       });
       await bridge.tick();
