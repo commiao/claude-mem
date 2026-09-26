@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
+import { logger } from '../../utils/logger.js';
 
 export type ObserverTaskState = 'queued' | 'reconciliation' | 'retry_authorized' | 'succeeded' | 'skipped' | 'failed';
 
@@ -125,10 +126,19 @@ export class ObserverTaskStore {
       const row = this.db.prepare('SELECT id, payload FROM observer_tasks WHERE session_db_id = ? AND source_id = ?')
         .get(input.sessionDbId, input.sourceId) as { id: string; payload: string };
       if (row.payload !== input.payload) {
+        logger.warn('WORKER', 'Observer task source identity conflicts with persisted payload', {
+          sessionDbId: input.sessionDbId,
+        });
         throw new Error('observer_task_source_payload_changed');
       }
+      logger.debug('QUEUE', 'Observer task persisted', {
+        taskId: row.id,
+        sessionDbId: input.sessionDbId,
+        reusedExisting: row.id !== id,
+      });
       return row.id;
     }
+    logger.debug('QUEUE', 'Observer task persisted', { taskId: id, sessionDbId: input.sessionDbId });
     return id;
   }
 

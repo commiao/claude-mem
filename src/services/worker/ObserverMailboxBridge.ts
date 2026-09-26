@@ -1,5 +1,6 @@
 import type { ObserverTaskStore, ObserverTaskRow } from './ObserverTaskStore.js';
 import { readFileSync, statSync } from 'fs';
+import { logger } from '../../utils/logger.js';
 
 const BUSINESS_KEY = 'claude_mem.observation';
 const UNKNOWN_STEP = '0'.repeat(64);
@@ -31,6 +32,7 @@ export class ObserverMailboxBridge {
   private cursor = '';
   private busy = false;
   private stopped = false;
+  private lastLoggedFailure: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly tasks: ObserverTaskStore, private readonly post: Post) {}
@@ -59,9 +61,20 @@ export class ObserverMailboxBridge {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => { void this.tick().catch(() => undefined); }, 10_000);
+    this.timer = setInterval(() => { void this.tick().catch(error => this.logTickFailure(error)); }, 10_000);
     this.timer.unref?.();
-    void this.tick().catch(() => undefined);
+    void this.tick().catch(error => this.logTickFailure(error));
+  }
+
+  private logTickFailure(error: unknown): void {
+    const message = error instanceof Error ? error.message : '';
+    const reason = /^observer_(?:mailbox|command|status)_[a-z0-9_]+$/.test(message)
+      ? message
+      : 'transport_or_processing_error';
+    if (reason !== this.lastLoggedFailure) {
+      logger.warn('WORKER', 'Observer reconciliation mailbox tick failed', { reason });
+      this.lastLoggedFailure = reason;
+    }
   }
 
   stop(): void {
@@ -143,6 +156,7 @@ export class ObserverMailboxBridge {
       const claimed = await this.post('/v1/reconciliation/claim', { business_key: BUSINESS_KEY }) as
         { command?: MailboxCommand | null };
       if (claimed.command) await this.handle(claimed.command);
+      this.lastLoggedFailure = null;
     } finally {
       this.busy = false;
     }

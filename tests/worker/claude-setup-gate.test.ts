@@ -99,6 +99,7 @@ describe('Claude setup-required generator gate', () => {
 
     const sessionManager = {
       getSession: () => activeSession,
+      hasUnresolvedObserverTasks: () => false,
       getMessageBuffer: () => ({
         getPendingCount: () => 1,
         peekTypes: () => [],
