@@ -542,9 +542,10 @@ export class ClaudeProvider {
                 sessionId: session.sessionDbId,
                 subtype: resultSubtype,
               });
-              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+              this.sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);
               session.abortReason = 'transport:observer_result';
               session.abortController.abort();
+              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
               break;
             } else {
               await processAgentResponse(
@@ -770,6 +771,7 @@ export class ClaudeProvider {
         const obsPrompt = buildObservationPrompt({
           // 这条观测的持久身份。用它，同一行的重投才会生成同一份提示。
           id: message._persistentId,
+          recoveryTaskId: message.recoveryTaskId,
           tool_name: message.tool_name!,
           tool_input: JSON.stringify(optimized.toolInput),
           tool_output: JSON.stringify(optimized.toolOutput),
@@ -782,6 +784,17 @@ export class ClaudeProvider {
           created_at_epoch: message._originalTimestamp,
           cwd: message.cwd
         });
+        if (message.recoveryTaskId) {
+          try {
+            this.dbManager.getObserverTaskStore().recordPreparedPrompt(
+              message.recoveryTaskId, obsPrompt, message._originalTimestamp);
+          } catch (error) {
+            // Never send a rebuilt prompt with a different body under the same
+            // durable business task. Reconciliation must inspect this drift.
+            this.dbManager.getObserverTaskStore().needsReconciliation([message.recoveryTaskId]);
+            throw error;
+          }
+        }
         activeResponseContext.current = snapshotResponseContext(session);
 
         session.conversationHistory.push({ role: 'user', content: obsPrompt });

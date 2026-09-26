@@ -99,6 +99,12 @@ export interface PendingMessage {
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  /** UUID of the durable observer task, independent of this process's queue id. */
+  recoveryTaskId?: string;
+  /** Durable first enqueue time used in the observation prompt. */
+  originalTimestamp?: number;
+  /** Dormant manual replay permit. No runtime executor consumes it yet. */
+  manualReplayPermitId?: string;
 }
 
 export interface PendingMessageWithId extends PendingMessage {
@@ -115,6 +121,9 @@ export interface ObservationData {
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  recoveryTaskId?: string;
+  originalTimestamp?: number;
+  manualReplayPermitId?: string;
 }
 
 export interface SSEEvent {

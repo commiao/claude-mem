@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { setIngestContext, ingestObservation } from '../../src/services/worker/http/shared.js';
 import { logger } from '../../src/utils/logger.js';
 
@@ -32,7 +33,10 @@ describe('ingestObservation dual-write to tool_uses', () => {
           queued.push({ sessionDbId, data });
         },
       } as any,
-      dbManager: { getSessionStore: () => store } as any,
+      dbManager: {
+        getSessionStore: () => store,
+        getObserverTaskStore: () => new ObserverTaskStore(store!.db),
+      } as any,
       eventBroadcaster: { broadcastObservationQueued: mock(() => {}) } as any,
       ensureGeneratorRunning: mock(async () => {}),
     });
@@ -62,6 +66,9 @@ describe('ingestObservation dual-write to tool_uses', () => {
     expect(queued).toHaveLength(1);
     expect(queued[0].data.tool_name).toBe('Read');
     expect(queued[0].data.toolUseId).toBe('toolu_dual_01');
+    expect(queued[0].data.originalTimestamp).toBe(
+      new ObserverTaskStore(store!.db).get(queued[0].data.recoveryTaskId)?.enqueuedAtEpoch,
+    );
 
     // The durable backup row exists with the raw payload.
     const rows = store!.queryToolUses({ contentSessionId: 'content-session-1' });
@@ -126,6 +133,7 @@ describe('ingestObservation dual-write to tool_uses', () => {
         queueObservation: async (sessionDbId: number, data: any) => { queued.push({ sessionDbId, data }); },
       } as any,
       dbManager: {
+        getObserverTaskStore: () => new ObserverTaskStore(store!.db),
         getSessionStore: () => new Proxy(store as any, {
           get(target, prop) {
             if (prop === 'upsertToolUse') return () => { throw new Error('disk full'); };

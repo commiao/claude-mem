@@ -1,6 +1,7 @@
 
 import { Database } from 'bun:sqlite';
 import { SessionStore } from '../sqlite/SessionStore.js';
+import { ObserverTaskStore } from './ObserverTaskStore.js';
 import { SessionSearch } from '../sqlite/SessionSearch.js';
 import { openConfiguredSqliteDatabase } from '../sqlite/connection.js';
 import { ChromaSync } from '../sync/ChromaSync.js';
@@ -13,6 +14,7 @@ import type { DBSession } from '../worker-types.js';
 export class DatabaseManager {
   private db: Database | null = null;
   private sessionStore: SessionStore | null = null;
+  private observerTaskStore: ObserverTaskStore | null = null;
   private sessionSearch: SessionSearch | null = null;
   private chromaSync: ChromaSync | null = null;
   private cloudSync: CloudSync | null = null;
@@ -36,6 +38,7 @@ export class DatabaseManager {
     // local corpus as a nonqueued baseline once; only subsequent writes enter
     // the canonical v2 outbox.
     this.sessionStore = new SessionStore(this.db, { syncOpsEnabled: cloudSyncConfigured });
+    this.observerTaskStore = new ObserverTaskStore(this.db);
     this.sessionSearch = new SessionSearch(this.db);
 
     const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
@@ -61,6 +64,7 @@ export class DatabaseManager {
     this.cloudSync = null;
 
     this.sessionStore = null;
+    this.observerTaskStore = null;
     this.sessionSearch = null;
 
     if (this.db) {
@@ -75,6 +79,11 @@ export class DatabaseManager {
       throw new Error('Database not initialized');
     }
     return this.sessionStore;
+  }
+
+  getObserverTaskStore(): ObserverTaskStore {
+    if (!this.observerTaskStore) throw new Error('Database not initialized');
+    return this.observerTaskStore;
   }
 
   getSessionSearch(): SessionSearch {

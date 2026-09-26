@@ -80,6 +80,7 @@ import {
 import { notifyGrokBotIndex } from './integrations/GrokBotIndexWriter.js';
 
 import { DatabaseManager } from './worker/DatabaseManager.js';
+import { ObserverMailboxBridge } from './worker/ObserverMailboxBridge.js';
 import { SessionManager } from './worker/SessionManager.js';
 import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { ClaudeProvider, classifyClaudeError } from './worker/ClaudeProvider.js';
@@ -216,6 +217,7 @@ export class WorkerService implements WorkerRef {
   private readonly deferredSessionEndQueue = new DeferredSessionEndQueue();
 
   private dbManager: DatabaseManager;
+  private observerMailbox: ObserverMailboxBridge | null = null;
   private sessionManager: SessionManager;
   public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: ClaudeProvider;
@@ -556,6 +558,14 @@ export class WorkerService implements WorkerRef {
 
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
+      this.sessionManager.recoverStrandedObserverTasks();
+      const reconciliationForwarder = process.env.CLAUDE_MEM_RECONCILIATION_FORWARDER_URL;
+      const reconciliationTokenFile = process.env.CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE;
+      if (reconciliationForwarder && reconciliationTokenFile) {
+        this.observerMailbox = ObserverMailboxBridge.forLoopback(
+          this.dbManager.getObserverTaskStore(), reconciliationForwarder, reconciliationTokenFile);
+        this.observerMailbox.start();
+      }
 
       // A SessionEnd hook gets a tiny host budget and persists its identifier
       // when the worker is unavailable. Drain that idempotent spool as soon as
@@ -872,6 +882,8 @@ export class WorkerService implements WorkerRef {
       isShuttingDown: () => this.isShuttingDown,
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
+        this.observerMailbox?.stop();
+        this.observerMailbox = null;
         if (this.deferredSessionEndReplayTimer !== null) {
           clearInterval(this.deferredSessionEndReplayTimer);
           this.deferredSessionEndReplayTimer = null;

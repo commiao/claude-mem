@@ -1,0 +1,438 @@
+import { createHash, randomUUID } from 'crypto';
+import type { Database } from 'bun:sqlite';
+import { logger } from '../../utils/logger.js';
+
+export type ObserverTaskState = 'queued' | 'reconciliation' | 'retry_authorized' | 'succeeded' | 'skipped' | 'failed';
+
+export interface ObserverTaskInput {
+  sessionDbId: number;
+  contentSessionId: string;
+  sourceId: string | null;
+  payload: string;
+  enqueuedAtEpoch?: number;
+}
+
+export interface ObserverTaskRow extends Omit<ObserverTaskInput, 'enqueuedAtEpoch'> {
+  id: string;
+  state: ObserverTaskState;
+  actualCalls: number;
+  version: number;
+  outcome: string | null;
+  enqueuedAtEpoch: number | null;
+}
+
+export interface PreparedObserverPrompt {
+  taskId: string;
+  prompt: string;
+  promptDigest: string;
+  enqueuedAtEpoch: number;
+}
+
+export interface RetryDecision {
+  commandId: string;
+  taskId: string;
+  modelStepId: string;
+  expectedVersion: number;
+  verifiedStepCalls: number;
+  /** True only after an authoritative gateway query proves no call remains in flight. */
+  noInFlight: boolean;
+}
+
+export type RetryReservation =
+  | { accepted: true; version: number; duplicate: boolean }
+  | { accepted: false; reason: 'not_found' | 'version_conflict' | 'not_reconciling' | 'uncertain_calls' | 'exhausted' | 'in_flight' };
+
+/** Durable source and state for observer work. The RAM message id is never an identity. */
+export class ObserverTaskStore {
+  constructor(private readonly db: Database) {
+    db.run(`CREATE TABLE IF NOT EXISTS observer_tasks (
+      id TEXT PRIMARY KEY,
+      session_db_id INTEGER NOT NULL,
+      content_session_id TEXT NOT NULL,
+      source_id TEXT,
+      payload TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'queued',
+      actual_calls INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1,
+      outcome TEXT,
+      enqueued_at_epoch INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_db_id, source_id)
+    )`);
+    db.run('CREATE INDEX IF NOT EXISTS idx_observer_tasks_state ON observer_tasks(state, session_db_id)');
+    const columns = db.prepare('PRAGMA table_info(observer_tasks)').all() as Array<{ name: string }>;
+    if (!columns.some(column => column.name === 'version')) {
+      db.run('ALTER TABLE observer_tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!columns.some(column => column.name === 'enqueued_at_epoch')) {
+      db.run('ALTER TABLE observer_tasks ADD COLUMN enqueued_at_epoch INTEGER');
+    }
+    db.run(`CREATE TABLE IF NOT EXISTS observer_task_prepared_prompts (
+      task_id TEXT PRIMARY KEY,
+      prompt TEXT NOT NULL,
+      prompt_digest TEXT NOT NULL,
+      enqueued_at_epoch INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS observer_task_commands (
+      command_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      model_step_id TEXT,
+      action TEXT NOT NULL CHECK(action IN ('check', 'retry')),
+      state TEXT NOT NULL CHECK(state IN ('accepted', 'started', 'finished')),
+      result_state TEXT,
+      result_version INTEGER,
+      result_reason TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    const commandColumns = db.prepare('PRAGMA table_info(observer_task_commands)').all() as Array<{ name: string }>;
+    for (const [name, declaration] of [
+      ['result_state', 'TEXT'], ['result_version', 'INTEGER'], ['result_reason', 'TEXT'],
+    ] as const) {
+      if (!commandColumns.some(column => column.name === name)) {
+        db.run(`ALTER TABLE observer_task_commands ADD COLUMN ${name} ${declaration}`);
+      }
+    }
+    db.run(`CREATE TABLE IF NOT EXISTS observer_task_steps (
+      task_id TEXT NOT NULL,
+      model_step_id TEXT NOT NULL,
+      actual_calls INTEGER NOT NULL DEFAULT 0 CHECK(actual_calls BETWEEN 0 AND 3),
+      state TEXT NOT NULL DEFAULT 'reconciliation' CHECK(state IN ('reconciliation', 'succeeded', 'failed')),
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(task_id, model_step_id)
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS observer_task_attempt_failures (
+      task_id TEXT NOT NULL,
+      model_step_id TEXT NOT NULL,
+      gateway_identity TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(task_id, model_step_id, gateway_identity)
+    )`);
+  }
+
+  create(input: ObserverTaskInput): string {
+    const id = randomUUID();
+    const epoch = input.enqueuedAtEpoch ?? Date.now();
+    if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error('invalid_observer_enqueue_time');
+    this.db.prepare(`INSERT INTO observer_tasks
+      (id, session_db_id, content_session_id, source_id, payload, enqueued_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_db_id, source_id) DO NOTHING`)
+      .run(id, input.sessionDbId, input.contentSessionId, input.sourceId, input.payload, epoch);
+    if (input.sourceId) {
+      const row = this.db.prepare('SELECT id, payload FROM observer_tasks WHERE session_db_id = ? AND source_id = ?')
+        .get(input.sessionDbId, input.sourceId) as { id: string; payload: string };
+      if (row.payload !== input.payload) {
+        logger.warn('WORKER', 'Observer task source identity conflicts with persisted payload', {
+          sessionDbId: input.sessionDbId,
+        });
+        throw new Error('observer_task_source_payload_changed');
+      }
+      logger.debug('QUEUE', 'Observer task persisted', {
+        taskId: row.id,
+        sessionDbId: input.sessionDbId,
+        reusedExisting: row.id !== id,
+      });
+      return row.id;
+    }
+    logger.debug('QUEUE', 'Observer task persisted', { taskId: id, sessionDbId: input.sessionDbId });
+    return id;
+  }
+
+  get(id: string): ObserverTaskRow | null {
+    const row = this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
+      content_session_id AS contentSessionId, source_id AS sourceId, payload,
+      state, actual_calls AS actualCalls, version, outcome,
+      enqueued_at_epoch AS enqueuedAtEpoch FROM observer_tasks WHERE id = ?`)
+      .get(id) as ObserverTaskRow | undefined;
+    return row ?? null;
+  }
+
+  /** Save the exact prompt before handing it to the SDK for its first send. */
+  recordPreparedPrompt(taskId: string, prompt: string, enqueuedAtEpoch: number): PreparedObserverPrompt {
+    if (!prompt || !Number.isSafeInteger(enqueuedAtEpoch) || enqueuedAtEpoch <= 0) {
+      throw new Error('invalid_prepared_observer_prompt');
+    }
+    const promptDigest = createHash('sha256').update(prompt).digest('hex');
+    return this.db.transaction(() => {
+      const task = this.get(taskId);
+      if (!task || task.enqueuedAtEpoch !== enqueuedAtEpoch) {
+        throw new Error('observer_task_enqueue_time_changed');
+      }
+      const existing = this.getPreparedPrompt(taskId);
+      if (existing) {
+        if (existing.prompt !== prompt || existing.promptDigest !== promptDigest ||
+            existing.enqueuedAtEpoch !== enqueuedAtEpoch) {
+          throw new Error('observer_task_prepared_prompt_changed');
+        }
+        return existing;
+      }
+      this.db.prepare(`INSERT INTO observer_task_prepared_prompts
+        (task_id, prompt, prompt_digest, enqueued_at_epoch) VALUES (?, ?, ?, ?)`)
+        .run(taskId, prompt, promptDigest, enqueuedAtEpoch);
+      return { taskId, prompt, promptDigest, enqueuedAtEpoch };
+    })();
+  }
+
+  getPreparedPrompt(taskId: string): PreparedObserverPrompt | null {
+    const row = this.db.prepare(`SELECT task_id AS taskId, prompt,
+      prompt_digest AS promptDigest, enqueued_at_epoch AS enqueuedAtEpoch
+      FROM observer_task_prepared_prompts WHERE task_id = ?`)
+      .get(taskId) as PreparedObserverPrompt | undefined;
+    return row ?? null;
+  }
+
+  needsReconciliation(ids: string[]): void {
+    const update = this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',
+      updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'queued'`);
+    this.db.transaction(() => { for (const id of ids) update.run(id); })();
+  }
+
+  recordPersistedOutcome(ids: string[], outcome: string): void {
+    const update = this.db.prepare(`UPDATE observer_tasks SET state = 'succeeded', outcome = ?,
+      updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state IN ('queued', 'reconciliation')`);
+    this.db.transaction(() => { for (const id of ids) update.run(outcome, id); })();
+  }
+
+  recordSkipped(ids: string[], reason: string): void {
+    const update = this.db.prepare(`UPDATE observer_tasks SET state = 'skipped', outcome = ?,
+      updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'queued'`);
+    this.db.transaction(() => { for (const id of ids) update.run(reason, id); })();
+  }
+
+  /** On restart, no in-RAM claim can prove whether an old queued row was sent. */
+  markStrandedQueuedForReconciliation(): number {
+    const result = this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',
+      version = version + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE state IN ('queued', 'retry_authorized')`).run();
+    return result.changes;
+  }
+
+  /** Persist an authoritative gateway witness for one stable business step. */
+  recordStepWitness(taskId: string, modelStepId: string, actualCalls: number): void {
+    if (!modelStepId || !Number.isInteger(actualCalls) || actualCalls < 0) {
+      throw new Error('invalid_model_step_witness');
+    }
+    this.db.transaction(() => {
+      if (!this.get(taskId)) throw new Error('observer_task_not_found');
+      const row = this.db.prepare(`SELECT actual_calls AS actualCalls, state
+        FROM observer_task_steps WHERE task_id = ? AND model_step_id = ?`)
+        .get(taskId, modelStepId) as { actualCalls: number; state: string } | undefined;
+      if (row && actualCalls < row.actualCalls) throw new Error('model_step_call_count_regressed');
+      if (actualCalls > 3) {
+        this.db.prepare(`INSERT INTO observer_task_steps
+          (task_id, model_step_id, actual_calls, state) VALUES (?, ?, 3, 'failed')
+          ON CONFLICT(task_id, model_step_id) DO UPDATE SET
+          actual_calls = 3, state = 'failed', updated_at = CURRENT_TIMESTAMP`)
+          .run(taskId, modelStepId);
+        this.db.prepare(`UPDATE observer_tasks SET state = 'failed', version = version + 1,
+          actual_calls = 3, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND state = 'reconciliation'`).run(taskId);
+        return;
+      }
+      const state = actualCalls >= 3 ? 'failed' : row?.state === 'succeeded' ? 'succeeded' : 'reconciliation';
+      this.db.prepare(`INSERT INTO observer_task_steps
+        (task_id, model_step_id, actual_calls, state) VALUES (?, ?, ?, ?)
+        ON CONFLICT(task_id, model_step_id) DO UPDATE SET
+        actual_calls = excluded.actual_calls, state = excluded.state,
+        updated_at = CURRENT_TIMESTAMP`).run(taskId, modelStepId, actualCalls, state);
+      if (state === 'failed') {
+        this.db.prepare(`UPDATE observer_tasks SET state = 'failed', version = version + 1,
+          updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'reconciliation'`).run(taskId);
+      }
+      const aggregate = this.db.prepare(`SELECT COALESCE(SUM(actual_calls), 0) AS calls
+        FROM observer_task_steps WHERE task_id = ?`).get(taskId) as { calls: number };
+      this.applyVerifiedCallCount(taskId, aggregate.calls);
+    })();
+  }
+
+  /** Store the gateway's witnessed model-call count. Unknown evidence never enters here. */
+  applyVerifiedCallCount(taskId: string, actualCalls: number): ObserverTaskRow | null {
+    if (!Number.isInteger(actualCalls) || actualCalls < 0) throw new Error('invalid_actual_call_count');
+    this.db.prepare(`UPDATE observer_tasks SET actual_calls = ?,
+      state = CASE WHEN ? >= 3 AND state = 'reconciliation' THEN 'failed' ELSE state END,
+      version = version + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND state IN ('reconciliation', 'failed') AND actual_calls != ?`)
+      .run(Math.min(actualCalls, 3), actualCalls, taskId, Math.min(actualCalls, 3));
+    return this.get(taskId);
+  }
+
+  reserveManualRetry(input: RetryDecision): RetryReservation {
+    return this.db.transaction((): RetryReservation => {
+      const prior = this.db.prepare('SELECT task_id AS taskId, model_step_id AS modelStepId, action, state FROM observer_task_commands WHERE command_id = ?')
+        .get(input.commandId) as { taskId: string; modelStepId: string; action: string; state: string } | undefined;
+      if (prior) {
+        if (prior.taskId !== input.taskId || prior.modelStepId !== input.modelStepId || prior.action !== 'retry') {
+          return { accepted: false, reason: 'version_conflict' };
+        }
+        const task = this.get(input.taskId);
+        return task ? { accepted: true, version: task.version, duplicate: true } : { accepted: false, reason: 'not_found' };
+      }
+      const task = this.get(input.taskId);
+      if (!task) return { accepted: false, reason: 'not_found' };
+      if (task.version !== input.expectedVersion) return { accepted: false, reason: 'version_conflict' };
+      if (task.state !== 'reconciliation') return { accepted: false, reason: 'not_reconciling' };
+      if (!input.modelStepId || !Number.isInteger(input.verifiedStepCalls) || input.verifiedStepCalls < 0) {
+        return { accepted: false, reason: 'uncertain_calls' };
+      }
+      const step = this.db.prepare(`SELECT actual_calls AS actualCalls, state
+        FROM observer_task_steps WHERE task_id = ? AND model_step_id = ?`)
+        .get(input.taskId, input.modelStepId) as { actualCalls: number; state: string } | undefined;
+      if (!step || step.actualCalls !== input.verifiedStepCalls || step.state !== 'reconciliation') {
+        return { accepted: false, reason: 'uncertain_calls' };
+      }
+      if (!input.noInFlight) return { accepted: false, reason: 'in_flight' };
+      if (input.verifiedStepCalls >= 3) return { accepted: false, reason: 'exhausted' };
+      // Preserve the global task ceiling as well as the per-step ceiling.
+      // A model SDK may issue several distinct internal calls for one task.
+      if (task.actualCalls >= 3) return { accepted: false, reason: 'exhausted' };
+      this.db.prepare(`UPDATE observer_tasks SET state = 'retry_authorized',
+        version = version + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND state = 'reconciliation' AND version = ?`)
+        .run(input.taskId, input.expectedVersion);
+      this.db.prepare(`INSERT INTO observer_task_commands (command_id, task_id, model_step_id, action, state)
+        VALUES (?, ?, ?, 'retry', 'accepted')`).run(input.commandId, input.taskId, input.modelStepId);
+      return { accepted: true, version: input.expectedVersion + 1, duplicate: false };
+    })();
+  }
+
+  startManualRetry(commandId: string, taskId: string): boolean {
+    return this.db.transaction(() => {
+      const command = this.db.prepare(`UPDATE observer_task_commands SET state = 'started',
+        updated_at = CURRENT_TIMESTAMP WHERE command_id = ? AND task_id = ?
+        AND action = 'retry' AND state = 'accepted'`).run(commandId, taskId);
+      if (command.changes !== 1) return false;
+      const task = this.db.prepare(`UPDATE observer_tasks SET state = 'queued',
+        version = version + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND state = 'retry_authorized'`).run(taskId);
+      if (task.changes !== 1) throw new Error('manual_retry_task_state_changed');
+      return true;
+    })();
+  }
+
+  /** Claim a mailbox command locally. Re-delivery returns its saved result. */
+  beginCheckCommand(commandId: string, taskId: string, modelStepId: string):
+    { duplicate: boolean; finished: boolean; resultState: string | null; resultVersion: number | null; resultReason: string | null } {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT task_id AS taskId, model_step_id AS modelStepId,
+        action, state, result_state AS resultState, result_version AS resultVersion,
+        result_reason AS resultReason FROM observer_task_commands WHERE command_id = ?`)
+        .get(commandId) as {
+          taskId: string; modelStepId: string; action: string; state: string;
+          resultState: string | null; resultVersion: number | null; resultReason: string | null;
+        } | undefined;
+      if (row) {
+        if (row.taskId !== taskId || row.modelStepId !== modelStepId || row.action !== 'check') {
+          throw new Error('observer_command_identity_conflict');
+        }
+        return { duplicate: true, finished: row.state === 'finished',
+          resultState: row.resultState, resultVersion: row.resultVersion, resultReason: row.resultReason };
+      }
+      this.db.prepare(`INSERT INTO observer_task_commands
+        (command_id, task_id, model_step_id, action, state) VALUES (?, ?, ?, 'check', 'accepted')`)
+        .run(commandId, taskId, modelStepId);
+      return { duplicate: false, finished: false, resultState: null, resultVersion: null, resultReason: null };
+    })();
+  }
+
+  finishCheckCommand(commandId: string, taskId: string, resultState: string,
+    resultVersion: number, resultReason: string): void {
+    const result = this.db.prepare(`UPDATE observer_task_commands SET state = 'finished',
+      result_state = ?, result_version = ?, result_reason = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ? AND task_id = ? AND action = 'check' AND state = 'accepted'`)
+      .run(resultState, resultVersion, resultReason, commandId, taskId);
+    if (result.changes !== 1) throw new Error('observer_check_command_not_claimed');
+  }
+
+  rejectUnverifiableRetry(commandId: string, taskId: string, modelStepId: string): void {
+    this.db.transaction(() => {
+      const prior = this.db.prepare(`SELECT task_id AS taskId, model_step_id AS modelStepId,
+        action FROM observer_task_commands WHERE command_id = ?`)
+        .get(commandId) as { taskId: string; modelStepId: string; action: string } | undefined;
+      if (prior) {
+        if (prior.taskId !== taskId || prior.modelStepId !== modelStepId || prior.action !== 'retry') {
+          throw new Error('observer_command_identity_conflict');
+        }
+        return;
+      }
+      const task = this.get(taskId);
+      this.db.prepare(`INSERT INTO observer_task_commands
+        (command_id, task_id, model_step_id, action, state,
+         result_state, result_version, result_reason)
+        VALUES (?, ?, ?, 'retry', 'finished', ?, ?, 'retry_identity_unproven')`)
+        .run(commandId, taskId, modelStepId, task?.state ?? 'reconciliation', task?.version ?? 0);
+    })();
+  }
+
+  getCommandResult(commandId: string):
+    { state: string; version: number; reason: string } | null {
+    const row = this.db.prepare(`SELECT result_state AS state, result_version AS version,
+      result_reason AS reason FROM observer_task_commands
+      WHERE command_id = ? AND state = 'finished'`).get(commandId) as
+      { state: string | null; version: number | null; reason: string | null } | undefined;
+    if (!row || row.state === null || row.version === null || row.reason === null) return null;
+    return { state: row.state, version: row.version, reason: row.reason };
+  }
+
+  /** A timed-out admitted request is a failed business attempt, independent of billing. */
+  recordExpiredBusinessAttempt(taskId: string, modelStepId: string, gatewayIdentity: string): number {
+    if (!/^[a-f0-9]{64}$/.test(modelStepId) || !/^[a-f0-9]{64}$/.test(gatewayIdentity)) {
+      throw new Error('invalid_gateway_attempt_identity');
+    }
+    return this.db.transaction(() => {
+      const task = this.get(taskId);
+      if (!task) throw new Error('observer_task_not_found');
+      if (task.state !== 'reconciliation') {
+        return this.getBusinessFailureCount(taskId, modelStepId);
+      }
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO observer_task_attempt_failures
+        (task_id, model_step_id, gateway_identity, reason)
+        VALUES (?, ?, ?, 'deadline_expired_without_business_result')`)
+        .run(taskId, modelStepId, gatewayIdentity).changes;
+      const count = (this.db.prepare(`SELECT COUNT(*) AS count FROM observer_task_attempt_failures
+        WHERE task_id = ? AND model_step_id = ?`).get(taskId, modelStepId) as { count: number }).count;
+      if (inserted && task.state === 'reconciliation') {
+        this.db.prepare(`UPDATE observer_tasks SET version = version + 1,
+          state = CASE WHEN ? >= 3 THEN 'failed' ELSE state END,
+          updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'reconciliation'`)
+          .run(count, taskId);
+      }
+      return count;
+    })();
+  }
+
+  getBusinessFailureCount(taskId: string, modelStepId: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS count FROM observer_task_attempt_failures
+      WHERE task_id = ? AND model_step_id = ?`).get(taskId, modelStepId) as { count: number }).count;
+  }
+
+  listBusinessFailureCounts(taskId: string): Array<{ modelStepId: string; failedAttempts: number }> {
+    return this.db.prepare(`SELECT model_step_id AS modelStepId, COUNT(*) AS failedAttempts
+      FROM observer_task_attempt_failures WHERE task_id = ? GROUP BY model_step_id
+      ORDER BY model_step_id`).all(taskId) as Array<{ modelStepId: string; failedAttempts: number }>;
+  }
+
+  hasUnresolved(sessionDbId: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM observer_tasks
+      WHERE session_db_id = ? AND state = 'reconciliation' LIMIT 1`).get(sessionDbId);
+  }
+
+  list(state: ObserverTaskState, limit = 100): ObserverTaskRow[] {
+    return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
+      content_session_id AS contentSessionId, source_id AS sourceId, payload,
+      state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
+      WHERE state = ? ORDER BY created_at, id LIMIT ?`).all(state, Math.min(Math.max(limit, 1), 500)) as ObserverTaskRow[];
+  }
+
+  listReportableAfter(afterId: string, limit = 20): ObserverTaskRow[] {
+    return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
+      content_session_id AS contentSessionId, source_id AS sourceId, payload,
+      state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
+      WHERE state IN ('reconciliation', 'succeeded', 'skipped', 'failed')
+        AND id > ? ORDER BY id LIMIT ?`)
+      .all(afterId, Math.min(Math.max(limit, 1), 100)) as ObserverTaskRow[];
+  }
+}

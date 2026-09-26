@@ -3030,7 +3030,7 @@ export class SessionStore {
     promptNumber?: number,
     discoveryTokens: number = 0,
     overrideTimestampEpoch?: number,
-    generatedByModel?: string
+    generatedByModel?: string,
   ): { id: number; createdAtEpoch: number } {
     // storeObservations skips empty-title rows, which would leave no id to return here.
     // This wrapper stores exactly one observation, so require a title up front rather than
@@ -3132,7 +3132,8 @@ export class SessionStore {
     promptNumber?: number,
     discoveryTokens: number = 0,
     overrideTimestampEpoch?: number,
-    generatedByModel?: string
+    generatedByModel?: string,
+    onStored?: (result: { observationIds: number[]; summaryId: number | null; createdAtEpoch: number }) => void,
   ): { observationIds: number[]; summaryId: number | null; createdAtEpoch: number } {
     const timestampEpoch = overrideTimestampEpoch ?? Date.now();
     const timestampIso = new Date(timestampEpoch).toISOString();
@@ -3229,7 +3230,12 @@ export class SessionStore {
         summaryId = Number(result.lastInsertRowid);
       }
 
-      return { observationIds, summaryId, createdAtEpoch: timestampEpoch };
+      const result = { observationIds, summaryId, createdAtEpoch: timestampEpoch };
+      // The caller may persist its task outcome on this same SQLite connection.
+      // If either write fails, neither the business result nor its task receipt
+      // commits, so reconciliation cannot see a false terminal state.
+      onStored?.(result);
+      return result;
     });
 
     return storeTx();

@@ -3,6 +3,7 @@ import { Database } from 'bun:sqlite';
 import type { Server } from 'node:http';
 import express from 'express';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { setIngestContext, ingestObservation } from '../../src/services/worker/http/shared.js';
 import { SessionRoutes } from '../../src/services/worker/http/routes/SessionRoutes.js';
 import { logger } from '../../src/utils/logger.js';
@@ -54,7 +55,10 @@ describe('skill_invoked telemetry', () => {
           queued.push({ sessionDbId, data });
         },
       } as any,
-      dbManager: { getSessionStore: () => store } as any,
+      dbManager: {
+        getSessionStore: () => store,
+        getObserverTaskStore: () => new ObserverTaskStore(store!.db),
+      } as any,
       eventBroadcaster: { broadcastObservationQueued: mock(() => {}) } as any,
       ensureGeneratorRunning: mock(async () => {}),
     });

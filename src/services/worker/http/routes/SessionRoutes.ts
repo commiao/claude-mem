@@ -149,6 +149,16 @@ export class SessionRoutes extends BaseRouteHandler {
     const session = this.sessionManager.getSession(sessionDbId);
     if (!session) return;
 
+    // A model failure requires an explicit operator decision. Later tool
+    // observations may still be queued, but must not trigger another call.
+    if (this.sessionManager.hasUnresolvedObserverTasks(sessionDbId)) {
+      logger.warn('SESSION', 'Observer task awaits reconciliation; generator start withheld', {
+        sessionId: sessionDbId,
+        source,
+      });
+      return;
+    }
+
     // The claiming variant: this path is about to SEND, so it must take the
     // single gateway re-probe rather than merely reading the clock.
     const selection = selectProviderForGenerator();
@@ -388,6 +398,10 @@ export class SessionRoutes extends BaseRouteHandler {
           myController.abort();
           return;
         }
+
+        // The provider may throw before producing an SDK result. Preserve the
+        // exact source and require reconciliation before another model call.
+        this.sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);
 
         // No retry: the generator failed, the in-RAM batch is dropped, and the
         // transcript is the recovery path. The next observation ingest will
