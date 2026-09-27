@@ -33,6 +33,19 @@ class CutoverTests(unittest.TestCase):
         self.args.bundle_sha='wrong'
         with patch.object(c,'health',self.ready),self.assertRaisesRegex(ValueError,'differs'):c.main(self.args)
         self.assertFalse((self.old/'capture-handoff.json').exists())
+    def test_prepare_keeps_credentials_local_and_overrides_only_runtime_location(self):
+        (self.old/'capture-handoff-g.receipt.json').write_text(json.dumps({'phase':'capturing','generation':'g','prior_hooks':{},'legacy_pid':123}))
+        for name in ['.cwd-remap-applied-v1','.cleanup-v12.4.3-applied']:
+            (self.old/name).write_text('already applied')
+        env='ANTHROPIC_AUTH_TOKEN=fixture-only\nCLAUDE_MEM_WORKER_PORT=37701\n'
+        (self.old/'.env').write_text(env)
+        self.args.stage='prepare'
+        with patch.object(c,'health',self.ready),patch.object(c,'hooks',return_value={}),patch.object(c,'prepare',return_value={'baseline_observation_id':1}):c.main(self.args)
+        self.assertEqual((self.old/'.env').read_text(),env)
+        self.assertIn('ANTHROPIC_AUTH_TOKEN=fixture-only',(self.new/'.env').read_text())
+        self.assertIn('CLAUDE_MEM_WORKER_PORT=37721',(self.new/'.env').read_text())
+        self.assertEqual((self.new/'.env').stat().st_mode & 0o777,0o600)
+
     def test_switch_checks_pid_artifact_and_preserves_other_settings(self):
         self.make_prepared();response=MagicMock();response.__enter__.return_value.status=200
         with patch.object(c,'health',self.ready),patch.object(c.subprocess,'run',return_value=SimpleNamespace(stdout='/bun '+str(self.bundle))),patch.object(c.urllib.request,'urlopen',return_value=response):c.main(self.args)
