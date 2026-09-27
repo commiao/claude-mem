@@ -48,12 +48,15 @@ the original `SessionManager` → `SessionRoutes` → `ClaudeProvider` path.
 
 The worker relies on the CredVault integration to enforce the actual HTTP
 boundary. The short-lived SDK process receives only
-`X-CredVault-Replay-Permit: <command_id>` and
+`X-CredVault-Replay-Permit: <command_id>`,
+`X-CredVault-Replay-Step-Id: <original-step>`, and
 `Idempotency-Key: cmretry-<command_id>`; the worker strips stale replay headers
-and requires an HTTP loopback `ANTHROPIC_BASE_URL`. Prompt digests and the old
-step hash are not sent as extra headers. The forwarder pins the full new wire
-body and key locally, coalesces SDK transport retries with the same key/body,
-and rejects body drift. Gateway admission validates the active claimed command,
+and requires an HTTP loopback `ANTHROPIC_BASE_URL`. The step hint is local only and is stripped before Gateway forwarding. The bridge
+first checks `/v1/replay-snapshot` for an exact original request and prompt match.
+The forwarder restores that complete original conversation, pins the restored
+body and command key, and the Gateway coalesces duplicate key/body requests.
+Missing historical snapshots produce a failed task without model dispatch;
+temporary snapshot-status failures remain observation errors. Gateway admission validates the active claimed command,
 lease, task, report version, failed-step evidence, and exact-step start budget;
 it maps the new wire request to the original logical step from its mailbox.
 

@@ -104,15 +104,16 @@ describe('prepared observer manual replay', () => {
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:39001',
       CLAUDE_CODE_MAX_RETRIES: '9',
       ANTHROPIC_CUSTOM_HEADERS: 'X-CredVault-Replay-Prompt-SHA256: stale\nX-Model-Gateway-Step-Id: stale\nX-Other: kept',
-    }, { permitId: COMMAND_ID, idempotencyKey: `cmretry-${COMMAND_ID}`, commandId: COMMAND_ID });
+    }, { permitId: COMMAND_ID, idempotencyKey: `cmretry-${COMMAND_ID}`, commandId: COMMAND_ID, modelStepId: MODEL_STEP });
     expect(env.CLAUDE_CODE_MAX_RETRIES).toBe('0');
     expect(env.ANTHROPIC_CUSTOM_HEADERS).toContain(`X-CredVault-Replay-Permit: ${COMMAND_ID}`);
     expect(env.ANTHROPIC_CUSTOM_HEADERS).toContain(`Idempotency-Key: cmretry-${COMMAND_ID}`);
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toContain(`X-CredVault-Replay-Step-Id: ${MODEL_STEP}`);
     expect(env.ANTHROPIC_CUSTOM_HEADERS).toContain('X-Other: kept');
     expect(env.ANTHROPIC_CUSTOM_HEADERS).not.toContain('Prompt-SHA256');
     expect(env.ANTHROPIC_CUSTOM_HEADERS).not.toContain('X-Model-Gateway-Step-Id');
     expect(() => withManualReplayHeaders({ ANTHROPIC_BASE_URL: 'https://api.anthropic.com' },
-      { permitId: COMMAND_ID, idempotencyKey: `cmretry-${COMMAND_ID}`, commandId: COMMAND_ID }))
+      { permitId: COMMAND_ID, idempotencyKey: `cmretry-${COMMAND_ID}`, commandId: COMMAND_ID, modelStepId: MODEL_STEP }))
       .toThrow('manual_replay_requires_loopback_gateway');
   });
 });

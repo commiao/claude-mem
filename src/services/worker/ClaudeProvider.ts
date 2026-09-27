@@ -43,14 +43,14 @@ import { clearDependencyStatus, recordClaudeCliSetupRequired } from '../../share
 import { createHash } from 'crypto';
 
 const REPLAY_HEADER_NAMES = new Set([
-  'x-credvault-replay-permit', 'x-credvault-replay-prompt-sha256',
+  'x-credvault-replay-permit', 'x-credvault-replay-prompt-sha256', 'x-credvault-replay-step-id',
   'x-model-gateway-step-id', 'idempotency-key',
 ]);
 
 /** Configure permit headers and retry budget only for one manual replay subprocess. */
 export function withManualReplayHeaders(
   env: NodeJS.ProcessEnv,
-  admission: { permitId: string; idempotencyKey: string; commandId: string },
+  admission: { permitId: string; idempotencyKey: string; commandId: string; modelStepId: string },
 ): NodeJS.ProcessEnv {
   const configuredBase = env.ANTHROPIC_BASE_URL;
   let base: URL | null = null;
@@ -59,7 +59,7 @@ export function withManualReplayHeaders(
     throw new Error('manual_replay_requires_loopback_gateway');
   }
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(admission.commandId) ||
-      admission.permitId !== admission.commandId ||
+      admission.permitId !== admission.commandId || !/^[a-f0-9]{64}$/.test(admission.modelStepId) ||
       admission.idempotencyKey !== `cmretry-${admission.commandId}`) {
     throw new Error('invalid_manual_replay_headers');
   }
@@ -76,6 +76,7 @@ export function withManualReplayHeaders(
     ANTHROPIC_CUSTOM_HEADERS: [
       ...existing,
       `X-CredVault-Replay-Permit: ${admission.permitId}`,
+      `X-CredVault-Replay-Step-Id: ${admission.modelStepId}`,
       `Idempotency-Key: ${admission.idempotencyKey}`,
     ].join('\n'),
   };
@@ -317,6 +318,7 @@ export class ClaudeProvider {
           permitId: manualReplay.manualReplayPermitId!,
           idempotencyKey: manualReplay.manualReplayIdempotencyKey!,
           commandId: manualReplay.manualReplayCommandId!,
+          modelStepId: manualReplay.manualReplayModelStepId!,
         });
       }
       const authMethod = getAuthMethodDescription();

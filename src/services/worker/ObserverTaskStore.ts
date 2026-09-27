@@ -156,6 +156,12 @@ export class ObserverTaskStore {
     return row ?? null;
   }
 
+  markRecoveryUnavailable(taskId: string, reason: string): void {
+    this.db.prepare(`UPDATE observer_tasks SET state = 'failed', outcome = ?,
+      version = version + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND state = 'reconciliation'`).run(reason, taskId);
+  }
+
   /** Save the exact prompt before handing it to the SDK for its first send. */
   recordPreparedPrompt(taskId: string, prompt: string, enqueuedAtEpoch: number): PreparedObserverPrompt {
     if (!prompt || !Number.isSafeInteger(enqueuedAtEpoch) || enqueuedAtEpoch <= 0) {

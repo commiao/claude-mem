@@ -351,20 +351,33 @@ export class ObserverMailboxBridge {
                   markerCount !== 1 || !prepared.prompt.includes(marker) ||
                   prepared.enqueuedAtEpoch !== current.enqueuedAtEpoch) {
                 reason = 'prepared_prompt_identity_unavailable';
+                this.tasks.markRecoveryUnavailable(command.task_id, reason);
               } else {
-                const execution = await this.replayDispatcher.dispatch({
-                  commandId: command.command_id, taskId: command.task_id,
-                  modelStepId: command.model_step_id, observedVersion: current.version,
-                  admission: {
-                    permitId: command.command_id,
-                    idempotencyKey: `cmretry-${command.command_id}`,
-                    promptDigest,
-                    baselineActualCalls: current.actualCalls,
-                  },
-                });
-                reason = execution.started
-                  ? await this.waitForReplay(command, claimedAt, current.actualCalls, execution)
-                  : execution.reason;
+                const snapshot = await this.post('/v1/replay-snapshot', {
+                  business_key: BUSINESS_KEY, task_id: command.task_id,
+                  model_step_id: command.model_step_id, prompt_digest: promptDigest,
+                }) as { available?: boolean };
+                if (typeof snapshot.available !== 'boolean') {
+                  throw new Error('original_request_snapshot_status_unavailable');
+                }
+                if (!snapshot.available) {
+                  reason = 'original_request_snapshot_unavailable';
+                  this.tasks.markRecoveryUnavailable(command.task_id, reason);
+                } else {
+                  const execution = await this.replayDispatcher.dispatch({
+                    commandId: command.command_id, taskId: command.task_id,
+                    modelStepId: command.model_step_id, observedVersion: current.version,
+                    admission: {
+                      permitId: command.command_id,
+                      idempotencyKey: `cmretry-${command.command_id}`,
+                      promptDigest,
+                      baselineActualCalls: current.actualCalls,
+                    },
+                  });
+                  reason = execution.started
+                    ? await this.waitForReplay(command, claimedAt, current.actualCalls, execution)
+                    : execution.reason;
+                }
               }
             }
           }

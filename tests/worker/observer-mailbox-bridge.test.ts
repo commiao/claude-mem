@@ -18,6 +18,7 @@ describe('ObserverMailboxBridge', () => {
         action: 'check' as const, expected_version: tasks.get(taskId)!.version, lease_token: 'lease' };
       const bridge = new ObserverMailboxBridge(tasks, async (path, body) => {
         requests.push({ path, body });
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command };
         if (path.endsWith('/task-attempts')) return { task_id: taskId, attempts: [], external_calls: 0 };
         return { ok: true };
@@ -43,6 +44,7 @@ describe('ObserverMailboxBridge', () => {
       const paths: string[] = [];
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
         paths.push(path);
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: 'a'.repeat(64),
           action: 'reconcile', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -69,6 +71,7 @@ describe('ObserverMailboxBridge', () => {
       const paths: string[] = [];
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
         paths.push(path);
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: MODEL_STEP,
           action: 'reconcile', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -97,6 +100,7 @@ describe('ObserverMailboxBridge', () => {
       let dispatches = 0;
       let statusReads = 0;
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'reconcile', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -131,6 +135,31 @@ describe('ObserverMailboxBridge', () => {
     } finally { db.close(); }
   });
 
+  it('moves missing original request context to failed without dispatching a model', async () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const taskId = tasks.create({ sessionDbId: 21, contentSessionId: 's', sourceId: 'missing-context', payload: '{}' });
+      tasks.recordPreparedPrompt(taskId, `[[cm-task:${taskId}]] original task`, tasks.get(taskId)!.enqueuedAtEpoch!);
+      tasks.needsReconciliation([taskId]);
+      let dispatches = 0;
+      const bridge = new ObserverMailboxBridge(tasks, async path => {
+        if (path.endsWith('/replay-snapshot')) return { available: false };
+        if (path.endsWith('/claim')) return { command: {
+          command_id: COMMAND_ID, task_id: taskId, model_step_id: MODEL_STEP,
+          action: 'reconcile', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
+        } };
+        if (path.endsWith('/task-attempts')) return { task_id: taskId, attempts: [], external_calls: 0 };
+        return {};
+      }, { dispatch: async () => { dispatches++; throw new Error('must not dispatch'); } });
+      await bridge.tick();
+      expect(dispatches).toBe(0);
+      expect(tasks.get(taskId)).toMatchObject({ state: 'failed', actualCalls: 0,
+        outcome: 'original_request_snapshot_unavailable' });
+      expect(tasks.getCommandResult(COMMAND_ID)?.state).toBe('failed');
+    } finally { db.close(); }
+  });
+
   it('counts an expired started HTTP request once, independent of billing evidence', async () => {
     const db = new Database(':memory:');
     try {
@@ -140,6 +169,7 @@ describe('ObserverMailboxBridge', () => {
       const step = 'b'.repeat(64);
       let serial = 0;
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: `ad566e18-e04c-47f8-a50c-${(1 + serial++).toString(16).padStart(12, '0')}`,
           task_id: taskId, model_step_id: step, action: 'check',
@@ -166,6 +196,7 @@ describe('ObserverMailboxBridge', () => {
       const step = 'd'.repeat(64);
       const deadline = new Date(Date.now() + 60_000).toISOString();
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'check', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -190,6 +221,7 @@ describe('ObserverMailboxBridge', () => {
       tasks.needsReconciliation([taskId]);
       const step = 'e'.repeat(64);
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'check', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -216,6 +248,7 @@ describe('ObserverMailboxBridge', () => {
       tasks.needsReconciliation([taskId]);
       const step = 'f'.repeat(64);
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'check', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -240,6 +273,7 @@ describe('ObserverMailboxBridge', () => {
       tasks.needsReconciliation([taskId]);
       const step = 'c'.repeat(64);
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'check', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -265,6 +299,7 @@ describe('ObserverMailboxBridge', () => {
       tasks.needsReconciliation([taskId]);
       const step = 'd'.repeat(64);
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'check', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -289,6 +324,7 @@ describe('ObserverMailboxBridge', () => {
       tasks.needsReconciliation([taskId]);
       const step = 'a'.repeat(64);
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: step,
           action: 'check', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
@@ -314,6 +350,7 @@ describe('ObserverMailboxBridge', () => {
       const steps = ['4', '5', '6'].map(char => char.repeat(64));
       const identities = ['7', '8', '9'].map(char => char.repeat(64));
       const bridge = new ObserverMailboxBridge(tasks, async (path) => {
+        if (path.endsWith('/replay-snapshot')) return { available: true };
         if (path.endsWith('/claim')) return { command: {
           command_id: COMMAND_ID, task_id: taskId, model_step_id: steps[0],
           action: 'reconcile', expected_version: tasks.get(taskId)!.version, lease_token: 'lease',
