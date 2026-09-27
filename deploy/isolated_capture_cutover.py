@@ -79,6 +79,16 @@ def main(a):
         for marker in ['.cwd-remap-applied-v1','.cleanup-v12.4.3-applied']:
             data=(old/marker).read_bytes();(new/marker).write_bytes(data)
         (new/'legacy-settings.before.json').write_bytes(raw);(new/'legacy-settings.before.json').chmod(0o600)
+        # The daemon sanitizes inherited credentials and re-reads its local
+        # env file. Preserve credentials locally without printing any values.
+        env_path=old/'.env'
+        if env_path.exists():
+            env_text=env_path.read_text()
+            env_text=re.sub(r'^(?:export )?CLAUDE_MEM_WORKER_PORT=.*$', 'CLAUDE_MEM_WORKER_PORT='+str(a.new_port),env_text,flags=re.M)
+            env_text=re.sub(r'^(?:export )?CLAUDE_MEM_DATA_DIR=.*$', 'CLAUDE_MEM_DATA_DIR='+str(new),env_text,flags=re.M)
+            fd=os.open(new/'.env',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+            with os.fdopen(fd,'w') as output:output.write(env_text)
+
         updated={**settings,'CLAUDE_MEM_DATA_DIR':str(new),'CLAUDE_MEM_WORKER_PORT':str(a.new_port),'CLAUDE_MEM_WORKER_HOST':'127.0.0.1','CLAUDE_MEM_CHROMA_ENABLED':'false','CLAUDE_MEM_TRANSCRIPTS_ENABLED':'false','CLAUDE_MEM_CODEX_TRANSCRIPT_INGESTION':'false','CLAUDE_MEM_CLOUD_SYNC_HUB_URL':'','CLAUDE_MEM_CLOUD_SYNC_TOKEN':'','CLAUDE_MEM_CLOUD_SYNC_USER_ID':''}
         atomic_json(new/'settings.json',updated)
         if digest(old/'settings.json')!=hashlib.sha256(raw).hexdigest():raise ValueError('legacy settings changed during preparation')
