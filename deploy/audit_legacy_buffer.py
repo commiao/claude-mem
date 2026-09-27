@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 HEADER = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\] \[([^\]]+)\] \[([^\]]+)\] (?:\[session-(\d+)\] )?", re.M)
@@ -202,7 +203,9 @@ def evidence(path, offset, line, event_id, label, timestamp, content):
 def match_sources(audit: dict, paths: list[Path], max_delay_ms: int = 10000) -> dict:
     wanted = {m['formatted_tool'] or '__summarize__' for s in audit['sessions'].values() for m in s['messages']}
     by_label = collections.defaultdict(list)
+    owners = {str(path): source_owner(path) for path in paths}
     for event in source_events(paths, wanted):
+        event['source_session_id'] = owners[event['path']]
         by_label[event['label']].append(event)
     totals = collections.Counter()
     for session in audit['sessions'].values():
@@ -211,7 +214,9 @@ def match_sources(audit: dict, paths: list[Path], max_delay_ms: int = 10000) -> 
             # A source completion must precede the hook enqueue. Future events
             # with the same command are never recovery evidence.
             matches = [e for e in by_label.get(message['formatted_tool'] or '__summarize__', [])
-                       if temporal_match(e, timestamp, max_delay_ms)]
+                       if temporal_match(e, timestamp, max_delay_ms)
+                       and session.get('content_session_id') is not None
+                       and e['source_session_id'] == session['content_session_id']]
             content = {e['content_sha256'] for e in matches}
             message['source_status'] = 'unique_content' if len(content) == 1 else ('ambiguous' if content else 'missing')
             message['source_evidence'] = matches
@@ -228,6 +233,32 @@ def match_sources(audit: dict, paths: list[Path], max_delay_ms: int = 10000) -> 
     return audit
 
 
+def source_owner(path: Path) -> str | None:
+    """Read declared hook session identity, never infer it from a filename."""
+    with path.open('rb') as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if row.get('type') == 'session_meta':
+                meta = row.get('payload', {})
+                return meta.get('session_id') or meta.get('id')
+            if row.get('sessionId'):
+                return row['sessionId']
+            # Only scan a small header prefix; absent identity fails closed.
+            if handle.tell() > 1024 * 1024:
+                break
+    return None
+
+
+def bind_sessions(audit: dict, database: Path) -> None:
+    with sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True) as db:
+        identities = dict(db.execute('SELECT id, content_session_id FROM sdk_sessions'))
+    for sid, session in audit['sessions'].items():
+        session['content_session_id'] = identities.get(int(sid))
+
+
 def temporal_match(event: dict, timestamp: int, max_delay_ms: int) -> bool:
     if event.get('timestamp_kind') == 'response_serialization':
         return (event['call_started_at_ms'] <= timestamp
@@ -241,8 +272,10 @@ def main():
     parser.add_argument('--worker-started-at', required=True)
     parser.add_argument('--source-root', action='append', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--session-db', type=Path, required=True)
     args = parser.parse_args()
     audit = audit_logs(list(args.logs.glob('claude-mem-*.log')), args.worker_started_at)
+    bind_sessions(audit, args.session_db)
     files = sorted({p for root in args.source_root for p in root.rglob('*.jsonl')})
     match_sources(audit, files)
     # Exclusive creation prevents an accidental overwrite of prior evidence.

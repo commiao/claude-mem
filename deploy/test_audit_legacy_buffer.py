@@ -57,7 +57,8 @@ class LegacyAuditTests(unittest.TestCase):
         result = self.run_logs(self.enqueue(500, 1, 1))
         timestamp = audit.millis('2026-09-28 01:00:00.500')
         p = self.root / 'source.jsonl'
-        rows = []
+        result['sessions'][7]['content_session_id'] = 'owner'
+        rows = [{'type': 'session_meta', 'payload': {'session_id': 'owner', 'id': 'child'}}]
         for ident, delta, output in [('a', -100, 'one'), ('b', -90, 'two'), ('future', 1, 'one')]:
             rows.append({'type': 'event_msg', 'payload': {'type': 'item_completed', 'completed_at_ms': timestamp+delta,
                 'item': {'type': 'CommandExecution', 'id': ident, 'command': ['zsh', '-c', 'echo hi'], 'aggregated_output': output}}})
@@ -67,6 +68,18 @@ class LegacyAuditTests(unittest.TestCase):
         self.assertEqual(message['source_status'], 'ambiguous')
         self.assertEqual(len(message['source_evidence']), 2)
         self.assertFalse(result['automatic_replay_allowed'])
+
+    def test_cross_session_same_command_cannot_match(self):
+        result = self.run_logs(self.enqueue(500, 1, 1))
+        result['sessions'][7]['content_session_id'] = 'owner'
+        p = self.root / 'owner-in-filename.jsonl'
+        p.write_text(json.dumps({'type': 'session_meta', 'payload': {'session_id': 'other'}}) + '\n' +
+            json.dumps({'type': 'event_msg', 'payload': {'type': 'item_completed',
+                'completed_at_ms': audit.millis('2026-09-28 01:00:00.400'),
+                'item': {'type': 'CommandExecution', 'command': ['zsh', '-c', 'echo hi'],
+                         'aggregated_output': 'wrong session'}}}))
+        audit.match_sources(result, [p])
+        self.assertEqual(result['sessions'][7]['messages'][0]['source_status'], 'missing')
 
     def test_response_serialization_requires_a_prior_call(self):
         event = {'timestamp_kind': 'response_serialization', 'call_started_at_ms': 100,
