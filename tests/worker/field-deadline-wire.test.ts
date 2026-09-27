@@ -1,21 +1,22 @@
 import { test, expect } from 'bun:test';
-import { createServer } from 'node:http';
+import { createServer, type Socket } from 'node:net';
 import { optimizeField } from '../../src/services/worker/field-optimizer.js';
 import { OpenRouterProvider } from '../../src/services/worker/OpenRouterProvider.js';
 
 test('field deadline cancels real OpenRouter fetch and prevents retries', async () => {
   let requests = 0;
   let disconnected = false;
-  const server = createServer((req, res) => {
-    requests++;
-    // Do not resume() the body: on older Bun versions that keeps the keep-alive
-    // socket open and `res.on('close')` does not fire within the observation
-    // window. The request's own abort/error and socket-close events are the
-    // event-driven, runtime-agnostic signal that the client disconnected.
-    req.on('error', () => { disconnected = true; });
-    req.on('close', () => { if ((req as any).aborted || (req as any).destroyed) disconnected = true; });
-    req.socket.on('close', () => { disconnected = true; });
-    // Deliberately never send headers: cancellation must reach the socket.
+  const sockets = new Set<Socket>();
+  // Observe the TCP boundary directly: Bun's node:http compatibility layer
+  // does not consistently forward response-close for a request without headers.
+  const server = createServer(socket => {
+    sockets.add(socket);
+    let received = false;
+    socket.on('data', () => {
+      if (!received) { requests++; received = true; }
+    });
+    socket.on('close', () => { disconnected = true; sockets.delete(socket); });
+    // Read the request but deliberately never send response headers.
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as { port: number };
@@ -43,7 +44,7 @@ test('field deadline cancels real OpenRouter fetch and prevents retries', async 
     expect(disconnected).toBe(true);
   } finally {
     globalThis.setTimeout = nativeTimeout;
-    server.closeAllConnections();
+    for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 }, 5000);

@@ -103,8 +103,16 @@ export interface PendingMessage {
   recoveryTaskId?: string;
   /** Durable first enqueue time used in the observation prompt. */
   originalTimestamp?: number;
-  /** Dormant manual replay permit. No runtime executor consumes it yet. */
+  /** Forwarder permit for this single operator-authorized task replay. */
   manualReplayPermitId?: string;
+  /** Gateway logical step id from the claimed human reconciliation command. */
+  manualReplayModelStepId?: string;
+  /** Fixed gateway key attached only to the one-shot replay subprocess. */
+  manualReplayIdempotencyKey?: string;
+  /** Local mailbox command id, used for durable deduplication. */
+  manualReplayCommandId?: string;
+  /** SHA-256 of the exact persisted prepared prompt bytes. */
+  manualReplayPromptDigest?: string;
 }
 
 export interface PendingMessageWithId extends PendingMessage {
@@ -124,6 +132,7 @@ export interface ObservationData {
   recoveryTaskId?: string;
   originalTimestamp?: number;
   manualReplayPermitId?: string;
+  manualReplayModelStepId?: string;
 }
 
 export interface SSEEvent {

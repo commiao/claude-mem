@@ -80,7 +80,7 @@ import {
 import { notifyGrokBotIndex } from './integrations/GrokBotIndexWriter.js';
 
 import { DatabaseManager } from './worker/DatabaseManager.js';
-import { ObserverMailboxBridge } from './worker/ObserverMailboxBridge.js';
+import { ObserverMailboxBridge, type ManualReplayDispatcher } from './worker/ObserverMailboxBridge.js';
 import { SessionManager } from './worker/SessionManager.js';
 import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { ClaudeProvider, classifyClaudeError } from './worker/ClaudeProvider.js';
@@ -218,6 +218,7 @@ export class WorkerService implements WorkerRef {
 
   private dbManager: DatabaseManager;
   private observerMailbox: ObserverMailboxBridge | null = null;
+  private sessionRoutes: SessionRoutes | null = null;
   private sessionManager: SessionManager;
   public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: ClaudeProvider;
@@ -407,10 +408,10 @@ export class WorkerService implements WorkerRef {
     });
 
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
-    this.server.registerRoutes(sessionRoutes);
+    this.sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
+    this.server.registerRoutes(this.sessionRoutes);
     attachIngestGeneratorStarter((sessionDbId, source) =>
-      sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
+      this.sessionRoutes!.ensureGeneratorRunning(sessionDbId, source),
     );
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
@@ -562,8 +563,37 @@ export class WorkerService implements WorkerRef {
       const reconciliationForwarder = process.env.CLAUDE_MEM_RECONCILIATION_FORWARDER_URL;
       const reconciliationTokenFile = process.env.CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE;
       if (reconciliationForwarder && reconciliationTokenFile) {
+        const taskStore = this.dbManager.getObserverTaskStore();
+        const replayDispatcher: ManualReplayDispatcher = {
+          dispatch: async input => {
+            const task = taskStore.get(input.taskId);
+            if (!task || !this.sessionRoutes || !this.sessionManager.canQueuePreparedReplay(input.taskId)) {
+              return { started: false, reason: 'manual_replay_runtime_not_isolated', completed: null };
+            }
+            const routes = this.sessionRoutes;
+            const started = await routes.startManualReplay(task.sessionDbId, task.id,
+              input.commandId, () => this.sessionManager.queuePreparedReplay(input));
+            if (!started) {
+              // This only removes a still-queued, unclaimed message. A running
+              // replay is left to its provider/Gateway lifecycle.
+              this.sessionManager.cancelQueuedManualReplay(task.id, input.commandId);
+              return { started: false, reason: 'manual_replay_queue_or_generator_rejected', completed: null };
+            }
+            const completed = routes.getManualReplayCompletion(input.commandId, task.id);
+            if (!completed) return { started: false, reason: 'manual_replay_completion_unavailable', completed: null };
+            return { started: true, reason: 'manual_replay_started', completed,
+              release: () => routes.releaseManualReplay(input.commandId, task.id) };
+          },
+          observe: (commandId, taskId) => {
+            const completed = this.sessionRoutes?.getManualReplayCompletion(commandId, taskId) ?? null;
+            return {
+              started: true, reason: 'manual_replay_already_started', completed,
+              release: () => this.sessionRoutes?.releaseManualReplay(commandId, taskId),
+            };
+          },
+        };
         this.observerMailbox = ObserverMailboxBridge.forLoopback(
-          this.dbManager.getObserverTaskStore(), reconciliationForwarder, reconciliationTokenFile);
+          taskStore, reconciliationForwarder, reconciliationTokenFile, replayDispatcher);
         this.observerMailbox.start();
       }
 

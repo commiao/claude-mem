@@ -58,18 +58,19 @@ describe('ObserverTaskStore', () => {
       const tasks = new ObserverTaskStore(db);
       const id = tasks.create({ sessionDbId: 5, contentSessionId: 's5', sourceId: 'toolu5', payload: '{}' });
       tasks.needsReconciliation([id]);
+      const modelStepId = 'a'.repeat(64);
       const command = {
-        commandId: 'command-5', taskId: id, modelStepId: 'step-5', expectedVersion: 2,
+        commandId: 'command-5', taskId: id, modelStepId, expectedVersion: 3,
         verifiedStepCalls: 1, noInFlight: true,
       };
       tasks.recordStepWitness(id, command.modelStepId, 1);
       expect(tasks.reserveManualRetry({ ...command, noInFlight: false }))
         .toEqual({ accepted: false, reason: 'in_flight' });
-      expect(tasks.reserveManualRetry(command)).toEqual({ accepted: true, version: 3, duplicate: false });
-      expect(tasks.reserveManualRetry(command)).toEqual({ accepted: true, version: 3, duplicate: true });
+      expect(tasks.reserveManualRetry(command)).toEqual({ accepted: true, version: 4, duplicate: false });
+      expect(tasks.reserveManualRetry(command)).toEqual({ accepted: true, version: 4, duplicate: true });
       expect(tasks.startManualRetry(command.commandId, id)).toBe(true);
       expect(tasks.startManualRetry(command.commandId, id)).toBe(false);
-      expect(tasks.get(id)).toMatchObject({ state: 'queued', actualCalls: 1, version: 4 });
+      expect(tasks.get(id)).toMatchObject({ state: 'queued', actualCalls: 1, version: 5 });
       expect(tasks.markStrandedQueuedForReconciliation()).toBe(1);
       expect(tasks.get(id)?.state).toBe('reconciliation');
     } finally {
@@ -77,33 +78,33 @@ describe('ObserverTaskStore', () => {
     }
   });
 
-  it('marks a failed model step terminal after three witnessed calls', () => {
+  it('does not equate three started calls with three failed calls', () => {
     const db = new Database(':memory:');
     try {
       const tasks = new ObserverTaskStore(db);
       const id = tasks.create({ sessionDbId: 7, contentSessionId: 's7', sourceId: 'toolu7', payload: '{}' });
       tasks.needsReconciliation([id]);
-      tasks.recordStepWitness(id, 'step-a', 3);
-      expect(tasks.get(id)?.state).toBe('failed');
-      expect(() => tasks.recordStepWitness(id, 'step-a', 2)).toThrow('model_step_call_count_regressed');
-      tasks.recordStepWitness(id, 'step-b', 1);
+      tasks.recordStepWitness(id, 'a'.repeat(64), 3);
+      expect(tasks.get(id)).toMatchObject({ state: 'reconciliation', actualCalls: 3 });
+      expect(() => tasks.recordStepWitness(id, 'a'.repeat(64), 2)).toThrow('model_step_call_count_regressed');
+      tasks.recordStepWitness(id, 'b'.repeat(64), 1);
       expect(db.prepare('SELECT actual_calls FROM observer_task_steps WHERE task_id = ? AND model_step_id = ?')
-        .get(id, 'step-b')).toEqual({ actual_calls: 1 });
+        .get(id, 'b'.repeat(64))).toEqual({ actual_calls: 1 });
     } finally {
       db.close();
     }
   });
 
-  it('keeps the three-call task ceiling when calls span different model steps', () => {
+  it('keeps task-wide actual-call progress when calls span model steps', () => {
     const db = new Database(':memory:');
     try {
       const tasks = new ObserverTaskStore(db);
       const id = tasks.create({ sessionDbId: 8, contentSessionId: 's8', sourceId: 'toolu8', payload: '{}' });
       tasks.needsReconciliation([id]);
-      tasks.recordStepWitness(id, 'step-one', 2);
+      tasks.recordStepWitness(id, 'c'.repeat(64), 2);
       expect(tasks.get(id)).toMatchObject({ actualCalls: 2, state: 'reconciliation' });
-      tasks.recordStepWitness(id, 'step-two', 1);
-      expect(tasks.get(id)).toMatchObject({ actualCalls: 3, state: 'failed' });
+      tasks.recordStepWitness(id, 'd'.repeat(64), 1);
+      expect(tasks.get(id)).toMatchObject({ actualCalls: 3, state: 'reconciliation' });
     } finally {
       db.close();
     }
@@ -114,14 +115,14 @@ describe('ObserverTaskStore', () => {
     try {
       const tasks = new ObserverTaskStore(db);
       const id = tasks.create({ sessionDbId: 9, contentSessionId: 's9', sourceId: 'toolu9', payload: '{}' });
-      expect(tasks.beginCheckCommand('check-9', id, '0'.repeat(64)))
+      expect(tasks.beginCheckCommand('check-9', id, 'e'.repeat(64)))
         .toMatchObject({ duplicate: false, finished: false });
       tasks.finishCheckCommand('check-9', id, 'reconciliation', 1, 'no_exact_step_evidence');
-      expect(tasks.beginCheckCommand('check-9', id, '0'.repeat(64))).toEqual({
+      expect(tasks.beginCheckCommand('check-9', id, 'e'.repeat(64))).toEqual({
         duplicate: true, finished: true, resultState: 'reconciliation',
         resultVersion: 1, resultReason: 'no_exact_step_evidence',
       });
-      expect(() => tasks.beginCheckCommand('check-9', 'different-task', '0'.repeat(64)))
+      expect(() => tasks.beginCheckCommand('check-9', 'different-task', 'e'.repeat(64)))
         .toThrow('observer_command_identity_conflict');
     } finally {
       db.close();
@@ -141,19 +142,35 @@ describe('ObserverTaskStore', () => {
       expect(tasks.recordExpiredBusinessAttempt(id, second, '2'.repeat(64))).toBe(1);
       expect(tasks.get(id)?.state).toBe('reconciliation');
       expect(tasks.recordExpiredBusinessAttempt(id, first, '3'.repeat(64))).toBe(2);
-      expect(tasks.get(id)?.state).toBe('reconciliation');
-      expect(tasks.recordExpiredBusinessAttempt(id, first, '4'.repeat(64))).toBe(3);
+      expect(tasks.get(id)).toMatchObject({ state: 'failed', outcome: 'three_failed_business_attempts' });
+      // The task is terminal at three unique failed HTTP attempts across all steps.
+      expect(tasks.recordExpiredBusinessAttempt(id, first, '4'.repeat(64))).toBe(2);
       expect(tasks.get(id)?.state).toBe('failed');
     } finally { db.close(); }
   });
 
-  it('does not record timeout failures while the business task is still queued', () => {
+  it('counts a witnessed expired call even when the local queue state has not caught up', () => {
     const db = new Database(':memory:');
     try {
       const tasks = new ObserverTaskStore(db);
       const id = tasks.create({ sessionDbId: 11, contentSessionId: 's11', sourceId: 'toolu11', payload: '{}' });
-      expect(tasks.recordExpiredBusinessAttempt(id, 'a'.repeat(64), 'b'.repeat(64))).toBe(0);
-      expect(tasks.getBusinessFailureCount(id, 'a'.repeat(64))).toBe(0);
+      expect(tasks.recordExpiredBusinessAttempt(id, 'a'.repeat(64), 'b'.repeat(64))).toBe(1);
+      expect(tasks.getBusinessFailureCount(id, 'a'.repeat(64))).toBe(1);
+      expect(tasks.get(id)).toMatchObject({ state: 'reconciliation', actualCalls: 0 });
+    } finally { db.close(); }
+  });
+
+  it('never counts one Gateway attempt identity under two logical model steps', () => {
+    const db = new Database(':memory:');
+    try {
+      const tasks = new ObserverTaskStore(db);
+      const id = tasks.create({ sessionDbId: 13, contentSessionId: 's13', sourceId: 'toolu13', payload: '{}' });
+      tasks.needsReconciliation([id]);
+      const identity = 'f'.repeat(64);
+      expect(tasks.recordExpiredBusinessAttempt(id, 'a'.repeat(64), identity)).toBe(1);
+      expect(() => tasks.recordExpiredBusinessAttempt(id, 'b'.repeat(64), identity))
+        .toThrow('observer_gateway_identity_step_conflict');
+      expect(tasks.getTaskBusinessFailureCount(id)).toBe(1);
     } finally { db.close(); }
   });
 

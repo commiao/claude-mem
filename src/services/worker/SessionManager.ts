@@ -9,12 +9,19 @@ import { deliverSessionWrapup, type TelegramWrapupFormatter } from '../integrati
 
 export const SESSION_END_WRAPUP_GRACE_MS = 5_000;
 
-export interface ManualReplayGate {
-  verify(input: { taskId: string; promptDigest: string; expectedVersion: number }): Promise<{
-    permitId: string;
-    cacheOnlyPrefixReady: true;
-    taskWideHttpGateReady: true;
-  }>;
+export interface ManualReplayAdmission {
+  permitId: string;
+  idempotencyKey: string;
+  promptDigest: string;
+  baselineActualCalls: number;
+}
+
+export interface PreparedReplayCommand {
+  commandId: string;
+  taskId: string;
+  modelStepId: string;
+  observedVersion: number;
+  admission: ManualReplayAdmission;
 }
 
 export class SessionManager {
@@ -24,57 +31,115 @@ export class SessionManager {
   private telegramWrapupFormatter: TelegramWrapupFormatter | null = null;
   private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.());
 
-  constructor(dbManager: DatabaseManager, private readonly manualReplayGate: ManualReplayGate | null = null) {
+  constructor(dbManager: DatabaseManager) {
     this.dbManager = dbManager;
   }
 
-  /** Dormant queue reconstruction; deliberately does not start a generator. */
-  async queuePreparedReplay(taskId: string, expectedVersion: number): Promise<boolean> {
-    if (process.env.CLAUDE_MEM_EXPERIMENTAL_REPLAY_QUEUE !== 'enabled' || !this.manualReplayGate) {
-      return false;
-    }
+  /** Check runtime isolation before the worker asks the forwarder for a permit. */
+  canQueuePreparedReplay(taskId: string): boolean {
     const taskStore = this.dbManager.getObserverTaskStore();
     const task = taskStore.get(taskId);
     const prepared = taskStore.getPreparedPrompt(taskId);
-    if (!task || task.state !== 'reconciliation' || task.version !== expectedVersion ||
+    if (!task || task.state !== 'reconciliation' ||
         !task.enqueuedAtEpoch || !prepared ||
         task.enqueuedAtEpoch !== prepared.enqueuedAtEpoch ||
-        this.buffer.getPendingCount(task.sessionDbId) !== 0) return false;
-    const admission = await this.manualReplayGate.verify({
-      taskId, promptDigest: prepared.promptDigest, expectedVersion,
-    });
-    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(admission.permitId) ||
-        admission.cacheOnlyPrefixReady !== true || admission.taskWideHttpGateReady !== true) return false;
-    // An asynchronous permit check may race a business outcome or new queue
-    // item. Re-read local state before the only mutation in this method.
-    const current = taskStore.get(taskId);
-    const stillPrepared = taskStore.getPreparedPrompt(taskId);
-    if (!current || current.state !== 'reconciliation' || current.version !== expectedVersion ||
-        stillPrepared?.promptDigest !== prepared.promptDigest ||
-        this.buffer.getPendingCount(current.sessionDbId) !== 0) return false;
-    const session = this.sessions.get(current.sessionDbId);
-    const sdkProcess = getSdkProcessForSession(current.sessionDbId);
+        this.buffer.getPendingCount(task.sessionDbId) !== 0 ||
+        taskStore.hasUnresolvedExcept(task.sessionDbId, taskId)) return false;
+    const session = this.sessions.get(task.sessionDbId);
+    const sdkProcess = getSdkProcessForSession(task.sessionDbId);
     if (session?.generatorPromise || (sdkProcess && !sdkProcess.process.killed && sdkProcess.process.exitCode === null)) {
       return false;
     }
+    try {
+      const source = JSON.parse(task.payload) as Record<string, unknown>;
+      return typeof source.tool_name === 'string' && typeof source.tool_input === 'string' &&
+        typeof source.tool_response === 'string' && Number.isSafeInteger(source.prompt_number);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Persist and queue one replay after the forwarder has issued its strict permit. */
+  async queuePreparedReplay(input: PreparedReplayCommand): Promise<boolean> {
+    const taskStore = this.dbManager.getObserverTaskStore();
+    const task = taskStore.get(input.taskId);
+    const prepared = taskStore.getPreparedPrompt(input.taskId);
+    if (!task || task.version !== input.observedVersion || !prepared ||
+        prepared.promptDigest !== input.admission.promptDigest ||
+        !this.canQueuePreparedReplay(input.taskId)) return false;
+    const admission = input.admission;
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(admission.permitId) ||
+        admission.permitId !== input.commandId ||
+      !/^[A-Za-z0-9._:-]{8,128}$/.test(admission.idempotencyKey) ||
+        !/^[a-f0-9]{64}$/.test(admission.promptDigest) ||
+        !Number.isSafeInteger(admission.baselineActualCalls) || admission.baselineActualCalls < 0) return false;
+
+    const reservation = taskStore.queueManualReplay({
+      commandId: input.commandId, taskId: input.taskId,
+      modelStepId: input.modelStepId, observedVersion: input.observedVersion,
+      permitId: admission.permitId, idempotencyKey: admission.idempotencyKey,
+      promptDigest: admission.promptDigest, baselineActualCalls: admission.baselineActualCalls,
+    });
+    if (!reservation.queued) return false;
+
     let source: Record<string, unknown>;
-    try { source = JSON.parse(current.payload) as Record<string, unknown>; }
-    catch { return false; }
-    if (typeof source.tool_name !== 'string' || typeof source.tool_input !== 'string' ||
-        typeof source.tool_response !== 'string' || !Number.isSafeInteger(source.prompt_number)) return false;
-    this.initializeSession(current.sessionDbId);
-    this.buffer.enqueuePreparedReplay(current.sessionDbId, {
-      type: 'observation', tool_name: source.tool_name,
+    try { source = JSON.parse(task.payload) as Record<string, unknown>; }
+    catch {
+      taskStore.cancelManualReplayBeforeStart(input.taskId, input.commandId);
+      return false;
+    }
+    this.initializeSession(task.sessionDbId);
+    try {
+      this.buffer.enqueuePreparedReplay(task.sessionDbId, {
+      type: 'observation', tool_name: source.tool_name as string,
       tool_input: source.tool_input, tool_response: source.tool_response,
       prompt_number: source.prompt_number as number,
       cwd: typeof source.cwd === 'string' ? source.cwd : undefined,
       agentId: typeof source.agentId === 'string' ? source.agentId : undefined,
       agentType: typeof source.agentType === 'string' ? source.agentType : undefined,
       toolUseId: typeof source.toolUseId === 'string' ? source.toolUseId : undefined,
-      recoveryTaskId: taskId, originalTimestamp: prepared.enqueuedAtEpoch,
+      recoveryTaskId: input.taskId, originalTimestamp: prepared.enqueuedAtEpoch,
       manualReplayPermitId: admission.permitId,
-    });
+      manualReplayModelStepId: input.modelStepId,
+      manualReplayIdempotencyKey: admission.idempotencyKey,
+      manualReplayCommandId: input.commandId,
+      manualReplayPromptDigest: admission.promptDigest,
+      });
+    } catch {
+      taskStore.cancelManualReplayBeforeStart(input.taskId, input.commandId);
+      return false;
+    }
     return true;
+  }
+
+  getManualReplayCandidate(sessionDbId: number): PendingMessageWithId | null {
+    return this.buffer.getManualReplayCandidate(sessionDbId);
+  }
+
+  cancelQueuedManualReplay(taskId: string, commandId: string): boolean {
+    const taskStore = this.dbManager.getObserverTaskStore();
+    const task = taskStore.get(taskId);
+    if (!task || task.state !== 'queued' || !taskStore.getManualReplayAdmission(commandId, taskId) ||
+        !this.buffer.removeQueuedManualReplay(task.sessionDbId, taskId, commandId)) {
+      return false;
+    }
+    return taskStore.cancelManualReplayBeforeStart(taskId, commandId) !== null;
+  }
+
+  canRunManualReplay(sessionDbId: number, taskId: string): boolean {
+    const candidate = this.buffer.getManualReplayCandidate(sessionDbId);
+    if (!candidate || candidate.recoveryTaskId !== taskId ||
+        this.dbManager.getObserverTaskStore().hasUnresolvedExcept(sessionDbId, taskId)) return false;
+    const taskStore = this.dbManager.getObserverTaskStore();
+    const task = taskStore.get(taskId);
+    const admission = taskStore.getManualReplayAdmission(candidate.manualReplayCommandId!, taskId);
+    return task?.sessionDbId === sessionDbId && task.state === 'queued' && !!admission &&
+      admission.permitId === candidate.manualReplayCommandId &&
+      admission.permitId === candidate.manualReplayPermitId &&
+      admission.modelStepId === candidate.manualReplayModelStepId &&
+      admission.idempotencyKey === `cmretry-${candidate.manualReplayCommandId}` &&
+      admission.idempotencyKey === candidate.manualReplayIdempotencyKey &&
+      admission.promptDigest === candidate.manualReplayPromptDigest;
   }
 
   recoverStrandedObserverTasks(): number {
@@ -372,6 +437,24 @@ export class SessionManager {
       session.claimedMessageIds = [];
     }
     return this.buffer.resetClaimed(sessionDbId);
+  }
+
+  /** Drop the one failed manual replay after its provider pass has stopped. */
+  discardClaimedManualReplay(sessionDbId: number, taskId: string): number {
+    const session = this.sessions.get(sessionDbId);
+    if (!session) return 0;
+    const claimed = this.buffer.getMessagesByIds(sessionDbId, session.claimedMessageIds);
+    const replayIds = claimed
+      .filter(message => message.recoveryTaskId === taskId && !!message.manualReplayCommandId)
+      .map(message => message._persistentId);
+    let removed = 0;
+    for (const id of replayIds) removed += this.buffer.confirm(id);
+    if (replayIds.length > 0) {
+      const removedIds = new Set(replayIds);
+      session.claimedMessageIds = session.claimedMessageIds.filter(id => !removedIds.has(id));
+      if (session.claimedMessageIds.length === 0) session.earliestPendingTimestamp = null;
+    }
+    return removed;
   }
 
   async confirmClaimedMessages(sessionDbId: number): Promise<number> {
