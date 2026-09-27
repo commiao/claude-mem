@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'bun:test';
+import { beforeEach, afterEach, describe, expect, it } from 'bun:test';
+import { resetDependencyStatusesForTesting } from '../../src/shared/dependency-health.js';
 import { Database } from 'bun:sqlite';
 import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { SessionManager } from '../../src/services/worker/SessionManager.js';
@@ -34,6 +35,10 @@ function makeFixture() {
 }
 
 describe('prepared observer manual replay', () => {
+  // This fixture supplies its own provider; another test's missing-CLI state
+  // must not prevent the original route from invoking that provider.
+  beforeEach(() => resetDependencyStatusesForTesting());
+  afterEach(() => resetDependencyStatusesForTesting());
   it('runs exactly once through SessionRoutes and the original Claude provider slot', async () => {
     const fixture = makeFixture();
     const { db, tasks, taskId, prepared, databaseManager, manager } = fixture;
