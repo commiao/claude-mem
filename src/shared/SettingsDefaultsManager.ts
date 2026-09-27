@@ -20,6 +20,8 @@ import { parseJsonWithBom, writeJsonFileAtomic } from './atomic-json.js';
 const LEGACY_TELEGRAM_TRIGGER_TYPES = 'security_alert';
 
 export interface SettingsDefaults {
+  CLAUDE_MEM_RECONCILIATION_FORWARDER_URL: string;
+  CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE: string;
   CLAUDE_MEM_MODEL: string;
   CLAUDE_MEM_CONTEXT_OBSERVATIONS: string;
   CLAUDE_MEM_WORKER_PORT: string;
@@ -252,6 +254,8 @@ export class SettingsDefaultsManager {
     // CLAUDE_MEM_WORKER_HOST) to expose ONLY /tv, /tv.html, /stream and
     // GET /api/observations to holders of this secret. Mint with:
     //   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+    CLAUDE_MEM_RECONCILIATION_FORWARDER_URL: '',
+    CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE: '',
     CLAUDE_MEM_TV_TOKEN: '',
     // claude-mem sign-in funnel state: all empty until the installer's
     // browser-login step writes them.

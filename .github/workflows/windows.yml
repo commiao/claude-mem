@@ -129,14 +129,13 @@ jobs:
           irm bun.sh/install.ps1 | iex
         shell: pwsh
 
-      # Caching uv's downloads AND its managed Python keeps a cold chromadb
+      # Caching uv's downloads keeps a cold chromadb
       # resolve off the critical path; without it this job pays ~10 minutes on
       # every run and routinely exceeds the timeout.
       - name: Install uv (with cache)
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-          cache-python: true
 
       - run: npm install --no-audit --no-fund
 

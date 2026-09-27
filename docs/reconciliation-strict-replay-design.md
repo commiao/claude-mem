@@ -78,3 +78,7 @@ After one manual command the task is one of:
   expired before a start, or the worker cannot prove a safe admission. The next
   model attempt, if permitted by the start budget, requires a fresh human
   command.
+
+## Deployment configuration
+
+Set `CLAUDE_MEM_RECONCILIATION_FORWARDER_URL` and `CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE` in the worker's existing `settings.json`. Environment overrides remain supported. The URL must be the authenticated loopback forwarder. The token file must be owner-only and contain the same caller credential used by the existing managed model connection. Both hook-started and launchd-started workers read these settings. Empty settings disable the bridge. Publishing a bundle alone does not enable it.

@@ -560,8 +560,8 @@ export class WorkerService implements WorkerRef {
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
       this.sessionManager.recoverStrandedObserverTasks();
-      const reconciliationForwarder = process.env.CLAUDE_MEM_RECONCILIATION_FORWARDER_URL;
-      const reconciliationTokenFile = process.env.CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE;
+      const reconciliationForwarder = settings.CLAUDE_MEM_RECONCILIATION_FORWARDER_URL;
+      const reconciliationTokenFile = settings.CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE;
       if (reconciliationForwarder && reconciliationTokenFile) {
         const taskStore = this.dbManager.getObserverTaskStore();
         const replayDispatcher: ManualReplayDispatcher = {
