@@ -55,7 +55,7 @@ def prepare(source, destination, generation):
             if latest:
                 prompt = dict(latest)
                 prompt.pop('id')
-                prompt.update(session_db_id=new_id, content_session_id=original)
+                prompt.update(session_db_id=new_id, content_session_id=original, prompt_number=1)
                 names = list(prompt)
                 db.execute('INSERT INTO user_prompts (' + ','.join(names) + ') VALUES (' + ','.join('?' for _ in names) + ')', list(prompt.values()))
         db.execute('CREATE TABLE capture_generation (generation TEXT PRIMARY KEY, baseline_observation_id INTEGER NOT NULL, source_path TEXT NOT NULL, prepared_at TEXT NOT NULL)')

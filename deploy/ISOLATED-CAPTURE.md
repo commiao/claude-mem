@@ -6,7 +6,7 @@ The destination keeps observations and historical SDK sessions for search.
 Historical content session ids move under `legacy/<generation>/<id>`. Fresh
 capture rows keep the original content ids but have no SDK memory id or worker
 port, so a new worker cannot resume the old worker's SDK conversations. The
-latest user prompt is copied exactly to each fresh row, preserving privacy.
+latest user prompt text is copied exactly to each fresh row, preserving privacy.
 
 A destination file existing is **not** success. Require the command's successful
 exit and its `capture_generation` row. A failed preparation leaves evidence;
@@ -58,3 +58,7 @@ remain; concurrent hooks then resume normal live processing.
 Keep the control file and journal as evidence after closure. Do not delete or
 reset an uncertain event to queued. This journal captures newly arriving hooks
 before dispatch; it is not permission to replay the old worker's RAM queue.
+
+The inherited latest prompt becomes prompt 1 in the fresh session. Runtime
+privacy lookup uses COUNT(user_prompts), so retaining its historical number
+would miss the privacy row. Historical prompt numbers remain unchanged.
