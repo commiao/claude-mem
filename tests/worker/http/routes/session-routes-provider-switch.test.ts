@@ -103,6 +103,7 @@ function makeRoutes(session: ActiveSession, agents: {
   const messageBuffer = makeFakeMessageBuffer();
   const sessionManager = {
     getSession: mock((id: number) => (id === session.sessionDbId ? session : undefined)),
+    hasUnresolvedObserverTasks: mock(() => false),
     getMessageBuffer: mock(() => messageBuffer),
     removeSessionImmediate: mock(() => {}),
   };

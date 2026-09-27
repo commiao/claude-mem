@@ -1,32 +1,25 @@
 import { test, expect } from 'bun:test';
-import { spawn } from 'node:child_process';
+import { createServer, type Socket } from 'node:net';
 import { optimizeField } from '../../src/services/worker/field-optimizer.js';
 import { OpenRouterProvider } from '../../src/services/worker/OpenRouterProvider.js';
 
 test('field deadline cancels real OpenRouter fetch and prevents retries', async () => {
   let requests = 0;
   let disconnected = false;
-  // Use Node's HTTP server as an independent wire witness. Bun's node:http
-  // compatibility layer can keep req/socket close events silent after fetch
-  // abort, making the old fixture fail even on the unchanged main branch.
-  const server = spawn('node', ['--input-type=module', '-e', `
-    import { createServer } from 'node:http';
-    const server = createServer((req, res) => {
-      process.send({ event: 'request' });
-      req.resume();
-      res.on('close', () => process.send({ event: 'closed' }));
+  const sockets = new Set<Socket>();
+  // Observe the TCP boundary directly: Bun's node:http compatibility layer
+  // does not consistently forward response-close for a request without headers.
+  const server = createServer(socket => {
+    sockets.add(socket);
+    let received = false;
+    socket.on('data', () => {
+      if (!received) { requests++; received = true; }
     });
-    server.listen(0, '127.0.0.1', () => process.send({ event: 'ready', port: server.address().port }));
-    process.on('message', () => { server.closeAllConnections(); server.close(() => process.exit(0)); });
-  `], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
-  const address = await new Promise<{ port: number }>((resolve, reject) => {
-    server.once('error', reject);
-    server.on('message', (message: any) => {
-      if (message.event === 'ready') resolve({ port: message.port });
-      if (message.event === 'request') requests++;
-      if (message.event === 'closed') disconnected = true;
-    });
+    socket.on('close', () => { disconnected = true; sockets.delete(socket); });
+    // Read the request but deliberately never send response headers.
   });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as { port: number };
   const nativeTimeout = globalThis.setTimeout;
   let budgetTimers = 0;
   // query() arms its attempt timeout before optimizeField arms the field deadline.
@@ -51,8 +44,7 @@ test('field deadline cancels real OpenRouter fetch and prevents retries', async 
     expect(disconnected).toBe(true);
   } finally {
     globalThis.setTimeout = nativeTimeout;
-    const exited = new Promise<void>(resolve => server.once('exit', () => resolve()));
-    server.send('stop');
-    await exited;
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
   }
 }, 5000);

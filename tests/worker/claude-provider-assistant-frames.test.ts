@@ -146,6 +146,8 @@ function createHarness(session: ActiveSession) {
     return confirmed;
   });
   const resetProcessingToPending = mock(async () => 0);
+  const markClaimedNeedsReconciliation = mock(() => {});
+  const markClaimedSkipped = mock(() => {});
   const storeObservations = mock(() => ({
     observationIds: [7],
     summaryId: null,
@@ -155,6 +157,8 @@ function createHarness(session: ActiveSession) {
   const sessionManager = {
     confirmClaimedMessages,
     resetProcessingToPending,
+    markClaimedNeedsReconciliation,
+    markClaimedSkipped,
     getClaimedMessages: () => claimedMessages,
     getMessageIterator: async function* () {},
   };
@@ -334,12 +338,13 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
     expect(harness.confirmClaimedMessages).toHaveBeenCalledTimes(2);
   });
 
-  it('re-queues the claimed batch when a textless turn ends on an SDK error (#3869)', async () => {
+  it('stops after a textless SDK failure without acknowledging or retrying the batch', async () => {
     const session = createSession();
     const harness = createHarness(session);
 
     scriptedMessages = [
       assistantFrame([{ type: 'thinking', thinking: 'considering the batch', signature: 'sig' }]),
+      resultFrame({ subtype: 'error_during_execution', is_error: true }),
       resultFrame({ subtype: 'error_during_execution', is_error: true }),
     ];
 
@@ -349,6 +354,8 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
     expect(harness.confirmClaimedMessages).not.toHaveBeenCalled();
     expect(harness.resetProcessingToPending).toHaveBeenCalledTimes(1);
     expect(harness.remainingClaimed()).toHaveLength(1);
+    expect(session.abortController.signal.aborted).toBe(true);
+    expect(session.abortReason).toBe('transport:observer_result');
   });
 });
 

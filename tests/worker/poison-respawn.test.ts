@@ -1,12 +1,19 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { logger } from '../../src/utils/logger.js';
 import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import { processAgentResponse } from '../../src/services/worker/agents/ResponseProcessor.js';
 import { handleGeneratorExit } from '../../src/services/worker/session/GeneratorExitHandler.js';
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
 import type { WorkerRef } from '../../src/services/worker/agents/types.js';
 
+const testDbs: Database[] = [];
+
 function makeDbManager(storeObservations = mock(() => ({ observationIds: [], summaryId: null, createdAtEpoch: 0 }))): DatabaseManager {
+  const db = new Database(':memory:');
+  testDbs.push(db);
+  const observerTasks = new ObserverTaskStore(db);
   return {
     getSessionById: () => ({
       content_session_id: 'content-123',
@@ -20,6 +27,7 @@ function makeDbManager(storeObservations = mock(() => ({ observationIds: [], sum
       ensureMemorySessionIdRegistered: () => {},
       storeObservations,
     }),
+    getObserverTaskStore: () => observerTasks,
     getChromaSync: () => undefined,
   } as unknown as DatabaseManager;
 }
@@ -59,6 +67,7 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
   afterEach(() => {
     spies.forEach(s => s.mockRestore());
     mock.restore();
+    for (const db of testDbs.splice(0)) db.close();
   });
 
   it('drops context-window prose that is not valid XML without aborting or preserving the claimed batch', async () => {

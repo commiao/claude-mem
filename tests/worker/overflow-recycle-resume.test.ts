@@ -42,6 +42,7 @@ function buildRoutes(session: ActiveSession, startSession: () => Promise<void>) 
 
   const sessionManager = {
     getSession: () => active,
+    hasUnresolvedObserverTasks: () => false,
     getMessageBuffer: () => ({ getPendingCount: () => 1, peekTypes: () => [] }),
     removeSessionImmediate: () => {
       removed += 1;

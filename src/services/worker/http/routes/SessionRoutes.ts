@@ -67,6 +67,7 @@ function normalizeAbortReason(
 }
 
 export class SessionRoutes extends BaseRouteHandler {
+  private manualReplayRuns = new Map<string, { taskId: string; promise: Promise<void> }>();
   // #2756 round 3: ensureGeneratorRunning is called from independent HTTP
   // request handlers (observation ingest, /summarize, /init — see
   // shared.ts:138 and this file's own callers below), so two calls for the
@@ -118,6 +119,11 @@ export class SessionRoutes extends BaseRouteHandler {
   };
 
   public ensureGeneratorRunning(sessionDbId: number, source: string): Promise<void> {
+    return this.withEnsureGeneratorLock(sessionDbId,
+      () => this.ensureGeneratorRunningLocked(sessionDbId, source));
+  }
+
+  private withEnsureGeneratorLock(sessionDbId: number, run: () => Promise<void>): Promise<void> {
     const priorTail = this.ensureGeneratorLocks.get(sessionDbId) ?? Promise.resolve();
     // .catch(() => {}) on the PRIOR tail only: one call's rejection must
     // never jam the queue for the next call on this session. `tail` itself
@@ -125,7 +131,7 @@ export class SessionRoutes extends BaseRouteHandler {
     // caller (the caller of ensureGeneratorRunning gets back `tail`).
     const tail: Promise<void> = priorTail
       .catch(() => {})
-      .then(() => this.ensureGeneratorRunningLocked(sessionDbId, source));
+      .then(run);
 
     this.ensureGeneratorLocks.set(sessionDbId, tail);
 
@@ -145,13 +151,79 @@ export class SessionRoutes extends BaseRouteHandler {
     return tail;
   }
 
+  /** Queue and start a replay under the same per-session generator lock. */
+  public async startManualReplay(
+    sessionDbId: number,
+    taskId: string,
+    commandId: string,
+    queue: () => Promise<boolean>,
+  ): Promise<boolean> {
+    let queued = false;
+    await this.withEnsureGeneratorLock(sessionDbId, async () => {
+      queued = await queue();
+      if (!queued || !this.sessionManager.canRunManualReplay(sessionDbId, taskId)) return;
+      const candidate = this.sessionManager.getManualReplayCandidate(sessionDbId);
+      if (!candidate || candidate.recoveryTaskId !== taskId || candidate.manualReplayCommandId !== commandId) {
+        queued = false;
+        return;
+      }
+      await this.ensureGeneratorRunningLocked(sessionDbId, `manual-reconciliation:${taskId}`);
+    });
+    if (!queued) return false;
+    // A very fast provider may already have claimed the sole message, so the
+    // dispatcher supplies its durable command UUID when starting the run.
+    return this.attachManualReplayRun(sessionDbId, taskId, commandId);
+  }
+
+  private attachManualReplayRun(sessionDbId: number, taskId: string, commandId: string): boolean {
+    const session = this.sessionManager.getSession(sessionDbId);
+    if (session?.generatorPromise) {
+      this.dbManager.getObserverTaskStore().markManualReplayRunning(taskId);
+      this.manualReplayRuns.set(commandId, { taskId, promise: session.generatorPromise });
+      return true;
+    }
+    // A very fast provider may already have persisted success or transitioned
+    // the task back to reconciliation before this method resumes.
+    const started = this.dbManager.getObserverTaskStore().get(taskId)?.state !== 'queued';
+    if (started) this.manualReplayRuns.set(commandId, { taskId, promise: Promise.resolve() });
+    return started;
+  }
+
+  /** Promise for the one already-started replay; it never dispatches another. */
+  public getManualReplayCompletion(commandId: string, taskId: string): Promise<void> | null {
+    const run = this.manualReplayRuns.get(commandId);
+    return run?.taskId === taskId ? run.promise : null;
+  }
+
+  public releaseManualReplay(commandId: string, taskId: string): void {
+    if (this.manualReplayRuns.get(commandId)?.taskId === taskId) this.manualReplayRuns.delete(commandId);
+  }
+
   private async ensureGeneratorRunningLocked(sessionDbId: number, source: string): Promise<void> {
     const session = this.sessionManager.getSession(sessionDbId);
     if (!session) return;
 
+    const manualReplayTaskId = source.startsWith('manual-reconciliation:')
+      ? source.slice('manual-reconciliation:'.length)
+      : null;
+
+    // A model failure requires an explicit operator decision. Later tool
+    // observations may still be queued, but must not trigger another call.
+    if (manualReplayTaskId
+      ? !this.sessionManager.canRunManualReplay(sessionDbId, manualReplayTaskId)
+      : this.sessionManager.hasUnresolvedObserverTasks(sessionDbId)) {
+      logger.warn('SESSION', 'Observer task awaits reconciliation; generator start withheld', {
+        sessionId: sessionDbId,
+        source,
+      });
+      return;
+    }
+
     // The claiming variant: this path is about to SEND, so it must take the
     // single gateway re-probe rather than merely reading the clock.
-    const selection = selectProviderForGenerator();
+    const selection = manualReplayTaskId
+      ? { provider: 'claude' as const, gatewayProbeClaimId: null }
+      : selectProviderForGenerator();
     const selectedProvider = selection.provider;
 
     if (!session.generatorPromise) {
@@ -388,6 +460,10 @@ export class SessionRoutes extends BaseRouteHandler {
           myController.abort();
           return;
         }
+
+        // The provider may throw before producing an SDK result. Preserve the
+        // exact source and require reconciliation before another model call.
+        this.sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);
 
         // No retry: the generator failed, the in-RAM batch is dropped, and the
         // transcript is the recovery path. The next observation ingest will

@@ -1,4 +1,6 @@
 import { test, expect } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { optimizeObservationFields } from '../../src/services/worker/field-optimizer.js';
 import { ingestObservation, setIngestContext } from '../../src/services/worker/http/shared.js';
 import { createServer } from 'node:http';
@@ -14,9 +16,14 @@ test('HTTP ingestion preserves raw strings while the native observer view shrink
   let queued: any;
   let optimized: any;
   let calls = 0;
+  const db = new Database(':memory:');
+  const observerTasks = new ObserverTaskStore(db);
   setIngestContext({
-    dbManager: { getSessionStore: () => ({ createSDKSession: () => 1,
-      getPromptNumberFromUserPrompts: () => 1, getUserPrompt: () => 'public fixture' }) } as any,
+    dbManager: {
+      getSessionStore: () => ({ createSDKSession: () => 1,
+        getPromptNumberFromUserPrompts: () => 1, getUserPrompt: () => 'public fixture' }),
+      getObserverTaskStore: () => observerTasks,
+    } as any,
     sessionManager: { queueObservation: async (_id: number, observation: any) => { queued = observation; } } as any,
     eventBroadcaster: { broadcastObservationQueued: () => {} } as any,
     ensureGeneratorRunning: async () => {
@@ -42,6 +49,7 @@ test('HTTP ingestion preserves raw strings while the native observer view shrink
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
+    db.close();
   }
 });
 
