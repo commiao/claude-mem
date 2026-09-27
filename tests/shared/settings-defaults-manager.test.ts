@@ -37,6 +37,19 @@ describe('SettingsDefaultsManager', () => {
     }
   });
 
+  it('loads persistent reconciliation settings for every worker startup path', () => {
+    const saved = {
+      CLAUDE_MEM_RECONCILIATION_FORWARDER_URL: 'http://127.0.0.1:39001',
+      CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE: '/private/task-fixture/caller-token',
+    };
+    writeFileSync(settingsPath, JSON.stringify(saved));
+    expect(SettingsDefaultsManager.loadFromFile(settingsPath, false)).toMatchObject(saved);
+    expect(SettingsDefaultsManager.getAllDefaults()).toMatchObject({
+      CLAUDE_MEM_RECONCILIATION_FORWARDER_URL: '',
+      CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE: '',
+    });
+  });
+
   describe('loadFromFile', () => {
     describe('file does not exist', () => {
       it('should create file with defaults when file does not exist', () => {

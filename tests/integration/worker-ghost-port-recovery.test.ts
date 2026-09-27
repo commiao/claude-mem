@@ -112,6 +112,9 @@ let reportedPort: number | null = null;
 // A deadline failure cannot cancel ensureWorkerStarted() — track the call so
 // teardown can let it settle (or reap what it spawned) before cleanup runs.
 let inflightEnsureStarted: Promise<unknown> | null = null;
+// Keep identities after the fixture/uv parent exits. A free listening port
+// does not imply its detached Python descendants have exited.
+let fixtureDescendants: ProcessIdentity[] = [];
 
 function bunExecutable(): string {
   return process.env.BUN_EXECUTABLE || process.execPath;
@@ -376,6 +379,21 @@ afterEach(async () => {
   };
   await killPidFileWorker();
 
+  // Bun >= 1.4 releases the port when the fixture dies, so the capability
+  // branch returns before production reclaim runs. The uv parent may already
+  // be gone too; walking that dead root cannot find the remaining Python
+  // processes, which then keep the Windows uv cache locked during CI cleanup.
+  const snapshot = fixtureDescendants;
+  fixtureDescendants = [];
+  for (const entry of survivingProcesses(snapshot).reverse()) {
+    if (entry.startToken === null) {
+      throw new Error(`Cannot safely clean up fixture process without identity: ${entry.pid}`);
+    }
+    await killProcessTree(entry.pid, { expectedStartToken: entry.startToken });
+  }
+  const remaining = await waitForOrphansToClear(snapshot, ORPHAN_SETTLE_TIMEOUT_MS);
+  expect(remaining, `fixture teardown left descendants: ${describeProcesses(remaining)}`).toHaveLength(0);
+
   if (fixturePort === null) return;
 
   // Bounded sweep. The wait above is time-boxed, so a launcher that was still
@@ -389,7 +407,7 @@ afterEach(async () => {
     await new Promise(resolve => setTimeout(resolve, 2_000));
     await killPidFileWorker();
   }
-});
+}, 90_000);
 
 describe.if(RUN_GATE && IS_WINDOWS)('worker recovers from a ghost listener left by an out-of-band kill', () => {
   it('reclaims the dead worker\'s sidecar chain and starts a new worker', async () => {
@@ -399,6 +417,7 @@ describe.if(RUN_GATE && IS_WINDOWS)('worker recovers from a ghost listener left 
     // Snapshot BEFORE the kill: once the root exits, identity is the only
     // way to tell the survivors apart from anything that recycled its PID.
     const snapshot = snapshotDescendants(fixture.pid);
+    fixtureDescendants = snapshot;
     expect(snapshot.length).toBeGreaterThan(0);
     const names = snapshot.map(p => p.name.toLowerCase()).join(' ');
     expect(names).toMatch(/uv|python/);
