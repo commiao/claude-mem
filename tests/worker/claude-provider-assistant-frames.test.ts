@@ -12,10 +12,11 @@ const actualProcessRegistry = { ...(await import('../../src/supervisor/process-r
 const actualModeManager = { ...(await import('../../src/services/domain/ModeManager.js')) };
 
 let scriptedMessages: unknown[] = [];
+let driveQuery: ((options: any) => AsyncIterable<unknown>) | undefined;
 
 mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   ...actualAgentSdk,
-  query: () => (async function* () {
+  query: (options: any) => driveQuery ? driveQuery(options) : (async function* () {
     for (const message of scriptedMessages) {
       yield message;
     }
@@ -174,6 +175,7 @@ function createHarness(session: ActiveSession) {
     resetProcessingToPending,
     storeObservations,
     remainingClaimed: () => claimedMessages,
+    sessionManager,
     provider: new ClaudeProvider(dbManager as never, sessionManager as never),
   };
 }
@@ -181,6 +183,7 @@ function createHarness(session: ActiveSession) {
 describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
   beforeEach(() => {
     scriptedMessages = [];
+    driveQuery = undefined;
   });
 
   it('leaves the claimed batch intact when a frame carries no text block', async () => {
@@ -346,5 +349,52 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
     expect(harness.confirmClaimedMessages).not.toHaveBeenCalled();
     expect(harness.resetProcessingToPending).toHaveBeenCalledTimes(1);
     expect(harness.remainingClaimed()).toHaveLength(1);
+  });
+});
+
+
+describe('ClaudeProvider backlog flow control', () => {
+  it('waits for each result before claiming another input, including the init result', async () => {
+    const session = createSession();
+    session.claimedMessageIds = [];
+    const harness = createHarness(session);
+    let claimed = 0;
+    harness.sessionManager.getMessageIterator = async function* () {
+      for (let id = 1; id <= 100; id++) {
+        claimed++;
+        session.claimedMessageIds.push(id);
+        yield { type: 'observation', tool_name: 'Read', tool_input: {}, tool_response: 'fact', _persistentId: id, _originalTimestamp: QUEUED_TIMESTAMP } as any;
+      }
+    };
+    driveQuery = (options: any) => (async function* () {
+      const iterator = options.prompt[Symbol.asyncIterator]();
+      const init = await iterator.next();
+      expect(init.done).toBe(false);
+      let nextResolved = false;
+      let next = iterator.next().then((value: any) => { nextResolved = true; return value; });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(claimed).toBe(0);
+      expect(nextResolved).toBe(false);
+      yield resultFrame();
+      await next;
+      expect(claimed).toBe(1);
+      nextResolved = false;
+      next = iterator.next().then((value: any) => { nextResolved = true; return value; });
+      yield assistantFrame([{ type: 'text', text: 'No durable observation.' }]);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(claimed).toBe(1);
+      expect(nextResolved).toBe(false);
+      yield resultFrame();
+      await next;
+      expect(claimed).toBe(2);
+      session.abortController.abort();
+      await iterator.return();
+    })();
+    try {
+      await harness.provider.startSession(session);
+    } finally {
+      driveQuery = undefined;
+      session.abortController.abort();
+    }
   });
 });
