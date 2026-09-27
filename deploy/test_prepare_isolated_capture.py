@@ -28,8 +28,13 @@ INSERT INTO user_prompts VALUES(2,1,'source',2,'<private>never ingest this</priv
         self.assertEqual(result['baseline_observation_id'],1)
         self.assertEqual(self.query(self.source,'SELECT content_session_id,memory_session_id FROM sdk_sessions'),[('source','sdk-old')])
         self.assertEqual(self.query(self.dest,"SELECT memory_session_id,worker_port FROM sdk_sessions WHERE content_session_id='source'"),[(None,None)])
-        self.assertEqual(self.query(self.dest,"SELECT prompt_number,prompt_text FROM user_prompts WHERE content_session_id='source'"),[(2,'<private>never ingest this</private>')])
+        self.assertEqual(self.query(self.dest,"SELECT prompt_number,prompt_text FROM user_prompts WHERE content_session_id='source'"),[(1,'<private>never ingest this</private>')])
         self.assertEqual(self.query(self.dest,'SELECT memory_session_id FROM observations'),[('sdk-old',)])
+    def test_empty_private_prompt_is_found_by_runtime_count_lookup(self):
+        c=sqlite3.connect(self.source);c.execute("UPDATE user_prompts SET prompt_text='' WHERE id=2");c.commit();c.close()
+        p.prepare(self.source,self.dest,'cutover')
+        self.assertEqual(self.query(self.dest,"SELECT prompt_text FROM user_prompts WHERE content_session_id='source' AND prompt_number=(SELECT count(*) FROM user_prompts WHERE content_session_id='source')"),[('',)])
+        self.assertEqual(self.query(self.dest,"SELECT prompt_number FROM user_prompts WHERE content_session_id LIKE 'legacy/%' ORDER BY id"),[(1,),(2,)])
     def test_existing_orphans_survive_unchanged(self):
         c=sqlite3.connect(self.source);c.execute("INSERT INTO observations VALUES(2,'orphan')");c.commit();c.close()
         result=p.prepare(self.source,self.dest,'cutover')
