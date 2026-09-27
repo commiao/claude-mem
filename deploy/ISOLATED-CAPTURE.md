@@ -38,3 +38,23 @@ rows receive globally increasing ids through an atomic source mapping.
 
 These tools prepare and validate data; they do not themselves authorize or
 implement production traffic switching.
+
+## Admission journal
+
+The hook pipeline checks `~/.claude-mem/capture-handoff.json` for a generation
+and absolute journal path. `capture_handoff_journal.py initialize` creates the
+journal exclusively before the control file is published. All mutation hooks
+persist original and normalized inputs before returning; summary text is frozen
+at admission rather than re-read from a changing transcript during delivery.
+
+Once pre-existing hook processes finish, prepare the new capture DB, start and
+verify the isolated worker, and switch hook routing while the gate stays shut.
+`capture_handoff_journal.py drain` invokes the release hook client in original
+order. HTTP errors and transport fallback are hard failures in this delivery
+mode. A claimed event is never automatically replayed after uncertain delivery
+or a crash. The journal closes atomically only when no queued/uncertain events
+remain; concurrent hooks then resume normal live processing.
+
+Keep the control file and journal as evidence after closure. Do not delete or
+reset an uncertain event to queued. This journal captures newly arriving hooks
+before dispatch; it is not permission to replay the old worker's RAM queue.

@@ -1194,7 +1194,7 @@ async function main() {
 
   const hookInitiatedCommands = ['start', 'hook', 'restart', '--daemon'];
   if ((command === undefined || hookInitiatedCommands.includes(command)) && isPluginDisabledInClaudeSettings()) {
-    process.exit(0);
+    process.exit(process.env.CLAUDE_MEM_HANDOFF_REPLAY ? 1 : 0);
   }
 
   const port = getWorkerPort();

@@ -1191,6 +1191,7 @@ export async function executeWithWorkerFallback<T = unknown>(
     ? await ensureWorkerReadyWithin(options.workerStartupTimeoutMs!)
     : await ensureWorkerAliveOnce();
   if (!alive) {
+    if (process.env.CLAUDE_MEM_HANDOFF_REPLAY) throw new Error('Handoff worker unavailable');
     if (!boundedStartup) {
       await recordWorkerUnreachable();
     }
@@ -1210,13 +1211,14 @@ export async function executeWithWorkerFallback<T = unknown>(
   try {
     response = await workerHttpRequest(url, init);
   } catch (error) {
-    if (!boundedStartup) throw error;
+    if (!boundedStartup || process.env.CLAUDE_MEM_HANDOFF_REPLAY) throw error;
     logger.debug('SYSTEM', 'Worker unavailable for best-effort hook call', {
       error: error instanceof Error ? error.message : String(error),
     });
     return { continue: true, reason: 'worker_unreachable', [WORKER_FALLBACK_BRAND]: true };
   }
   if (!response.ok) {
+    if (process.env.CLAUDE_MEM_HANDOFF_REPLAY) throw new Error(`Handoff worker returned ${response.status}`);
     const text = await response.text().catch(() => '');
     await resetWorkerFailureCounter();
     if (response.status === 429 || response.status >= 500) {
