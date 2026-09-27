@@ -99,6 +99,20 @@ export interface PendingMessage {
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  /** UUID of the durable observer task, independent of this process's queue id. */
+  recoveryTaskId?: string;
+  /** Durable first enqueue time used in the observation prompt. */
+  originalTimestamp?: number;
+  /** Forwarder permit for this single operator-authorized task replay. */
+  manualReplayPermitId?: string;
+  /** Gateway logical step id from the claimed human reconciliation command. */
+  manualReplayModelStepId?: string;
+  /** Fixed gateway key attached only to the one-shot replay subprocess. */
+  manualReplayIdempotencyKey?: string;
+  /** Local mailbox command id, used for durable deduplication. */
+  manualReplayCommandId?: string;
+  /** SHA-256 of the exact persisted prepared prompt bytes. */
+  manualReplayPromptDigest?: string;
 }
 
 export interface PendingMessageWithId extends PendingMessage {
@@ -115,6 +129,10 @@ export interface ObservationData {
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  recoveryTaskId?: string;
+  originalTimestamp?: number;
+  manualReplayPermitId?: string;
+  manualReplayModelStepId?: string;
 }
 
 export interface SSEEvent {

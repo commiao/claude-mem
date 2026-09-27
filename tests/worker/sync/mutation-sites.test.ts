@@ -11,12 +11,13 @@
 // runOneTimeCwdRemap against a real pending_messages fixture — both open the
 // DB file themselves, exactly as in production.
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
+import { ChromaSync } from '../../../src/services/sync/ChromaSync.js';
 import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
 import { openConfiguredSqliteDatabase } from '../../../src/services/sqlite/connection.js';
 import { emitRemapProject, hasSyncLane } from '../../../src/services/sync/remap-outbox.js';
@@ -57,12 +58,17 @@ function outboxRows(db: Database): OutboxRow[] {
 
 describe('mutation sites', () => {
   let tempDir: string;
+  let chromaPatch: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'claude-mem-mutation-sites-'));
+    // Summaries also produce Chroma patches now. This suite verifies SQL/outbox
+    // transactions; keep vector I/O local rather than starting a real client.
+    chromaPatch = spyOn(ChromaSync.prototype, 'updateMergedIntoProject').mockResolvedValue(undefined);
   });
 
   afterEach(() => {
+    chromaPatch.mockRestore();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -335,8 +341,7 @@ describe('mutation sites', () => {
 
   // ---------------------------------------------------------------------------
   // (c) worktree adoption — the REAL site, own connection, real git repo with
-  // a merged worktree. Summaries only (no observation ids ⇒ the site's Chroma
-  // patch is skipped — vector search is not under test here).
+  // a merged worktree. Vector I/O is replaced locally; SQL and Git remain real.
   // ---------------------------------------------------------------------------
   it('adoptMergedWorktrees emits remap_project through its own connection', async () => {
     const repo = join(tempDir, 'mainrepo');

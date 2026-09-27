@@ -40,6 +40,47 @@ import { buildTelegramWrapupPrompt, type TelegramWrapupFormatterInput } from '..
 import { telemetryBuffer } from '../telemetry/buffer.js';
 import { captureEvent } from '../telemetry/telemetry.js';
 import { clearDependencyStatus, recordClaudeCliSetupRequired } from '../../shared/dependency-health.js';
+import { createHash } from 'crypto';
+
+const REPLAY_HEADER_NAMES = new Set([
+  'x-credvault-replay-permit', 'x-credvault-replay-prompt-sha256', 'x-credvault-replay-step-id',
+  'x-model-gateway-step-id', 'idempotency-key',
+]);
+
+/** Configure permit headers and retry budget only for one manual replay subprocess. */
+export function withManualReplayHeaders(
+  env: NodeJS.ProcessEnv,
+  admission: { permitId: string; idempotencyKey: string; commandId: string; modelStepId: string },
+): NodeJS.ProcessEnv {
+  const configuredBase = env.ANTHROPIC_BASE_URL;
+  let base: URL | null = null;
+  try { base = configuredBase ? new URL(configuredBase) : null; } catch {}
+  if (!base || base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
+    throw new Error('manual_replay_requires_loopback_gateway');
+  }
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(admission.commandId) ||
+      admission.permitId !== admission.commandId || !/^[a-f0-9]{64}$/.test(admission.modelStepId) ||
+      admission.idempotencyKey !== `cmretry-${admission.commandId}`) {
+    throw new Error('invalid_manual_replay_headers');
+  }
+  const existing = (env.ANTHROPIC_CUSTOM_HEADERS ?? '').split(/\r?\n/)
+    .filter(line => line.includes(':'))
+    .filter(line => !REPLAY_HEADER_NAMES.has(line.slice(0, line.indexOf(':')).trim().toLowerCase()));
+  return {
+    ...env,
+    // A reconciliation click is one manual attempt. Disable Claude Code's
+    // configurable API retry budget for this isolated subprocess only.
+    // The CLI has a separate first-byte/no-response retry cap, so this does
+    // not claim to disable every transport retry (see SDKAPIRetryMessage).
+    CLAUDE_CODE_MAX_RETRIES: '0',
+    ANTHROPIC_CUSTOM_HEADERS: [
+      ...existing,
+      `X-CredVault-Replay-Permit: ${admission.permitId}`,
+      `X-CredVault-Replay-Step-Id: ${admission.modelStepId}`,
+      `Idempotency-Key: ${admission.idempotencyKey}`,
+    ].join('\n'),
+  };
+}
 
 /**
  * Module-scoped guard so the "effort parameter" hint only fires once per
@@ -213,6 +254,7 @@ export class ClaudeProvider {
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     const cwdTracker = { lastCwd: undefined as string | undefined };
     const observerExtraArgs = ['--no-session-persistence'];
+    const manualReplay = this.sessionManager.getManualReplayCandidate?.(session.sessionDbId) ?? null;
 
     // Find and validate Claude executable (shared utility, closes #2222)
     let claudePath: string;
@@ -270,7 +312,15 @@ export class ClaudeProvider {
     );
 
     try {
-      const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
+      let isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
+      if (manualReplay) {
+        isolatedEnv = withManualReplayHeaders(isolatedEnv, {
+          permitId: manualReplay.manualReplayPermitId!,
+          idempotencyKey: manualReplay.manualReplayIdempotencyKey!,
+          commandId: manualReplay.manualReplayCommandId!,
+          modelStepId: manualReplay.manualReplayModelStepId!,
+        });
+      }
       const authMethod = getAuthMethodDescription();
 
       logger.info('SDK', 'Starting SDK query', {
@@ -295,20 +345,21 @@ export class ClaudeProvider {
       }
 
       ensureDir(OBSERVER_SESSIONS_DIR);
+      const hardenedOptions = buildHardenedSdkOptions({
+        source: 'Observer',
+        sessionDbId: session.sessionDbId,
+        contentSessionId: session.contentSessionId,
+        project: session.project,
+        model: modelId,
+        env: isolatedEnv,  // Use isolated credentials from ~/.claude-mem/.env, not process.env
+        pathToClaudeCodeExecutable: claudePath,
+        abortController: session.abortController,
+        ...(shouldResume && session.memorySessionId ? { resume: session.memorySessionId } : {}),
+        spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId, slotReservation, observerExtraArgs),
+      });
       const queryResult = query({
         prompt: messageGenerator,
-        options: buildHardenedSdkOptions({
-          source: 'Observer',
-          sessionDbId: session.sessionDbId,
-          contentSessionId: session.contentSessionId,
-          project: session.project,
-          model: modelId,
-          env: isolatedEnv,  // Use isolated credentials from ~/.claude-mem/.env, not process.env
-          pathToClaudeCodeExecutable: claudePath,
-          abortController: session.abortController,
-          ...(shouldResume && session.memorySessionId ? { resume: session.memorySessionId } : {}),
-          spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId, slotReservation, observerExtraArgs),
-        }),
+        options: manualReplay ? { ...hardenedOptions, maxTurns: 1 } : hardenedOptions,
       });
 
       // Baseline for the next dispatched response's discovery-token delta.
@@ -319,9 +370,6 @@ export class ClaudeProvider {
       // without one still needs the idle hand-off, otherwise the claimed batch
       // is left dangling for session teardown to discard.
       let turnDispatchedText = false;
-      // One re-queue per generator pass for a batch a failed turn never read.
-      let retriedAfterErrorResult = false;
-
       for await (const message of queryResult) {
         // Quota-aware wall-clock guard (#2234): the SDK pushes
         // `rate_limit_event` messages carrying live subscription quota state
@@ -535,22 +583,30 @@ export class ClaudeProvider {
           const resultSubtype = (message as any).subtype as string | undefined;
           const resultIsError = (message as any).is_error === true || resultSubtype !== 'success';
 
-          // The turn is over and the model never emitted text. Only a
-          // successful turn means "the model read the batch and chose to skip
-          // it" — forward the empty response once so the claim is acknowledged
-          // instead of being retried forever. A failed turn never reached that
-          // judgement, so its batch goes back to the buffer for the drain to
-          // re-yield. Exactly one such retry per generator pass: a message is
-          // always pending while a batch is re-queued, so the buffer never
-          // idles out, and an endlessly failing turn would spin on it.
+          // An SDK error without assistant text is not a model decision. Keep
+          // the claimed batch and stop this generator pass. Re-yielding it here
+          // would call the model again automatically; forwarding an empty
+          // response would falsely acknowledge work that never completed.
           if (!turnDispatchedText) {
-            if (resultIsError && !retriedAfterErrorResult) {
-              retriedAfterErrorResult = true;
-              logger.warn('SDK', 'SDK turn failed before emitting text, re-queueing the claimed batch', {
+            if (resultIsError) {
+              logger.warn('SDK', 'SDK turn failed before emitting text; preserving the claimed batch', {
                 sessionId: session.sessionDbId,
                 subtype: resultSubtype,
               });
-              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+              this.sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);
+              session.abortReason = 'transport:observer_result';
+              session.abortController.abort();
+              if (manualReplay) {
+                // This was a human-authorized one-shot. Leaving it in the RAM
+                // queue would let a later ordinary generator resend it, and
+                // would block a fresh manual command from isolating the task.
+                this.sessionManager.discardClaimedManualReplay(
+                  session.sessionDbId, manualReplay.recoveryTaskId!,
+                );
+              } else {
+                await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+              }
+              break;
             } else {
               await processAgentResponse(
                 '',
@@ -567,9 +623,6 @@ export class ClaudeProvider {
               );
               discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
             }
-          }
-          if (!resultIsError) {
-            retriedAfterErrorResult = false;
           }
           turnDispatchedText = false;
         }
@@ -702,6 +755,7 @@ export class ClaudeProvider {
     compressField?: FieldCompressor,
   ): AsyncIterableIterator<SDKUserMessage> {
     const mode = ModeManager.getInstance().getActiveMode();
+    const manualReplayAtStart = this.sessionManager.getManualReplayCandidate?.(session.sessionDbId) ?? null;
 
     const isInitPrompt = session.lastPromptNumber === 1;
     logger.info('SDK', 'Creating message generator', {
@@ -712,29 +766,30 @@ export class ClaudeProvider {
       promptType: isInitPrompt ? 'INIT' : 'CONTINUATION'
     });
 
-    // Brief the generation with the same session-start context a new Claude Code
-    // session gets, so a conversation that starts partway through continues from
-    // the memory rather than from nothing (#3800).
-    const priorContext = await loadSessionStartContext(session, cwdTracker.lastCwd);
-    const initPrompt = isInitPrompt
-      ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
-      : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
-    activeResponseContext.current = snapshotResponseContext(session);
+    // A permit-backed replay is a one-message recovery process: no init prompt,
+    // session context, compression request, or rebuilt body may precede it.
+    if (!manualReplayAtStart) {
+      const priorContext = await loadSessionStartContext(session, cwdTracker.lastCwd);
+      const initPrompt = isInitPrompt
+        ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
+        : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
+      activeResponseContext.current = snapshotResponseContext(session);
 
-    session.conversationHistory.push({ role: 'user', content: initPrompt });
+      session.conversationHistory.push({ role: 'user', content: initPrompt });
 
-    session.lastPromptSentAt = Date.now();
-    session.lastGeneratorSource = 'init';
-    yield {
-      type: 'user',
-      message: {
-        role: 'user',
-        content: initPrompt
-      },
-      session_id: session.contentSessionId,
-      parent_tool_use_id: null,
-      isSynthetic: true
-    };
+      session.lastPromptSentAt = Date.now();
+      session.lastGeneratorSource = 'init';
+      yield {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: initPrompt
+        },
+        session_id: session.contentSessionId,
+        parent_tool_use_id: null,
+        isSynthetic: true
+      };
+    }
 
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
       session.pendingAgentId = message.agentId ?? null;
@@ -745,6 +800,57 @@ export class ClaudeProvider {
       }
 
       if (message.type === 'observation') {
+        if (message.manualReplayPermitId) {
+          const taskId = message.recoveryTaskId;
+          const commandId = message.manualReplayCommandId;
+          const taskStore = this.dbManager.getObserverTaskStore();
+          const prepared = taskId ? taskStore.getPreparedPrompt(taskId) : null;
+          const durableAdmission = taskId && commandId
+            ? taskStore.getManualReplayAdmission(commandId, taskId) : null;
+          const task = taskId ? taskStore.get(taskId) : null;
+          const marker = taskId ? `[[cm-task:${taskId}]]` : '';
+          const markerCount = prepared?.prompt.match(/\[\[cm-task:[^\]]+\]\]/g)?.length ?? 0;
+          const digest = prepared
+            ? createHash('sha256').update(prepared.prompt, 'utf8').digest('hex') : '';
+          const exactCandidate = manualReplayAtStart &&
+            manualReplayAtStart.recoveryTaskId === taskId &&
+            manualReplayAtStart.manualReplayCommandId === commandId &&
+            manualReplayAtStart.manualReplayPermitId === message.manualReplayPermitId &&
+            manualReplayAtStart.manualReplayModelStepId === message.manualReplayModelStepId &&
+            manualReplayAtStart.manualReplayIdempotencyKey === message.manualReplayIdempotencyKey &&
+            manualReplayAtStart.manualReplayPromptDigest === message.manualReplayPromptDigest;
+          if (!exactCandidate || !taskId || !commandId || !prepared || !durableAdmission ||
+              task?.state !== 'running' || prepared.enqueuedAtEpoch !== message._originalTimestamp ||
+              prepared.promptDigest !== message.manualReplayPromptDigest || digest !== prepared.promptDigest ||
+              markerCount !== 1 || !prepared.prompt.includes(marker) ||
+              durableAdmission.permitId !== message.manualReplayPermitId ||
+              durableAdmission.modelStepId !== message.manualReplayModelStepId ||
+              durableAdmission.idempotencyKey !== message.manualReplayIdempotencyKey ||
+              durableAdmission.promptDigest !== prepared.promptDigest) {
+            if (taskId) taskStore.needsReconciliation([taskId]);
+            throw new Error('manual_replay_prepared_prompt_identity_mismatch');
+          }
+
+          activeResponseContext.current = snapshotResponseContext(session);
+          session.conversationHistory.push({ role: 'user', content: prepared.prompt });
+          session.lastPromptSentAt = Date.now();
+          session.lastGeneratorSource = 'manual-reconciliation';
+          yield {
+            type: 'user',
+            message: { role: 'user', content: prepared.prompt },
+            session_id: session.contentSessionId,
+            parent_tool_use_id: null,
+            isSynthetic: true,
+          };
+          return;
+        }
+
+        if (manualReplayAtStart) {
+          const taskId = manualReplayAtStart.recoveryTaskId;
+          if (taskId) this.dbManager.getObserverTaskStore().needsReconciliation([taskId]);
+          throw new Error('manual_replay_queue_identity_missing');
+        }
+
         if (message.prompt_number !== undefined) {
           session.lastPromptNumber = message.prompt_number;
         }
@@ -778,6 +884,7 @@ export class ClaudeProvider {
         const obsPrompt = buildObservationPrompt({
           // 这条观测的持久身份。用它，同一行的重投才会生成同一份提示。
           id: message._persistentId,
+          recoveryTaskId: message.recoveryTaskId,
           tool_name: message.tool_name!,
           tool_input: JSON.stringify(optimized.toolInput),
           tool_output: JSON.stringify(optimized.toolOutput),
@@ -790,6 +897,17 @@ export class ClaudeProvider {
           created_at_epoch: message._originalTimestamp,
           cwd: message.cwd
         });
+        if (message.recoveryTaskId) {
+          try {
+            this.dbManager.getObserverTaskStore().recordPreparedPrompt(
+              message.recoveryTaskId, obsPrompt, message._originalTimestamp);
+          } catch (error) {
+            // Never send a rebuilt prompt with a different body under the same
+            // durable business task. Reconciliation must inspect this drift.
+            this.dbManager.getObserverTaskStore().needsReconciliation([message.recoveryTaskId]);
+            throw error;
+          }
+        }
         activeResponseContext.current = snapshotResponseContext(session);
 
         session.conversationHistory.push({ role: 'user', content: obsPrompt });

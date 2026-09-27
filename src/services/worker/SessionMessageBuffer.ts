@@ -54,6 +54,10 @@ export class SessionMessageBuffer {
    * and only against others in the same session for this worker's lifetime.
    */
   enqueue(sessionDbId: number, message: PendingMessage): number {
+    const enqueuedAt = message.originalTimestamp ?? Date.now();
+    if (!Number.isSafeInteger(enqueuedAt) || enqueuedAt <= 0) {
+      throw new Error('invalid_pending_message_timestamp');
+    }
     const toolUseId = message.toolUseId;
     if (toolUseId) {
       const seen = this.getSeen(sessionDbId);
@@ -64,10 +68,60 @@ export class SessionMessageBuffer {
     }
 
     const id = this.nextId++;
-    this.getList(sessionDbId).push({ id, message, claimed: false, enqueuedAt: Date.now() });
+    this.getList(sessionDbId).push({ id, message, claimed: false, enqueuedAt });
     this.onMutate?.();
     this.signal(sessionDbId);
     return id;
+  }
+
+  /** Queue one explicitly authorized replay in an otherwise empty session. */
+  enqueuePreparedReplay(sessionDbId: number, message: PendingMessage): number {
+    if (!message.recoveryTaskId || !message.manualReplayPermitId || !message.manualReplayModelStepId ||
+        !message.manualReplayCommandId || !/^[a-f0-9]{64}$/.test(message.manualReplayModelStepId) ||
+        !message.manualReplayIdempotencyKey || !message.manualReplayPromptDigest ||
+        !Number.isSafeInteger(message.originalTimestamp) ||
+        (message.originalTimestamp ?? 0) <= 0) {
+      throw new Error('invalid_prepared_replay_message');
+    }
+    if (this.getPendingCount(sessionDbId) !== 0) {
+      throw new Error('prepared_replay_session_not_isolated');
+    }
+    const id = this.nextId++;
+    this.getList(sessionDbId).push({
+      id, message, claimed: false, enqueuedAt: message.originalTimestamp!,
+    });
+    if (message.toolUseId) this.getSeen(sessionDbId).add(message.toolUseId);
+    this.onMutate?.();
+    this.signal(sessionDbId);
+    return id;
+  }
+
+  /** The replay generator must see exactly one authorized task before startup. */
+  getManualReplayCandidate(sessionDbId: number): PendingMessageWithId | null {
+    const list = this.buffers.get(sessionDbId);
+    if (!list || list.length !== 1 || list[0].claimed) return null;
+    const buffered = list[0];
+    const message = buffered.message;
+    if (!message.recoveryTaskId || !message.manualReplayPermitId || !message.manualReplayModelStepId ||
+        !message.manualReplayCommandId || !/^[a-f0-9]{64}$/.test(message.manualReplayModelStepId) ||
+        !message.manualReplayIdempotencyKey || !message.manualReplayPromptDigest) return null;
+    return {
+      ...message,
+      _persistentId: buffered.id,
+      _originalTimestamp: buffered.enqueuedAt,
+    };
+  }
+
+  /** Remove only an unclaimed replay that has not entered a generator. */
+  removeQueuedManualReplay(sessionDbId: number, taskId: string, commandId: string): boolean {
+    const list = this.buffers.get(sessionDbId);
+    if (!list) return false;
+    const index = list.findIndex(item => !item.claimed && item.message.recoveryTaskId === taskId &&
+      item.message.manualReplayCommandId === commandId);
+    if (index < 0) return false;
+    list.splice(index, 1);
+    this.onMutate?.();
+    return true;
   }
 
   /** Remove a stored message by id. Returns 1 if found, 0 otherwise. */
