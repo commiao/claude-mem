@@ -62,3 +62,9 @@ before dispatch; it is not permission to replay the old worker's RAM queue.
 The inherited latest prompt becomes prompt 1 in the fresh session. Runtime
 privacy lookup uses COUNT(user_prompts), so retaining its historical number
 would miss the privacy row. Historical prompt numbers remain unchanged.
+
+On this Mac, `settings.isolated.approved.json` pins the isolated runtime
+configuration. Apply with `check_settings.py --approved <this manifest>
+--live ~/.claude-mem-next/settings.json --apply`. Four agent slots let the
+three active sessions progress; the slot limiter rereads this value without
+restarting either worker. The gateway retains its own admission limit.
