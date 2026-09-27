@@ -35,6 +35,7 @@ import {
   resolveConversationMaxChars,
 } from '../../shared/observer-recycle.js';
 import { recycleObserverConversation, loadSessionStartContext } from './session/recycle-conversation.js';
+import { ObserverTurnGate } from './session/ObserverTurnGate.js';
 import { optimizeObservationFields, buildFieldCompressionPrompt, type FieldCompressor } from './field-optimizer.js';
 import { buildTelegramWrapupPrompt, type TelegramWrapupFormatterInput } from '../integrations/TelegramWrapupNotifier.js';
 import { telemetryBuffer } from '../telemetry/buffer.js';
@@ -280,7 +281,8 @@ export class ClaudeProvider {
     const activeResponseContext = { current: snapshotResponseContext(session) };
     const compressField: FieldCompressor = (text, budgetChars, signal) =>
       this.compressField(text, budgetChars, session, modelId, claudePath, signal);
-    const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField);
+    const turnGate = new ObserverTurnGate(session.abortController.signal);
+    const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField, turnGate);
 
     this.resetCarriedMemorySessionId(session);
 
@@ -625,9 +627,13 @@ export class ClaudeProvider {
             }
           }
           turnDispatchedText = false;
+          // Only a final result releases input prefetch. Assistant frames can
+          // arrive in pieces and must never acknowledge a later prompt.
+          turnGate.complete();
         }
       }
     } finally {
+      turnGate.dispose();
       // Safety net for paths where the SDK never invoked the spawn factory;
       // a leaked reservation would occupy an agent slot until worker restart.
       slotReservation.release();
@@ -753,6 +759,7 @@ export class ClaudeProvider {
     activeResponseContext: { current: ReturnType<typeof snapshotResponseContext> },
     worker?: WorkerRef,
     compressField?: FieldCompressor,
+    turnGate?: ObserverTurnGate,
   ): AsyncIterableIterator<SDKUserMessage> {
     const mode = ModeManager.getInstance().getActiveMode();
     const manualReplayAtStart = this.sessionManager.getManualReplayCandidate?.(session.sessionDbId) ?? null;
@@ -779,6 +786,7 @@ export class ClaudeProvider {
 
       session.lastPromptSentAt = Date.now();
       session.lastGeneratorSource = 'init';
+      turnGate?.begin();
       yield {
         type: 'user',
         message: {
@@ -789,6 +797,7 @@ export class ClaudeProvider {
         parent_tool_use_id: null,
         isSynthetic: true
       };
+      if (turnGate && !await turnGate.wait()) return;
     }
 
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
@@ -914,6 +923,7 @@ export class ClaudeProvider {
 
         session.lastPromptSentAt = Date.now();
         session.lastGeneratorSource = 'ingest';
+        turnGate?.begin();
         yield {
           type: 'user',
           message: {
@@ -938,6 +948,7 @@ export class ClaudeProvider {
 
         session.lastPromptSentAt = Date.now();
         session.lastGeneratorSource = 'summarize';
+        turnGate?.begin();
         yield {
           type: 'user',
           message: {
@@ -949,6 +960,9 @@ export class ClaudeProvider {
           isSynthetic: true
         };
       }
+      // Wait BEFORE the iterator claims another buffered message. This also
+      // keeps the init response from confirming inputs it has not read yet.
+      if (turnGate && !await turnGate.wait()) return;
     }
   }
 
