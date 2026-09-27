@@ -1,8 +1,9 @@
+import { journalCaptureHandoff } from './capture-handoff.js';
 import { readJsonFromStdin } from './stdin-reader.js';
 import { getPlatformAdapter } from './adapters/index.js';
 import { AdapterRejectedInput } from './adapters/errors.js';
 import { getEventHandler } from './handlers/index.js';
-import type { HookResult } from './types.js';
+import type { HookResult, NormalizedHookInput } from './types.js';
 import { HOOK_EXIT_CODES } from '../shared/hook-constants.js';
 import {
   installHookStderrBuffer,
@@ -93,11 +94,22 @@ async function executeHookPipeline(
   adapter: ReturnType<typeof getPlatformAdapter>,
   handler: ReturnType<typeof getEventHandler>,
   platform: string,
+  event: string,
   options: HookCommandOptions
 ): Promise<number> {
   const rawInput = await readJsonFromStdin({ safetyTimeoutMs: options.stdinSafetyTimeoutMs });
-  const input = adapter.normalizeInput(rawInput);
+  const input: NormalizedHookInput = process.env.CLAUDE_MEM_HANDOFF_REPLAY
+    ? (rawInput as { normalizedInput: NormalizedHookInput }).normalizedInput
+    : adapter.normalizeInput(rawInput);
+  if (process.env.CLAUDE_MEM_HANDOFF_REPLAY && (!input || typeof input.sessionId !== 'string' || typeof input.cwd !== 'string')) {
+    throw new Error('Invalid normalized capture input');
+  }
   input.platform = platform;
+  if (journalCaptureHandoff(platform, event, rawInput, input)) {
+    emitModelContext(adapter, buildNoOpResult(event));
+    exitGraceful(options);
+    return HOOK_EXIT_CODES.SUCCESS;
+  }
   const result = await handler.execute(input);
 
   // MODEL_CONTEXT: the only stdout JSON emit, via the platform adapter.
@@ -129,8 +141,12 @@ export async function hookCommand(platform: string, event: string, options: Hook
   const handler = getEventHandler(event);
 
   try {
-    return await executeHookPipeline(adapter, handler, platform, options);
+    return await executeHookPipeline(adapter, handler, platform, event, options);
   } catch (error) {
+    if (process.env.CLAUDE_MEM_HANDOFF_REPLAY) {
+      emitBlockingError('Capture handoff delivery failed; retain journal for reconciliation', options);
+      return HOOK_EXIT_CODES.BLOCKING_ERROR;
+    }
     if (error instanceof AdapterRejectedInput) {
       logger.warn('HOOK', `Adapter rejected input (${error.reason}), skipping hook`);
       emitModelContext(adapter, buildNoOpResult(event));
