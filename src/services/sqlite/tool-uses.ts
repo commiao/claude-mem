@@ -196,6 +196,7 @@ export function createToolUsesSchema(db: Database): void {
   `);
 
   db.run('CREATE INDEX IF NOT EXISTS idx_tool_uses_project ON tool_uses(project)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_tool_uses_project_nocase_created ON tool_uses(project COLLATE NOCASE, created_at_epoch DESC, id DESC)');
   db.run('CREATE INDEX IF NOT EXISTS idx_tool_uses_memory_session ON tool_uses(memory_session_id)');
   db.run('CREATE INDEX IF NOT EXISTS idx_tool_uses_content_session ON tool_uses(content_session_id)');
   db.run('CREATE INDEX IF NOT EXISTS idx_tool_uses_session_db_id ON tool_uses(session_db_id)');
@@ -236,7 +237,9 @@ export function upsertToolUse(db: Database, input: UpsertToolUseInput): number |
     )
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(content_session_id, tool_use_id) DO UPDATE SET
-      memory_session_id = COALESCE(excluded.memory_session_id, tool_uses.memory_session_id),
+      memory_session_id = CASE WHEN tool_uses.observation_id IS NULL
+        THEN COALESCE(excluded.memory_session_id, tool_uses.memory_session_id)
+        ELSE tool_uses.memory_session_id END,
       session_db_id     = COALESCE(excluded.session_db_id, tool_uses.session_db_id),
       project           = CASE WHEN excluded.project != '' THEN excluded.project ELSE tool_uses.project END,
       platform_source   = excluded.platform_source,
@@ -300,14 +303,20 @@ export function linkToolUsesToObservation(
   const result = db.prepare(`
     UPDATE tool_uses
     SET observation_id = COALESCE(observation_id, ?),
-        memory_session_id = COALESCE(?, memory_session_id)
+        memory_session_id = CASE WHEN observation_id IS NULL
+          THEN COALESCE(?, memory_session_id)
+          ELSE COALESCE(memory_session_id, ?)
+        END
     WHERE content_session_id = ?
       AND tool_use_id IN (${placeholders})
+      AND (observation_id IS NULL OR observation_id = ?)
   `).run(
     params.observationId,
     params.memorySessionId ?? null,
+    params.memorySessionId ?? null,
     params.contentSessionId,
-    ...ids
+    ...ids,
+    params.observationId
   );
 
   return Number(result.changes ?? 0);
@@ -365,7 +374,7 @@ export function getToolUsesByIds(
   const conditions = [`(${idClauses.join(' OR ')})`];
 
   if (options.project) {
-    conditions.push('project = ?');
+    conditions.push('project COLLATE NOCASE = ?');
     params.push(options.project);
   }
   if (options.contentSessionId) {
@@ -398,7 +407,7 @@ export function queryToolUses(db: Database, filters: ToolUseQueryFilters = {}): 
   const params: Array<string | number> = [];
 
   if (filters.project) {
-    conditions.push('project = ?');
+    conditions.push('project COLLATE NOCASE = ?');
     params.push(filters.project);
   }
   if (filters.contentSessionId) {
@@ -464,7 +473,7 @@ export function countToolUses(
   const params: Array<string | number> = [];
 
   if (filters.project) {
-    conditions.push('project = ?');
+    conditions.push('project COLLATE NOCASE = ?');
     params.push(filters.project);
   }
   if (filters.contentSessionId) {

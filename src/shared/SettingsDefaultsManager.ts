@@ -23,6 +23,12 @@ const LEGACY_TELEGRAM_TRIGGER_TYPES = 'security_alert';
 
 /** Pinned workers.dev hub from the Cloudflare SyncHub era. */
 const LEGACY_CLOUD_SYNC_HUB_HOST = 'sync-hub.black-pond-afbb.workers.dev';
+/**
+ * Production cmem-sync Supabase function, which Connect handed out for a few
+ * hours after the Supabase cutover. Supabase's Cloudflare WAF blocks plain
+ * memory pushes there; the sync.cmem.ai proxy gzips them through.
+ */
+const DIRECT_SUPABASE_CLOUD_SYNC_HUB_HOST = 'ziczmqtpmaxbornfghye.supabase.co';
 /** Canonical Pro hub after the Fly cutover. */
 const CANONICAL_CLOUD_SYNC_HUB_URL = 'https://sync.cmem.ai';
 
@@ -52,8 +58,10 @@ function hasRetiredOpenRouterDefault(flatSettings: Record<string, any>): boolean
 
 /**
  * Per-attempt deadline for one observer LLM request, in ms (retry.ts), shared
- * by every provider that has one (Gemini, OpenRouter and any OpenAI-compatible
- * endpoint, including the cmem.ai gateway).
+ * by every non-streamed request (Gemini, Codex, the cmem.ai gateway, and an
+ * OpenAI-compatible endpoint that refuses streaming). Streamed OpenRouter and
+ * OpenAI-compatible requests are bounded by liveness instead: a 90s idle
+ * timeout and a 300s cap (streamed-chat-completion.ts).
  *
  * A deadline exists to catch a hung request, not to cut off a slow one. The
  * gateway's normal latency runs p90 40–72s and p99 ~100–140s by day, so the old
@@ -128,7 +136,8 @@ function migratedCloudSyncHubUrl(raw: unknown): string | null {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return null;
   try {
-    if (new URL(trimmed).hostname === LEGACY_CLOUD_SYNC_HUB_HOST) {
+    const hostname = new URL(trimmed).hostname;
+    if (hostname === LEGACY_CLOUD_SYNC_HUB_HOST || hostname === DIRECT_SUPABASE_CLOUD_SYNC_HUB_HOST) {
       return CANONICAL_CLOUD_SYNC_HUB_URL;
     }
   } catch {
@@ -149,6 +158,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_PUBLIC_URL: string;
   CLAUDE_MEM_API_TIMEOUT_MS: string;
   CLAUDE_MEM_SESSION_INIT_TIMEOUT_MS: string;
+  CLAUDE_MEM_IDLE_EXIT_SEC: string;  // Worker idle-exit window in seconds; '0' (default) = never idle-exit.
   CLAUDE_MEM_SKIP_TOOLS: string;
   CLAUDE_MEM_SKIP_BASH_PATTERNS: string;
   CLAUDE_MEM_SKIP_SUBAGENT_OBSERVATIONS: string;  // #2736 — skip ALL subagent observations (agent id AND agent type present)
@@ -182,6 +192,12 @@ export interface SettingsDefaults {
   // Quota fallback. Both empty (the default) = off: dispatch is unchanged.
   CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: string;
   CLAUDE_MEM_QUOTA_FALLBACK_MODEL: string;
+  // Quota guard: per-window utilization (0–1) at which a subscription observer stops (#4230).
+  CLAUDE_MEM_QUOTA_THRESHOLD_FIVE_HOUR: string;
+  CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY: string;
+  CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_OPUS: string;
+  CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_SONNET: string;
+  CLAUDE_MEM_QUOTA_THRESHOLD_OVERAGE: string;
   CLAUDE_MEM_DATA_DIR: string;
   CLAUDE_MEM_LOG_LEVEL: string;
   CLAUDE_MEM_PYTHON_VERSION: string;
@@ -204,6 +220,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_REINFORCE_ALPHA: string;
   CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: string;
   CLAUDE_MEM_WELCOME_HINT_ENABLED: string;
+  CLAUDE_MEM_FILE_READ_GATE_ENABLED: string;
   CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: string;
   CLAUDE_MEM_FOLDER_USE_LOCAL_MD: string;  
   CLAUDE_MEM_TRANSCRIPTS_ENABLED: string;  
@@ -214,6 +231,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: string;
   CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: string;  // Observer model context window in tokens; '' = resolve automatically
   CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: string;  // Output-token cap on every HTTP observer request (OpenRouter, custom, gateway, Gemini)
+  CLAUDE_MEM_OBSERVE_BARE_PROMPTS: string;  // 'true' sends a user prompt to the observer on its own; default 'false' carries it on the next tool event
   CLAUDE_MEM_HOOK_FAIL_LOUD_THRESHOLD: string;
   CLAUDE_MEM_REDACT_ENABLED: string;
   CLAUDE_MEM_REDACT_DISABLED_BUILTINS: string;
@@ -251,7 +269,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CLOUD_SYNC_HUB_URL: string;
   CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID: string;
   CLAUDE_MEM_CLOUD_SYNC_DEVICE_NAME: string;
-  CLAUDE_MEM_CLOUD_SYNC_WS: string;    // advisory WebSocket speed layer (Phase 4) — 'false' = HTTP polling only
+  CLAUDE_MEM_CLOUD_SYNC_WS: string;    // live updates via Supabase Realtime — 'false' disables live updates (HTTP polling only)
   // Content flush knobs. 200-op pages + 30s timeout hit hub projection_busy
   // (#3618). Defaults: 40 ops / 90s (hub projection lease).
   CLAUDE_MEM_CLOUD_SYNC_CONTENT_BATCH_SIZE: string;
@@ -359,6 +377,13 @@ export class SettingsDefaultsManager {
                                 // https://37700.host.<user>.<domain>). Empty => localhost.
     CLAUDE_MEM_API_TIMEOUT_MS: String(getTimeout(HOOK_TIMEOUTS.API_REQUEST)),
     CLAUDE_MEM_SESSION_INIT_TIMEOUT_MS: String(defaultSessionInitRequestTimeoutMs()),  // 10s; 7s on Windows, whose hook start-up the budget never sees
+    // Worker idle exit (opt-in; minimum 60): after this many seconds with no
+    // session activity, no queued work, no open or recent requests and no AI
+    // interaction, the worker shuts itself down through the graceful stop
+    // sequence (shutdown_reason 'idle'). The next hook that reads memory
+    // starts it again. Never armed with CLAUDE_MEM_WORKER_AUTOSTART=false or
+    // while transcript watches run.
+    CLAUDE_MEM_IDLE_EXIT_SEC: '0',
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
     CLAUDE_MEM_SKIP_BASH_PATTERNS: '',  // Regex matched against a shell command (Bash; Codex exec_command); when it matches, the observation is skipped. Empty = capture every command. Use alternation for several patterns, e.g. ^(ls|cat|pwd)\b
     CLAUDE_MEM_SKIP_SUBAGENT_OBSERVATIONS: 'false',  // #2736 — default off preserves current behavior; set 'true' to skip every subagent observation (recommended for heavy Dynamic Workflows users)
@@ -403,6 +428,11 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OPENAI_COMPAT_MODEL: '',  // Model id passed verbatim. Empty = the preset's default model.
     CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: '',  // '' = off | 'claude' | 'gemini' | 'openrouter' | 'openai-compatible': where observer work goes while the selected provider's quota breaker holds (a spent allowance, or rate limits that outlast their retries)
     CLAUDE_MEM_QUOTA_FALLBACK_MODEL: '',     // Claude model for a Claude fallback run; '' = CLAUDE_MEM_MODEL and tier routing. Ignored for other fallbacks (only ClaudeProvider reads modelOverride)
+    CLAUDE_MEM_QUOTA_THRESHOLD_FIVE_HOUR: '0.95',          // Quota guard (#4230): subscription observer stops at this utilization of the window. A provider rejection always stops it
+    CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY: '0.93',
+    CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_OPUS: '0.93',
+    CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY_SONNET: '0.92',
+    CLAUDE_MEM_QUOTA_THRESHOLD_OVERAGE: '0.95',
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
     CLAUDE_MEM_PYTHON_VERSION: '3.13',
@@ -424,6 +454,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_REINFORCE_ALPHA: '0',  // ACT-R reinforcement weight for SessionStart ranking. 0 = off (the N most recent observations, unchanged); >0 lets re-confirmed older observations climb into the window
     CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'true',
     CLAUDE_MEM_WELCOME_HINT_ENABLED: 'true',
+    CLAUDE_MEM_FILE_READ_GATE_ENABLED: 'true',  // 'false' = never block a full-file Read; the file's observation timeline is still added as context
     CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: 'false',
     CLAUDE_MEM_FOLDER_USE_LOCAL_MD: 'false',  // When true, writes to CLAUDE.local.md instead of CLAUDE.md
     CLAUDE_MEM_TRANSCRIPTS_ENABLED: 'true',
@@ -437,6 +468,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: '400000',  // Retire an observer conversation past this size and start a fresh generation (#3800)
     CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: '',  // Observer model context window in tokens; '' = resolve it (OpenRouter catalogue, Gemini/Claude maps). Lowers the budget above to half the window (#3625)
     CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: '4096',  // max_tokens / max_completion_tokens / Gemini maxOutputTokens on every HTTP observer request (#3868)
+    CLAUDE_MEM_OBSERVE_BARE_PROMPTS: 'false',  // 'true' restores one observer call per user prompt; 'false' carries the prompt on the next tool event's call
     CLAUDE_MEM_HOOK_FAIL_LOUD_THRESHOLD: '3',  // After N consecutive worker-unreachable hook invocations, show the worker-outage notice once per session (never blocks; plan-17)
     CLAUDE_MEM_REDACT_ENABLED: 'false',                   // Opt-in auto-redaction of common secret patterns (see docs/public/usage/auto-redaction.mdx)
     CLAUDE_MEM_REDACT_DISABLED_BUILTINS: '',              // CSV of built-in pattern names to disable, e.g. 'jwt,slack_token'
@@ -477,10 +509,10 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CLOUD_SYNC_HUB_URL: '',  // sync-hub base URL (e.g. https://sync.cmem.ai). Empty = sync OFF
     CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID: '',      // Minted at first CloudSync start, then persisted back here
     CLAUDE_MEM_CLOUD_SYNC_DEVICE_NAME: hostname(),  // Human-readable label for the cmem.ai Devices panel
-    CLAUDE_MEM_CLOUD_SYNC_WS: 'true',  // Advisory WebSocket speed layer (plan Phase 4). 'false' = HTTP polling only — sync stays fully correct, just poll-latency (prime directive #2)
+    CLAUDE_MEM_CLOUD_SYNC_WS: 'true',  // Live updates (Supabase Realtime `advance` broadcasts). 'false' disables live updates — sync stays fully correct, just poll-latency (prime directive #2)
     CLAUDE_MEM_CLOUD_SYNC_CONTENT_BATCH_SIZE: '40',  // Drain page size; 200-op content pushes timed out under hub projection_busy
     CLAUDE_MEM_CLOUD_SYNC_REQUEST_TIMEOUT_MS: '90000',  // Content-push AbortSignal; matches hub PROJECTION_LEASE_MS (90s)
-    CLAUDE_MEM_LLM_TIMEOUT_MS: String(DEFAULT_LLM_TIMEOUT_MS),  // Per-attempt observer LLM deadline (retry.ts); see DEFAULT_LLM_TIMEOUT_MS
+    CLAUDE_MEM_LLM_TIMEOUT_MS: String(DEFAULT_LLM_TIMEOUT_MS),  // Per-attempt deadline for non-streamed observer requests (retry.ts); streamed OpenRouter/OpenAI-compatible requests use a 90s idle timeout + 300s cap (streamed-chat-completion.ts)
     CLAUDE_MEM_FIELD_OPTIMIZE_TIMEOUT_MS: String(DEFAULT_LLM_TIMEOUT_MS),  // Oversized-field condensation deadline (field-optimizer.ts); a request to the same backend, so the same deadline
     // Observation TV remote broadcast. EMPTY = OFF: the read-only guard is not
     // mounted and the worker behaves exactly as before. Set (with a non-loopback
@@ -710,7 +742,7 @@ export class SettingsDefaultsManager {
             hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
             { mode: 0o600 },
           );
-          console.warn('[SETTINGS] Migrated cloud sync hub URL off the legacy workers.dev host:', settingsPath);
+          console.warn('[SETTINGS] Migrated cloud sync hub URL to', rewrittenHubUrl, 'from a retired hub host:', settingsPath);
         } catch (error: unknown) {
           console.warn('[SETTINGS] Failed to migrate cloud sync hub URL:', settingsPath, error instanceof Error ? error.message : String(error));
         }

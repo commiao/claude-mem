@@ -58,8 +58,8 @@ describe('durable gateway observer batches', () => {
     const prior=process.env.CLAUDE_MEM_LLM_QUEUE_URL;
     delete process.env.CLAUDE_MEM_LLM_QUEUE_URL;
     try {
-      await expect(sessions.queueObservation(session, {recoveryTaskId:id} as any))
-        .rejects.toThrow('gateway_owned_task_requires_queue_runtime');
+      expect(() => sessions.queueObservation(session, {recoveryTaskId:id} as any))
+        .toThrow('gateway_owned_task_requires_queue_runtime');
       expect(sessions.getMessageBuffer().getPendingCount(session)).toBe(0);
     } finally {
       if(prior!==undefined) process.env.CLAUDE_MEM_LLM_QUEUE_URL=prior;

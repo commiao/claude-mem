@@ -29,6 +29,7 @@ export interface Summary {
   learned?: string;
   completed?: string;
   next_steps?: string;
+  notes?: string | null;
   created_at_epoch: number;
 }
 
@@ -121,6 +122,7 @@ export interface Settings {
 
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY?: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE?: string;
+  CLAUDE_MEM_FILE_READ_GATE_ENABLED?: string;
 
   /** File/env only — shown read-only. Not written via POST /api/settings. */
   CLAUDE_CODE_PATH?: string;

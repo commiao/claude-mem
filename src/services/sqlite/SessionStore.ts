@@ -1,3 +1,4 @@
+import { emitContextInvalidation } from '../../shared/context-invalidation.js';
 import { Database, type SQLQueryBindings, type Statement } from 'bun:sqlite';
 import { randomUUID } from 'crypto';
 import { DATA_DIR, DB_PATH, ensureDir, OBSERVER_SESSIONS_PROJECT, USER_SETTINGS_PATH } from '../../shared/paths.js';
@@ -47,6 +48,7 @@ import { isSubagentEvent } from '../../shared/subagent-predicate.js';
 import { findRecentDuplicateUserPrompt as findRecentDuplicateUserPromptRecord } from './prompts/get.js';
 import { normalizeStoredPromptText, MEDIA_PROMPT_PLACEHOLDER } from './prompt-storage.js';
 import { applySqliteConnectionPragmas } from './connection.js';
+import { streamRows } from './stream-rows.js';
 import { OBSERVATIONS_FTS_TRIGGERS_SQL, SESSION_SUMMARIES_FTS_TRIGGERS_SQL } from './SessionSearch.js';
 import {
   assertCanonicalDecimal,
@@ -59,41 +61,6 @@ import {
 // a slow request while allowing a later SessionEnd delivery to recover work
 // abandoned by a process crash between claiming and marking the row sent.
 export const TELEGRAM_WRAPUP_CLAIM_STALE_AFTER_MS = 5 * 60_000;
-
-let warnedMissingIterate = false;
-
-/**
- * Iterate a prepared statement's rows, preferring the streaming `.iterate()`
- * added in Bun v1.1.31 and falling back to the materializing `.all()` on
- * older runtimes.
- *
- * package.json declares `engines.bun >= 1.1.31`, but engines is advisory —
- * nothing enforces it when the plugin is installed through the Claude Code
- * marketplace. On an older Bun the bare `.iterate()` call threw
- * "…iterate is not a function" from inside schema migration v46, which runs
- * during background init. That rejection left the worker permanently
- * `initialized:false` while still serving 200 on /api/health, so every hook
- * silently skipped until the failure counter began blocking them outright.
- *
- * Falling back keeps the migration correct on old runtimes (it only costs
- * peak memory, and this scan runs once per install) and the one-time warning
- * names the real cause instead of a cryptic TypeError.
- */
-function streamRows(statement: {
-  iterate?: () => Iterable<unknown>;
-  all: () => unknown[];
-}): Iterable<unknown> {
-  if (typeof statement.iterate === 'function') return statement.iterate();
-  if (!warnedMissingIterate) {
-    warnedMissingIterate = true;
-    logger.warn('DB', 'bun:sqlite lacks Statement.iterate(); falling back to .all()', {
-      bunVersion: typeof Bun !== 'undefined' ? Bun.version : 'unknown',
-      requiredBunVersion: '>=1.1.31',
-      impact: 'migration rows are materialized in memory; upgrade Bun to restore streaming',
-    });
-  }
-  return statement.all();
-}
 
 /**
  * Coerce a value to something bun:sqlite can bind. The cloud/export shape
@@ -209,6 +176,17 @@ const DEDUP_SCHEMA_VERSION = 56;
 /** ACT-R reinforcement columns (v56 is the dedup tables above, v58 advisor_calls). */
 const REINFORCEMENT_SCHEMA_VERSION = 57;
 
+/**
+ * A by-ids lookup's row limit: a positive integer, or undefined for no limit.
+ * Callers can pass a raw query-string value, so it is coerced and checked here
+ * and then bound as a parameter, never written into the SQL text. Only safe
+ * integers count: SQLite rejects a bound LIMIT beyond its integer range.
+ */
+function positiveIntegerRowLimit(limit: unknown): number | undefined {
+  const parsedLimit = Number(limit);
+  return Number.isSafeInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined;
+}
+
 export class SessionStore {
   public db: Database;
   private readonly syncOpsEnabled: boolean;
@@ -274,6 +252,9 @@ export class SessionStore {
     this.ensureSessionProjectKeySourceColumn();
     this.requeuePromptsDeadLetteredForSize();
     this.ensureWorkStateTable();
+    this.ensureHookSpoolConsumedTable();
+    this.ensureProjectRecencyIndexes();
+    this.ensureMergedIntoProjectCoveringIndexes();
   }
 
   private getIndexColumns(indexName: string): string[] {
@@ -1970,6 +1951,59 @@ export class SessionStore {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(61, new Date().toISOString());
   }
 
+  // v63 — SessionStart reads the newest N rows per project key. Ordered
+  // (key COLLATE NOCASE, created_at_epoch DESC) indexes let each key's scan stop
+  // after N rows; the single-column v55 indexes made SQLite fetch every row of
+  // the project and sort them (~21k rows / 63 MB per SessionStart on a large db).
+  private ensureProjectRecencyIndexes(): void {
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_project_nocase_recent ON observations(project COLLATE NOCASE, created_at_epoch DESC)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_merged_into_nocase_recent ON observations(merged_into_project COLLATE NOCASE, created_at_epoch DESC)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_summaries_project_nocase_recent ON session_summaries(project COLLATE NOCASE, created_at_epoch DESC)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_summaries_merged_into_nocase_recent ON session_summaries(merged_into_project COLLATE NOCASE, created_at_epoch DESC)');
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(63, new Date().toISOString());
+  }
+
+  // v64 — projectReadKeys (context cache, every SessionStart render) reads
+  // `project` for rows whose merged_into_project matches. With only the
+  // single-column v55 index SQLite loaded every merged row from the table to
+  // read one column (~9k rows / 7.5k pages per call on a large db); these
+  // covering indexes answer it from the index alone.
+  private ensureMergedIntoProjectCoveringIndexes(): void {
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_merged_into_nocase_project ON observations(merged_into_project COLLATE NOCASE, project)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_summaries_merged_into_nocase_project ON session_summaries(merged_into_project COLLATE NOCASE, project)');
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(64, new Date().toISOString());
+  }
+
+  // v62 — exactly-once hand-off marker for hook spool entries (HookSpool.drain):
+  // written the moment ingest irrevocably accepts an entry, cleared once its file is gone.
+  private ensureHookSpoolConsumedTable(): void {
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS hook_spool_consumed (
+        entry_key TEXT PRIMARY KEY,
+        consumed_at_epoch_ms INTEGER NOT NULL
+      )
+    `);
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(62, new Date().toISOString());
+  }
+
+  isHookSpoolEntryConsumed(entryKey: string): boolean {
+    return this.db.prepare('SELECT 1 FROM hook_spool_consumed WHERE entry_key = ?').get(entryKey) != null;
+  }
+
+  markHookSpoolEntryConsumed(entryKey: string, consumedAtEpochMs: number): void {
+    this.db.prepare(
+      'INSERT INTO hook_spool_consumed (entry_key, consumed_at_epoch_ms) VALUES (?, ?) ON CONFLICT(entry_key) DO UPDATE SET consumed_at_epoch_ms = excluded.consumed_at_epoch_ms'
+    ).run(entryKey, consumedAtEpochMs);
+  }
+
+  clearHookSpoolEntryConsumed(entryKey: string): void {
+    this.db.prepare('DELETE FROM hook_spool_consumed WHERE entry_key = ?').run(entryKey);
+  }
+
+  pruneHookSpoolConsumedMarkersBefore(epochMs: number): void {
+    this.db.prepare('DELETE FROM hook_spool_consumed WHERE consumed_at_epoch_ms < ?').run(epochMs);
+  }
+
   // v52 — durable claim ledger for one Telegram session wrap-up per route.
   // The DDL is intentionally idempotent so fresh installs and existing DBs
   // converge even if a fixture has an incomplete schema_versions ledger.
@@ -2471,11 +2505,20 @@ export class SessionStore {
 
     if (!current || current.memory_session_id === memorySessionId) return;
 
-    this.db.prepare(`
-      UPDATE sdk_sessions
-      SET memory_session_id = ?
-      WHERE id = ?
-    `).run(memorySessionId, sessionDbId);
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE sdk_sessions
+        SET memory_session_id = ?
+        WHERE id = ?
+      `).run(memorySessionId, sessionDbId);
+      // Observations cascade this deliberate identity change through their FK;
+      // receipts have no FK, so carry the same session identity explicitly.
+      this.db.prepare(`
+        UPDATE tool_uses
+        SET memory_session_id = ?
+        WHERE session_db_id = ?
+      `).run(memorySessionId, sessionDbId);
+    })();
     if (memorySessionId) this.requeuePromptSync(sessionDbId);
   }
 
@@ -2987,11 +3030,21 @@ export class SessionStore {
   }
 
   appendWorkStateEntry(entry: { project: string; listName: string; fields: WorkStateFields; createdAtEpoch?: number }): number {
-    return appendWorkStateEntryRow(this.db, entry);
+    const entryId = appendWorkStateEntryRow(this.db, entry);
+    emitContextInvalidation({ projects: [entry.project] }, 'appendWorkStateEntry');
+    return entryId;
   }
 
   getWorkStateEntries(projects: string[], listName?: string): WorkStateEntry[] {
-    return getWorkStateEntriesRows(this.db, projects, listName);
+    const entries = getWorkStateEntriesRows(this.db, this.getProjectReadKeys(projects), listName);
+    // Keys explicitly supplied by the checkout describe one list history.
+    // Adopted projects discovered by getProjectReadKeys retain their own scope.
+    const foldKey = (key: string) => key.replace(/[A-Z]/g, character => character.toLowerCase());
+    const aliases = new Set(projects.map(foldKey));
+    const primary = projects.at(-1);
+    return entries.map(entry => primary && aliases.has(foldKey(entry.project))
+      ? { ...entry, scope_project: primary }
+      : entry);
   }
 
   countToolUses(filters: ToolUseQueryFilters = {}): Array<{ tool_name: string; uses: number }> {
@@ -3004,11 +3057,13 @@ export class SessionStore {
   ): ObservationSearchResult[] {
     if (ids.length === 0) return [];
 
-    const { orderBy = 'date_desc', limit, platformSource, type, concepts, files } = options;
+    const { orderBy = 'date_desc', platformSource, type, concepts, files } = options;
+    const limit = positiveIntegerRowLimit(options.limit);
     const projects = scopedProjects(options);
     const preserveIdOrder = orderBy === 'relevance';
-    const orderClause = preserveIdOrder ? '' : `ORDER BY o.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
-    const limitClause = limit && !preserveIdOrder ? `LIMIT ${limit}` : '';
+    const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
+    const orderClause = preserveIdOrder ? '' : `ORDER BY o.created_at_epoch ${direction}, o.id ${direction}`;
+    const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
 
     const placeholders = ids.map(() => '?').join(',');
     const params: any[] = [...ids];
@@ -3048,10 +3103,12 @@ export class SessionStore {
     if (files) {
       const filesList = Array.isArray(files) ? files : [files];
       const fileConditions = filesList.map(() => {
-        return '(EXISTS (SELECT 1 FROM json_each(o.files_read) WHERE value LIKE ?) OR EXISTS (SELECT 1 FROM json_each(o.files_modified) WHERE value LIKE ?))';
+        return "(EXISTS (SELECT 1 FROM json_each(o.files_read) WHERE value LIKE ? ESCAPE '\\') OR EXISTS (SELECT 1 FROM json_each(o.files_modified) WHERE value LIKE ? ESCAPE '\\'))";
       });
       filesList.forEach(file => {
-        params.push(`%${file}%`, `%${file}%`);
+        // The hydration filter receives literal file paths, like SQLite search.
+        const literal = file.replace(/[\\%_]/g, '\\$&');
+        params.push(`%${literal}%`, `%${literal}%`);
       });
       additionalConditions.push(`(${fileConditions.join(' OR ')})`);
     }
@@ -3059,6 +3116,7 @@ export class SessionStore {
     const whereClause = additionalConditions.length > 0
       ? `WHERE o.id IN (${placeholders}) AND ${additionalConditions.join(' AND ')}`
       : `WHERE o.id IN (${placeholders})`;
+    if (limitClause) params.push(limit);
 
     const stmt = this.db.prepare(`
       SELECT o.*
@@ -3100,7 +3158,7 @@ export class SessionStore {
       FROM session_summaries
       WHERE memory_session_id = ?
       ${platformClause}
-      ORDER BY created_at_epoch DESC
+      ORDER BY created_at_epoch DESC, id DESC
       LIMIT 1
     `);
 
@@ -3261,7 +3319,7 @@ export class SessionStore {
     `).run(observedModel || null, observedBilling || null, sessionDbId);
   }
 
-  getSdkSessionsBySessionIds(memorySessionIds: string[]): {
+  getSdkSessionsBySessionIds(memorySessionIds: string[], promptIds: number[] = []): {
     id: number;
     content_session_id: string;
     memory_session_id: string;
@@ -3275,34 +3333,57 @@ export class SessionStore {
     completed_at_epoch: number | null;
     status: string;
   }[] {
-    if (memorySessionIds.length === 0) return [];
+    if (memorySessionIds.length === 0 && promptIds.length === 0) return [];
 
-    const placeholders = memorySessionIds.map(() => '?').join(',');
-    const stmt = this.db.prepare(`
-      SELECT id, content_session_id, memory_session_id, project,
-             COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
-             user_prompt, custom_title,
-             started_at, started_at_epoch, completed_at, completed_at_epoch, status
-      FROM sdk_sessions
-      WHERE memory_session_id IN (${placeholders})
-      ORDER BY started_at_epoch DESC
-    `);
-
-    return stmt.all(...memorySessionIds) as any[];
+    // Memory and prompt references share a 500-binding budget. Deduplicate
+    // both references and returned rows; one parent can span many chunks.
+    const references: Array<string | number> = [...new Set(memorySessionIds), ...new Set(promptIds)];
+    const sessions = new Map<number, ReturnType<SessionStore['getSdkSessionsBySessionIds']>[number]>();
+    for (let offset = 0; offset < references.length; offset += 500) {
+      const batch = references.slice(offset, offset + 500);
+      const memoryIds = batch.filter((id): id is string => typeof id === 'string');
+      const prompts = batch.filter((id): id is number => typeof id === 'number');
+      const conditions: string[] = [];
+      if (memoryIds.length) conditions.push(`memory_session_id IN (${memoryIds.map(() => '?').join(',')})`);
+      if (prompts.length) conditions.push(`id IN (SELECT session_db_id FROM user_prompts WHERE id IN (${prompts.map(() => '?').join(',')}))`);
+      const stmt = this.db.prepare(`
+        SELECT id, content_session_id, memory_session_id, project,
+               COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
+               user_prompt, custom_title,
+               started_at, started_at_epoch, completed_at, completed_at_epoch, status
+        FROM sdk_sessions
+        WHERE ${conditions.join(' OR ')}
+        ORDER BY started_at_epoch DESC
+      `);
+      for (const row of stmt.all(...batch) as ReturnType<SessionStore['getSdkSessionsBySessionIds']>) sessions.set(row.id, row);
+    }
+    return [...sessions.values()].sort((a, b) => b.started_at_epoch - a.started_at_epoch);
   }
 
-  getPromptNumberFromUserPrompts(contentSessionId: string, sessionDbId?: number): number {
+  /**
+   * The session's current prompt number (count of its user_prompts rows).
+   * `createdAtOrBeforeEpochMs` answers "which prompt was current at that
+   * moment" instead — for an event that happened earlier than it is being
+   * ingested (a hook spool entry drained after an outage).
+   */
+  getPromptNumberFromUserPrompts(
+    contentSessionId: string,
+    sessionDbId?: number,
+    createdAtOrBeforeEpochMs?: number,
+  ): number {
     const resolvedSessionDbId = this.resolvePromptSessionDbId(contentSessionId, sessionDbId);
-    if (resolvedSessionDbId !== null) {
+    const sessionClause = resolvedSessionDbId !== null ? 'session_db_id = ?' : 'content_session_id = ?';
+    const sessionParam = resolvedSessionDbId !== null ? resolvedSessionDbId : contentSessionId;
+    if (createdAtOrBeforeEpochMs !== undefined) {
       const result = this.db.prepare(`
-        SELECT COUNT(*) as count FROM user_prompts WHERE session_db_id = ?
-      `).get(resolvedSessionDbId) as { count: number };
+        SELECT COUNT(*) as count FROM user_prompts WHERE ${sessionClause} AND created_at_epoch <= ?
+      `).get(sessionParam, createdAtOrBeforeEpochMs) as { count: number };
       return result.count;
     }
 
     const result = this.db.prepare(`
-      SELECT COUNT(*) as count FROM user_prompts WHERE content_session_id = ?
-    `).get(contentSessionId) as { count: number };
+      SELECT COUNT(*) as count FROM user_prompts WHERE ${sessionClause}
+    `).get(sessionParam) as { count: number };
     return result.count;
   }
 
@@ -3640,6 +3721,7 @@ export class SessionStore {
       timestampIso,
       timestampEpoch
     );
+    emitContextInvalidation({ projects: [project] }, 'storeSummary');
 
     return {
       id: Number(result.lastInsertRowid),
@@ -3848,7 +3930,9 @@ export class SessionStore {
       return result;
     });
 
-    return storeTx();
+    const stored = storeTx();
+    emitContextInvalidation({ projects: [project] }, 'storeObservations');
+    return stored;
   }
 
   /**
@@ -3875,11 +3959,12 @@ export class SessionStore {
   ): SessionSummarySearchResult[] {
     if (ids.length === 0) return [];
 
-    const { orderBy = 'date_desc', limit, platformSource } = options;
+    const { orderBy = 'date_desc', platformSource } = options;
+    const limit = positiveIntegerRowLimit(options.limit);
     const projects = scopedProjects(options);
     const preserveIdOrder = orderBy === 'relevance';
     const orderClause = preserveIdOrder ? '' : `ORDER BY ss.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
-    const limitClause = limit && !preserveIdOrder ? `LIMIT ${limit}` : '';
+    const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
     const placeholders = ids.map(() => '?').join(',');
     const params: any[] = [...ids];
     const additionalConditions: string[] = [];
@@ -3898,6 +3983,7 @@ export class SessionStore {
     const additionalFilter = additionalConditions.length > 0
       ? `AND ${additionalConditions.join(' AND ')}`
       : '';
+    if (limitClause) params.push(limit);
 
     const stmt = this.db.prepare(`
       SELECT ss.*
@@ -3922,11 +4008,12 @@ export class SessionStore {
   ): UserPromptRecord[] {
     if (ids.length === 0) return [];
 
-    const { orderBy = 'date_desc', limit, platformSource } = options;
+    const { orderBy = 'date_desc', platformSource } = options;
+    const limit = positiveIntegerRowLimit(options.limit);
     const projects = scopedProjects(options);
     const preserveIdOrder = orderBy === 'relevance';
     const orderClause = preserveIdOrder ? '' : `ORDER BY up.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
-    const limitClause = limit && !preserveIdOrder ? `LIMIT ${limit}` : '';
+    const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
     const placeholders = ids.map(() => '?').join(',');
     const params: any[] = [...ids];
     const additionalConditions: string[] = [];
@@ -3945,6 +4032,7 @@ export class SessionStore {
     const additionalFilter = additionalConditions.length > 0
       ? `AND ${additionalConditions.join(' AND ')}`
       : '';
+    if (limitClause) params.push(limit);
 
     const stmt = this.db.prepare(`
       SELECT
@@ -4026,26 +4114,29 @@ export class SessionStore {
     let endEpoch: number;
 
     if (anchorObservationId !== null) {
+      // These probes consume only the boundary epoch. Row-value comparisons
+      // retain the ID tie boundary; ordering IDs within one epoch cannot change
+      // the time window and would force a sort beyond the existing epoch index.
       const beforeQuery = `
         SELECT o.id, o.created_at_epoch
         FROM observations o
         LEFT JOIN sdk_sessions src ON src.memory_session_id = o.memory_session_id
-        WHERE o.id <= ? ${observationScope.clause}
-        ORDER BY o.id DESC
+        WHERE (o.created_at_epoch, o.id) <= (?, ?) ${observationScope.clause}
+        ORDER BY o.created_at_epoch DESC
         LIMIT ?
       `;
       const afterQuery = `
         SELECT o.id, o.created_at_epoch
         FROM observations o
         LEFT JOIN sdk_sessions src ON src.memory_session_id = o.memory_session_id
-        WHERE o.id >= ? ${observationScope.clause}
-        ORDER BY o.id ASC
+        WHERE (o.created_at_epoch, o.id) >= (?, ?) ${observationScope.clause}
+        ORDER BY o.created_at_epoch ASC
         LIMIT ?
       `;
 
       try {
-        const beforeRecords = this.db.prepare(beforeQuery).all(anchorObservationId, ...observationScope.params, depthBefore + 1) as Array<{id: number; created_at_epoch: number}>;
-        const afterRecords = this.db.prepare(afterQuery).all(anchorObservationId, ...observationScope.params, depthAfter + 1) as Array<{id: number; created_at_epoch: number}>;
+        const beforeRecords = this.db.prepare(beforeQuery).all(anchorEpoch, anchorObservationId, ...observationScope.params, depthBefore + 1) as Array<{id: number; created_at_epoch: number}>;
+        const afterRecords = this.db.prepare(afterQuery).all(anchorEpoch, anchorObservationId, ...observationScope.params, depthAfter + 1) as Array<{id: number; created_at_epoch: number}>;
 
         if (beforeRecords.length === 0 && afterRecords.length === 0) {
           return { observations: [], sessions: [], prompts: [] };
@@ -4220,6 +4311,7 @@ export class SessionStore {
     project: string;
     platform_source?: string;
     user_prompt: string;
+    custom_title?: string | null;
     started_at: string;
     started_at_epoch: number;
     completed_at: string | null;
@@ -4236,27 +4328,39 @@ export class SessionStore {
       return { imported: false, id: existing.id };
     }
 
+    const customTitle = session.custom_title ?? null;
+    // Backup values are historical SQLite data, not a newly authored title.
+    // Preserve legacy strings exactly; JSON objects/numbers are not title values.
+    if (customTitle !== null && typeof customTitle !== 'string') {
+      throw new TypeError('Imported custom_title must be a string or null');
+    }
+
     const stmt = this.db.prepare(`
       INSERT INTO sdk_sessions (
-        content_session_id, memory_session_id, project, platform_source, user_prompt,
+        content_session_id, memory_session_id, project, platform_source, user_prompt, custom_title,
         started_at, started_at_epoch, completed_at, completed_at_epoch, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const result = stmt.run(
-	      session.content_session_id,
-	      session.memory_session_id,
-	      session.project,
-	      normalizedPlatformSource,
-      session.user_prompt,
-      session.started_at,
-      session.started_at_epoch,
-      session.completed_at,
-      session.completed_at_epoch,
-      session.status
-    );
+    return this.db.transaction(() => {
+      const result = stmt.run(
+  	      session.content_session_id,
+  	      session.memory_session_id,
+  	      session.project,
+  	      normalizedPlatformSource,
+        session.user_prompt,
+        customTitle,
+        session.started_at,
+        session.started_at_epoch,
+        session.completed_at,
+        session.completed_at_epoch,
+        session.status
+      );
 
-    return { imported: true, id: result.lastInsertRowid as number };
+      // Backups contain no title mutation clock. Publishing this historical
+      // value as a new set_title op could overwrite a newer replica title.
+      return { imported: true, id: result.lastInsertRowid as number };
+    })();
   }
 
   importSessionSummary(summary: {
@@ -4286,9 +4390,20 @@ export class SessionStore {
       return { imported: false, id: 0 };
     }
 
+    // project and discovery_tokens stay out of the replay match: both are
+    // rewritten after a row is created (cwd remap / remap_project, and
+    // updateDiscoveryTokens), so an earlier export of this row must still match.
     const existing = this.db.prepare(
-      'SELECT id FROM session_summaries WHERE memory_session_id = ?'
-    ).get(summary.memory_session_id) as { id: number } | undefined;
+      `SELECT id FROM session_summaries WHERE memory_session_id = ?
+        AND request IS ? AND investigated IS ? AND learned IS ? AND completed IS ?
+        AND next_steps IS ? AND files_read IS ? AND files_edited IS ? AND notes IS ?
+        AND prompt_number IS ? AND created_at_epoch = ?`
+    ).get(summary.memory_session_id, coerceBindValue(summary.request),
+      coerceBindValue(summary.investigated), coerceBindValue(summary.learned),
+      coerceBindValue(summary.completed), coerceBindValue(summary.next_steps),
+      coerceBindValue(summary.files_read), coerceBindValue(summary.files_edited),
+      coerceBindValue(summary.notes), summary.prompt_number ?? null,
+      summary.created_at_epoch) as { id: number } | undefined;
 
     if (existing) {
       return { imported: false, id: existing.id };
@@ -4318,6 +4433,7 @@ export class SessionStore {
       summary.created_at,
       summary.created_at_epoch
     );
+    emitContextInvalidation({ projects: [summary.project] }, 'importSessionSummary');
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
@@ -4355,10 +4471,20 @@ export class SessionStore {
       return { imported: false, id: 0 };
     }
 
+    // Same replay match as importSessionSummary: project and discovery_tokens
+    // are rewritten after a row is created, so they are not part of it.
     const existing = this.db.prepare(`
       SELECT id FROM observations
-      WHERE memory_session_id = ? AND title = ? AND created_at_epoch = ?
-    `).get(obs.memory_session_id, coerceBindValue(obs.title), obs.created_at_epoch) as { id: number } | undefined;
+      WHERE memory_session_id = ? AND text IS ? AND type = ?
+        AND title IS ? AND subtitle IS ? AND facts IS ? AND narrative IS ?
+        AND concepts IS ? AND files_read IS ? AND files_modified IS ?
+        AND prompt_number IS ? AND agent_type IS ?
+        AND agent_id IS ? AND created_at_epoch = ?
+    `).get(obs.memory_session_id, coerceBindValue(obs.text), obs.type,
+      coerceBindValue(obs.title), coerceBindValue(obs.subtitle), coerceBindValue(obs.facts),
+      coerceBindValue(obs.narrative), coerceBindValue(obs.concepts), coerceBindValue(obs.files_read),
+      coerceBindValue(obs.files_modified), obs.prompt_number ?? null,
+      obs.agent_type ?? null, obs.agent_id ?? null, obs.created_at_epoch) as { id: number } | undefined;
 
     if (existing) {
       return { imported: false, id: existing.id };
@@ -4392,6 +4518,7 @@ export class SessionStore {
       obs.created_at,
       obs.created_at_epoch
     );
+    emitContextInvalidation({ projects: [obs.project] }, 'importObservation');
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
