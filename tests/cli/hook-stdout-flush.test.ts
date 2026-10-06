@@ -1,9 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { spawn } from 'child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Readable } from 'stream';
 
 const HOOK_IO_PATH = join(import.meta.dir, '..', '..', 'src', 'shared', 'hook-io.ts');
 const CONTEXT = 'x'.repeat(1024 * 1024) + '\nSynthetic context: \u03bb \ud83d\ude80';
@@ -68,52 +66,21 @@ interface CapturedOutput {
   marker: string;
 }
 
-function captureWithPausedReader(
+async function captureWithPausedReader(
   executable: string,
   kind: 'json' | 'raw',
   closeReader = false,
 ): Promise<CapturedOutput> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(executable, [fixturePath, kind], {
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    const marker: Buffer[] = [];
-    child.stdout!.on('data', chunk => stdout.push(Buffer.from(chunk)));
-    child.stdout!.pause();
-    if (closeReader) child.stdout!.destroy();
-    child.stderr!.on('data', chunk => stderr.push(Buffer.from(chunk)));
-    const drainMarker = child.stdio[3] as Readable;
-    drainMarker.on('data', chunk => {
-      marker.push(Buffer.from(chunk));
-      child.stdout!.resume();
-    });
-    child.once('exit', () => child.stdout!.resume());
-
-    // A deadline prevents a broken flush implementation from leaking a child.
-    // Reader release itself uses the fixture's marker or exit, never a sleep.
-    const deadline = setTimeout(() => {
-      child.stdout!.resume();
-      child.kill();
-      reject(new Error('Hook stdout fixture did not finish within 5 seconds'));
-    }, 5000);
-    child.once('error', error => {
-      clearTimeout(deadline);
-      reject(error);
-    });
-    child.once('close', (code, signal) => {
-      clearTimeout(deadline);
-      resolve({
-        code,
-        signal,
-        stdout: Buffer.concat(stdout).toString('utf-8'),
-        stderr: Buffer.concat(stderr).toString('utf-8'),
-        marker: Buffer.concat(marker).toString('utf-8'),
-      });
-    });
-  });
+  if (!nodePath) throw new Error('Native Node pipe fixture requires Node');
+  // Native Node owns the extra marker pipe. Bun's child_process compatibility
+  // layer can race a fast child exit while connecting fd 3 on macOS.
+  const child = Bun.spawn([nodePath, join(import.meta.dir, '../fixtures/scripts/hook-stdout-parent.cjs'),
+    executable, fixturePath, kind, String(closeReader)], {stdout: 'pipe', stderr: 'pipe'});
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ]);
+  if (code !== 0) throw new Error(`Native pipe fixture failed: ${stderr}`);
+  return JSON.parse(stdout);
 }
 
 describe('hook stdout completes before graceful exit', () => {

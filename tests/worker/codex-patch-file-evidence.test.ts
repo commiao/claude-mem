@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { describe, expect, it, spyOn } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -46,7 +47,8 @@ describe('Codex hook patch file evidence', () => {
         mode.loadMode('code');
         const store = new SessionStore(':memory:');
         cleanup.push(() => store.close());
-        const db = { getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id),
+        const tasks = new ObserverTaskStore(store.db);
+        const db = { getObserverTaskStore: () => tasks, getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id),
           getChromaSync: () => null, getCloudSync: () => null } as unknown as DatabaseManager;
         const manager = new SessionManager(db);
         let priorContext: IngestContext | null = null;

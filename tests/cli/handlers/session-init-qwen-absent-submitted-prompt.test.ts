@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { afterEach, describe, expect, it, spyOn } from 'bun:test';
 import express from 'express';
 import { mkdtempSync, rmSync } from 'fs';
@@ -255,7 +256,9 @@ describe('Qwen session prompts through the real session routes', () => {
       cleanup.push(() => settings.mockRestore());
       const store = new SessionStore(':memory:');
       cleanup.push(() => store.close());
+      const tasks = new ObserverTaskStore(store.db);
       const dbManager = {
+        getObserverTaskStore: () => tasks,
         getSessionStore: () => store,
         getSessionById: (id: number) => store.getSessionById(id),
         getChromaSync: () => null,

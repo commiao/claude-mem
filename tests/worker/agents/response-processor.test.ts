@@ -187,6 +187,7 @@ describe('ResponseProcessor', () => {
     } as unknown as DatabaseManager;
 
     mockSessionManager = {
+      markClaimedPersistedOutcome: mock(() => {}),
         markClaimedNeedsReconciliation: mock(() => {}),
         markClaimedSkipped: mock(() => {}),
       getMessageIterator: async function* () {
