@@ -75,6 +75,7 @@ describe('DataRoutes GET /api/processing-status — parkedSessions (#2756)', () 
   it('reports parkedSessions: 0 alongside the existing fields when nothing is parked', async () => {
     const mockSessionManager = {
       isAnySessionProcessing: mock(() => Promise.resolve(false)),
+      getDurableQueueStatus: () => undefined,
       getTotalActiveWork: mock(() => Promise.resolve(0)),
     };
 
@@ -108,7 +109,8 @@ describe('DataRoutes GET /api/processing-status — parkedSessions (#2756)', () 
     try {
       const mockSessionManager = {
         isAnySessionProcessing: mock(() => Promise.resolve(true)),
-        getTotalActiveWork: mock(() => Promise.resolve(5)),
+        getDurableQueueStatus: () => undefined,
+      getTotalActiveWork: mock(() => Promise.resolve(5)),
       };
 
       const routes = new DataRoutes(

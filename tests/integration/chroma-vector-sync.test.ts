@@ -214,38 +214,18 @@ describe('ChromaSync Vector Sync Integration', () => {
 
   describe('Error handling', () => {
     it('should handle connection failures gracefully', async () => {
-      if (!chromaAvailable) {
-        console.log(`Skipping: ${skipReason}`);
-        return;
-      }
-
       const { ChromaSync } = await import('../../src/services/sync/ChromaSync.js');
-      const sync = new ChromaSync(testProject);
-
-      const observation = {
-        type: 'discovery' as const,
-        title: 'Test',
-        subtitle: null,
-        facts: [],
-        narrative: null,
-        concepts: [],
-        files_read: [],
-        files_modified: []
-      };
-
+      const { ChromaMcpManager } = await import('../../src/services/sync/ChromaMcpManager.js');
+      const call = spyOn(ChromaMcpManager.getInstance(), 'callTool')
+        .mockRejectedValue(new Error('fixture connection refused'));
       try {
-        await sync.syncObservation(
-          1,
-          'session-123',
-          'test',
-          observation,
-          1,
-          Date.now()
-        );
-        // If it didn't throw, the connection might have succeeded
-      } catch (error) {
-        expect(error).toBeDefined();
-      }
+        const sync = new ChromaSync(testProject);
+        await expect(sync.syncObservation(1, 'session-123', 'test', {
+          type: 'discovery', title: 'Test', subtitle: null, facts: [], narrative: null,
+          concepts: [], files_read: [], files_modified: [],
+        }, 1, Date.now())).rejects.toThrow('fixture connection refused');
+        expect(call).toHaveBeenCalled();
+      } finally { call.mockRestore(); }
     });
   });
 

@@ -4,12 +4,16 @@ import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
 import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../../shared/paths.js';
-import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
+import { USER_SETTINGS_PATH, OBSERVER_WORKING_DIRECTORY_ERROR_PREFIX, paths } from '../../shared/paths.js';
+import {
+  buildIsolatedEnvWithFreshOAuth,
+  getAuthMethodDescription,
+  resolveConfigDirProfileKey,
+} from '../../shared/EnvManager.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
 import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
-import { processAgentResponse, snapshotResponseContext, type WorkerRef } from './agents/index.js';
+import { processAgentResponse, snapshotResponseContext, takeObserverSchemaReminder, type WorkerRef } from './agents/index.js';
 import {
   createSdkSpawnFactory,
   getSdkProcessForSession,
@@ -27,22 +31,28 @@ import {
 // @ts-ignore - Agent SDK types may not be available
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
-import { ClassifiedProviderError } from './provider-errors.js';
+import { describeObserverOutputShape, formatEmptyOutputReason } from '../../sdk/output-classifier.js';
+import { ClassifiedProviderError, isClassified } from './provider-errors.js';
 import { resolveSummaryTierModel, resolveTierAlias } from './model-aliases.js';
+import { accumulateClaudeUsage, observerUsageLogFields } from './observer-usage.js';
 import {
   shouldRecycleConversation,
-  conversationChars,
+  describeGenerationUsage,
   resolveConversationMaxChars,
+  windowAwareConversationMaxChars,
 } from '../../shared/observer-recycle.js';
-import { recycleObserverConversation, loadSessionStartContext } from './session/recycle-conversation.js';
-import { ObserverTurnGate } from './session/ObserverTurnGate.js';
-import { optimizeObservationFields, buildFieldCompressionPrompt, type FieldCompressor } from './field-optimizer.js';
+import { resolveContextWindowTokens, observationFieldMaxChars } from './context-window.js';
+import { recycleObserverConversation, loadSessionStartContext, openObserverGeneration } from './session/recycle-conversation.js';
+import { ObserverResponsePacer } from './session/response-pacer.js';
+import { IDLE_TIMEOUT_MS } from './SessionMessageBuffer.js';
+import { optimizeObservationFields, buildFieldCompressionPrompt, type CompressedField, type FieldCompressor } from './field-optimizer.js';
+import { resolveFieldOptimizeTimeoutMs } from './retry.js';
 import { buildTelegramWrapupPrompt, type TelegramWrapupFormatterInput } from '../integrations/TelegramWrapupNotifier.js';
 import { telemetryBuffer } from '../telemetry/buffer.js';
 import { captureEvent } from '../telemetry/telemetry.js';
-import { clearDependencyStatus, recordClaudeCliSetupRequired } from '../../shared/dependency-health.js';
+import { clearDependencyStatus, recordClaudeCliSetupRequired, OBSERVER_DIR_UNUSABLE_CODE } from '../../shared/dependency-health.js';
+import { clearClaudeCliSelfHealAttempts } from './stale-spawn-recovery.js';
 import { createHash } from 'crypto';
-
 const REPLAY_HEADER_NAMES = new Set([
   'x-credvault-replay-permit', 'x-credvault-replay-prompt-sha256', 'x-credvault-replay-step-id',
   'x-model-gateway-step-id', 'idempotency-key',
@@ -97,26 +107,57 @@ export function __resetEffortHintLatchForTesting(): void {
 }
 
 /**
+ * A process launch that failed: Node's spawn error (code ENOENT/EINVAL, a
+ * spawn syscall) or the same failure carried in a wrapping message
+ * ("spawn claude ENOENT", "Failed to spawn …: spawn EINVAL"). An ENOENT from a
+ * file read is not one.
+ */
+function isSpawnFailure(error: unknown): boolean {
+  for (const candidate of [error, (error as { cause?: unknown } | null)?.cause]) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const { code, syscall, message } = candidate as { code?: unknown; syscall?: unknown; message?: unknown };
+    if ((code === 'ENOENT' || code === 'EINVAL') && typeof syscall === 'string' && syscall.startsWith('spawn')) return true;
+    if (typeof message === 'string' && /\bspawn\b.*\b(ENOENT|EINVAL)\b/.test(message)) return true;
+  }
+  return false;
+}
+
+/**
  * Classify a ClaudeProvider error (executable spawn failures, SDK errors,
  * Anthropic API errors). Provider-specific because it relies on:
  *   - SDK error class names (e.g. OverloadedError) when present
- *   - spawn errors (ENOENT) when the Claude executable is missing
+ *   - spawn errors (ENOENT/EINVAL) when the executable is missing or is a
+ *     Windows .cmd/.bat shim the SDK cannot launch without a shell
  *   - Anthropic-specific message strings ("Invalid API key", "Prompt is too long")
  */
 export function classifyClaudeError(err: unknown): ClassifiedProviderError {
   const message = err instanceof Error ? err.message : String(err);
   const errAny = err as { name?: string; status?: number; error?: { type?: string }; body?: unknown };
 
-  // Executable / spawn issues — unrecoverable, no point retrying.
+  // Executable / spawn issues — unrecoverable, no point retrying. EINVAL is the
+  // shape modern Node raises when the SDK spawns a Windows .cmd/.bat shim
+  // (e.g. a codex or uv shim reached via CLAUDE_CODE_PATH) without a shell.
   if (
     message.includes('Claude executable not found') ||
     message.includes('Every Claude CLI found is too old') ||
     message.includes('CLAUDE_CODE_PATH') ||
     (message.includes('desktop app') && message.includes('headless mode')) ||
     message.includes('ENOENT') ||
+    message.includes('EINVAL') ||
     message.startsWith('spawn ')
   ) {
     return new ClassifiedProviderError(message, { kind: 'setup_required', cause: err });
+  }
+
+  // The observer working directory cannot be created: the data dir is a file,
+  // sits under one, or is not writable (ensureObserverSessionsDir). Retrying
+  // cannot fix that, so it is a setup problem. The CLI's own
+  // `Path "..." does not exist` result is deliberately NOT matched here:
+  // telemetry shows it once per install and never again (occurrence_count 1
+  // across 13.10-13.25), so parking Claude starts behind the setup cooldown
+  // for it would cost more than the retry.
+  if (message.startsWith(`${OBSERVER_WORKING_DIRECTORY_ERROR_PREFIX}: `)) {
+    return new ClassifiedProviderError(message, { kind: 'setup_required', code: OBSERVER_DIR_UNUSABLE_CODE, cause: err });
   }
 
   // Anthropic auth failures.
@@ -215,15 +256,46 @@ export function classifyClaudeError(err: unknown): ClassifiedProviderError {
   return new ClassifiedProviderError(message, { kind: 'transient', cause: err });
 }
 
+/**
+ * The full context the model read on a turn: fresh input + cache writes +
+ * cache reads. This is the value that grows across an observer generation and
+ * eventually meets the model's window (#2956).
+ */
+export function computeFullContextTokens(
+  usage: {
+    input_tokens?: number | null;
+    cache_creation_input_tokens?: number | null;
+    cache_read_input_tokens?: number | null;
+  } | undefined | null
+): number {
+  if (!usage) return 0;
+  return (
+    (usage.input_tokens || 0) +
+    (usage.cache_creation_input_tokens || 0) +
+    (usage.cache_read_input_tokens || 0)
+  );
+}
+
 export class ClaudeProvider {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
 
-  /** Character budget for one observer generation, operator-overridable (#3800). */
-  private conversationMaxChars(): number {
-    return resolveConversationMaxChars(
-      SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS
+  /**
+   * Character budget for one observer generation: operator-overridable (#3800)
+   * and never more than half this generation's model window (#3625).
+   */
+  private conversationMaxChars(session: ActiveSession): number {
+    return windowAwareConversationMaxChars(
+      resolveConversationMaxChars(
+        SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS
+      ),
+      session.observerContextWindowTokens,
     );
+  }
+
+  /** How long an unanswered prompt may go without SDK activity (#4066). */
+  private responseStallMs(): number {
+    return IDLE_TIMEOUT_MS;
   }
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
@@ -252,6 +324,29 @@ export class ClaudeProvider {
     }
   }
 
+  /**
+   * Classify a thrown provider error and rethrow. A setup_required failure (a
+   * missing or unspawnable executable) is recorded and rethrown as the
+   * classified error so SessionRoutes reports it once and skips future Claude
+   * starts until it is repaired; every other error keeps its original shape so
+   * genuine bugs still reach exception capture. `executablePath` is the resolved
+   * path a spawn failure could not launch — carried on the error and status so
+   * the setup-recheck gate does not re-run a query against the same shim.
+   */
+  private recordAndThrowClassified(error: unknown, executablePath?: string): never {
+    // Already classified (an observer-dir failure carries its own code): keep it.
+    if (isClassified(error)) throw error;
+    const err = error instanceof Error ? error : new Error(String(error));
+    const classified = classifyClaudeError(err);
+    if (classified.kind === 'setup_required') {
+      recordClaudeCliSetupRequired(classified.message, executablePath);
+      throw executablePath
+        ? new ClassifiedProviderError(classified.message, { kind: 'setup_required', cause: err, executablePath })
+        : classified;
+    }
+    throw err;
+  }
+
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     const cwdTracker = { lastCwd: undefined as string | undefined };
     const observerExtraArgs = ['--no-session-persistence'];
@@ -262,18 +357,16 @@ export class ClaudeProvider {
     try {
       claudePath = findClaudeExecutable('SDK');
       clearDependencyStatus('claude_cli');
+      clearClaudeCliSelfHealAttempts();
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      const classified = classifyClaudeError(err);
-      if (classified.kind === 'setup_required') {
-        recordClaudeCliSetupRequired(classified.message);
-        throw classified;
-      }
-      throw err;
+      this.recordAndThrowClassified(error);
     }
 
     const modelId = session.modelOverride || this.getModelId();
     session.lastModelId = typeof modelId === 'string' ? modelId : undefined;
+    // Resolved once per generation: the generation budget and the per-field
+    // cap both scale with the model's window (#3625).
+    session.observerContextWindowTokens = await resolveContextWindowTokens('claude', String(modelId ?? ''));
     // Each query() starts a fresh SDK process, so its total_cost_usd
     // accumulator starts from zero — reset the per-turn cost baseline with it.
     session.lastResultTotalCostUsd = null;
@@ -281,8 +374,9 @@ export class ClaudeProvider {
     const activeResponseContext = { current: snapshotResponseContext(session) };
     const compressField: FieldCompressor = (text, budgetChars, signal) =>
       this.compressField(text, budgetChars, session, modelId, claudePath, signal);
-    const turnGate = new ObserverTurnGate(session.abortController.signal);
-    const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField, turnGate);
+    // Paces the streaming feed to one unanswered prompt per generation (#4066).
+    const pacer = new ObserverResponsePacer();
+    const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField, pacer);
 
     this.resetCarriedMemorySessionId(session);
 
@@ -324,6 +418,12 @@ export class ClaudeProvider {
         });
       }
       const authMethod = getAuthMethodDescription();
+      // The account this generator bills for its whole life: its env (and so
+      // its OAuth identity) is fixed at spawn, even if the setting changes
+      // while it runs. Quota snapshots are tagged with it and checked against
+      // it, and a refusal it hits arms the breaker under it.
+      const observerProfile = resolveConfigDirProfileKey();
+      session.observerProfile = observerProfile;
 
       logger.info('SDK', 'Starting SDK query', {
         sessionDbId: session.sessionDbId,
@@ -346,23 +446,27 @@ export class ClaudeProvider {
         }
       }
 
-      ensureDir(OBSERVER_SESSIONS_DIR);
-      const hardenedOptions = buildHardenedSdkOptions({
-        source: 'Observer',
-        sessionDbId: session.sessionDbId,
-        contentSessionId: session.contentSessionId,
-        project: session.project,
-        model: modelId,
-        env: isolatedEnv,  // Use isolated credentials from ~/.claude-mem/.env, not process.env
-        pathToClaudeCodeExecutable: claudePath,
-        abortController: session.abortController,
-        ...(shouldResume && session.memorySessionId ? { resume: session.memorySessionId } : {}),
-        spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId, slotReservation, observerExtraArgs),
-      });
-      const queryResult = query({
-        prompt: messageGenerator,
-        options: manualReplay ? { ...hardenedOptions, maxTurns: 1 } : hardenedOptions,
-      });
+      let observerOptions: ReturnType<typeof buildHardenedSdkOptions>;
+      try {
+        observerOptions = buildHardenedSdkOptions({
+          source: 'Observer',
+          sessionDbId: session.sessionDbId,
+          contentSessionId: session.contentSessionId,
+          project: session.project,
+          model: modelId,
+          env: isolatedEnv,  // Use isolated credentials from ~/.claude-mem/.env, not process.env
+          pathToClaudeCodeExecutable: claudePath,
+          abortController: session.abortController,
+          ...(shouldResume && session.memorySessionId ? { resume: session.memorySessionId } : {}),
+          spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId, slotReservation, observerExtraArgs),
+        });
+      } catch (error) {
+        // Building the options creates the working directory. An unusable data
+        // dir classifies as setup_required, so the generator-start catch records
+        // it for the SessionStart notice instead of retrying every ingest.
+        throw classifyClaudeError(error);
+      }
+      const queryResult = query({ prompt: messageGenerator, options: manualReplay ? { ...observerOptions, maxTurns: 1 } : observerOptions });
 
       // Baseline for the next dispatched response's discovery-token delta.
       // Textless frames are not dispatched (see below), so their usage rolls
@@ -372,7 +476,49 @@ export class ClaudeProvider {
       // without one still needs the idle hand-off, otherwise the claimed batch
       // is left dangling for session teardown to discard.
       let turnDispatchedText = false;
+      // Shape of the turn's last textless frame (block kinds only, never
+      // content), so an idle hand-off can say WHY the turn was empty (#3454).
+      let turnEmptyOutputReason: string | undefined;
+      // One re-queue per generator pass for a batch a failed turn never read.
+      let retriedAfterErrorResult = false;
+      // #3664: whether any assistant frame of the current turn reported input,
+      // and the rows the turn stored. A gateway that synthesizes streaming
+      // reports zero input on every frame, so the session counters and the
+      // stored discovery_tokens miss the input; the turn's result message
+      // carries the real usage, applied at the turn boundary below.
+      let turnReportedInput = false;
+      let turnInsertedObservationIds: number[] = [];
+      let turnSummaryId: number | null = null;
+      // The MEMORY_ID_CAPTURED/CHANGED line is a spawn-health signal for log
+      // monitors, but the id arrives on the SDK's first system frame — before
+      // any output is classified — so a spawn that only ever returns auth or
+      // quota prose logged "captured" and looked healthy (#4150). Hold the line
+      // here and emit it once the parser has accepted real output. Signed-out,
+      // quota and transport prose return normally from the parser but pause
+      // the generator (session.abortReason), so they keep it held.
+      let pendingMemoryIdLog: { message: string; memorySessionId: string; previousId: string | null } | null = null;
+      const flushPendingMemoryIdLog = (): void => {
+        if (!pendingMemoryIdLog || session.abortReason) return;
+        const { message, memorySessionId, previousId } = pendingMemoryIdLog;
+        pendingMemoryIdLog = null;
+        logger.info('SESSION', message, {
+          sessionId: session.sessionDbId,
+          memorySessionId,
+          previousId,
+        });
+      };
+
       for await (const message of queryResult) {
+        // A stall already handed the claimed batch back to pending; a frame
+        // processed now would be stored twice once the batch is re-sent (#4066).
+        if (pacer.hasStalled) break;
+        // Any SDK message means the turn is alive, so the feed's stall window
+        // restarts; an announced API retry also buys its backoff delay (#4066).
+        pacer.activity(
+          message.type === 'system' && message.subtype === 'api_retry' && typeof message.retry_delay_ms === 'number'
+            ? message.retry_delay_ms
+            : 0,
+        );
         // Quota-aware wall-clock guard (#2234): the SDK pushes
         // `rate_limit_event` messages carrying live subscription quota state
         // (see extractRateLimitInfo for the shape). Capture the snapshot, then
@@ -385,7 +531,7 @@ export class ClaudeProvider {
           // so a `rejected` snapshot here means the user's own Claude Code
           // session is out of usage too. set() dedupes: one event per
           // exhausted window, not one per observer request against the wall.
-          if (globalRateLimitStore.set(info)) {
+          if (globalRateLimitStore.set({ ...info, profile: observerProfile })) {
             logger.warn('SDK', 'Subscription usage limit hit', {
               sessionDbId: session.sessionDbId,
               window: info.rateLimitType,
@@ -399,7 +545,7 @@ export class ClaudeProvider {
               observed_billing: session.observedBilling,
             });
           }
-          const decision = shouldAbortForQuota(authMethod, globalRateLimitStore);
+          const decision = shouldAbortForQuota(authMethod, globalRateLimitStore, Date.now(), observerProfile);
           if (decision.abort) {
             logger.warn('SDK', `Aborting session for quota guard: ${decision.reason}`, {
               sessionDbId: session.sessionDbId,
@@ -427,11 +573,14 @@ export class ClaudeProvider {
           const logMessage = previousId
             ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
             : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
-          logger.info('SESSION', logMessage, {
-            sessionId: session.sessionDbId,
+          // Defer the info line until output is classified (see
+          // flushPendingMemoryIdLog); the id state is registered now so resume
+          // still works even if the spawn produces no valid output.
+          pendingMemoryIdLog = {
+            message: logMessage,
             memorySessionId: message.session_id,
-            previousId
-          });
+            previousId,
+          };
           if (!dbVerified) {
             // Expected on later turns: ensure keeps the first registered id.
             logger.debug('SESSION', `Keeping the registered memory_session_id | sessionDbId=${session.sessionDbId} | registered=${registeredId} | offered=${message.session_id}`, {
@@ -456,6 +605,7 @@ export class ClaudeProvider {
           const hasTextBlock = Array.isArray(content)
             ? content.some((c: any) => c?.type === 'text')
             : typeof content === 'string';
+          const emptyOutputReason = formatEmptyOutputReason(describeObserverOutputShape(content));
           const textContent = Array.isArray(content)
             ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
             : typeof content === 'string' ? content : '';
@@ -464,19 +614,13 @@ export class ClaudeProvider {
 
           const usage = message.message.usage;
           if (usage) {
-            session.cumulativeInputTokens += usage.input_tokens || 0;
-            session.cumulativeOutputTokens += usage.output_tokens || 0;
-
-            if (usage.cache_creation_input_tokens) {
-              session.cumulativeInputTokens += usage.cache_creation_input_tokens;
-            }
+            accumulateClaudeUsage(session, usage);
+            if (computeFullContextTokens(usage) > 0) turnReportedInput = true;
 
             // Real per-response usage for telemetry (tokens_input includes the
             // full context the model read: fresh + cache writes + cache reads).
             session.lastUsage = {
-              input: (usage.input_tokens || 0) +
-                (usage.cache_creation_input_tokens || 0) +
-                (usage.cache_read_input_tokens || 0),
+              input: computeFullContextTokens(usage),
               output: usage.output_tokens || 0,
             };
 
@@ -492,6 +636,7 @@ export class ClaudeProvider {
           }
 
           if (!hasTextBlock) {
+            turnEmptyOutputReason = emptyOutputReason;
             logger.debug('SDK', 'Assistant frame carried no text block, leaving queued batch intact', {
               sessionId: session.sessionDbId,
               promptNumber: session.lastPromptNumber,
@@ -520,22 +665,33 @@ export class ClaudeProvider {
             throw new Error('Invalid API key: check your API key configuration in ~/.claude-mem/settings.json or ~/.claude-mem/.env');
           }
 
-          await processAgentResponse(
-            textContent,
-            session,
-            this.dbManager,
-            this.sessionManager,
-            worker,
-            discoveryTokens,
-            originalTimestamp,
-            'SDK',
-            cwdTracker.lastCwd,
-            modelId,
-            activeResponseContext.current
-          );
+          pacer.processingStarted();
+          try {
+            const stored = await processAgentResponse(
+              textContent,
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              discoveryTokens,
+              originalTimestamp,
+              'SDK',
+              cwdTracker.lastCwd,
+              modelId,
+              activeResponseContext.current,
+              emptyOutputReason
+            );
+            if (stored) {
+              turnInsertedObservationIds.push(...(stored.insertedObservationIds ?? []));
+              turnSummaryId = stored.summaryId ?? turnSummaryId;
+            }
+          } finally {
+            pacer.processingFinished();
+          }
 
           discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
           turnDispatchedText = true;
+          flushPendingMemoryIdLog();
         }
 
         if (message.type === 'result') {
@@ -551,6 +707,43 @@ export class ClaudeProvider {
             cache_read_input_tokens?: number;
             output_tokens?: number;
           } | undefined;
+          // What this turn actually read feeds the generation budget (#2957):
+          // the proxy history misses the SDK's system prompt and tool schemas.
+          // An init turn's reading is not kept, so a budget smaller than the
+          // init prompt cannot recycle every fresh generation on it. With the
+          // feed paced to one unanswered prompt, lastGeneratorSource names the
+          // prompt this result answers.
+          if (resultUsage && session.lastGeneratorSource !== 'init') {
+            session.lastContextTokens = computeFullContextTokens(resultUsage);
+          }
+          // No frame of this turn reported input, yet the turn read some: an
+          // SSE-synthesizing gateway (#3664). Count the input the frames left
+          // out, moving the baseline with it so the next response's discovery
+          // delta stays its own, and give the rows this turn inserted the
+          // turn's real cost (fresh input + cache writes + output, the basis
+          // the frames normally give).
+          if (resultUsage && !turnReportedInput) {
+            const missedInput = (resultUsage.input_tokens || 0) + (resultUsage.cache_creation_input_tokens || 0);
+            if (missedInput > 0) {
+              session.cumulativeInputTokens += missedInput;
+              discoveryTokenBaseline += missedInput;
+              if (resultUsage.cache_read_input_tokens) {
+                session.cumulativeCacheReadTokens =
+                  (session.cumulativeCacheReadTokens ?? 0) + resultUsage.cache_read_input_tokens;
+              }
+              if (turnInsertedObservationIds.length > 0 || turnSummaryId !== null) {
+                this.dbManager.getSessionStore().updateDiscoveryTokens(
+                  turnInsertedObservationIds,
+                  turnSummaryId,
+                  missedInput + (resultUsage.output_tokens || 0),
+                );
+              }
+            }
+          }
+          turnReportedInput = false;
+          turnInsertedObservationIds = [];
+          turnSummaryId = null;
+
           const totalCostUsd = (message as any).total_cost_usd as number | undefined;
           let turnCostUsd: number | undefined;
           if (typeof totalCostUsd === 'number') {
@@ -564,11 +757,7 @@ export class ClaudeProvider {
           const pending = session.pendingCompressionEvent;
           if (pending) {
             session.pendingCompressionEvent = null;
-            const finalInput = resultUsage
-              ? (resultUsage.input_tokens || 0) +
-                (resultUsage.cache_creation_input_tokens || 0) +
-                (resultUsage.cache_read_input_tokens || 0)
-              : undefined;
+            const finalInput = resultUsage ? computeFullContextTokens(resultUsage) : undefined;
             const finalOutput = resultUsage ? resultUsage.output_tokens || 0 : undefined;
             telemetryBuffer.record('session_compressed', session.sessionDbId, {
               ...pending,
@@ -610,30 +799,52 @@ export class ClaudeProvider {
               }
               break;
             } else {
-              await processAgentResponse(
-                '',
-                session,
-                this.dbManager,
-                this.sessionManager,
-                worker,
-                (session.cumulativeInputTokens + session.cumulativeOutputTokens) - discoveryTokenBaseline,
-                session.earliestPendingTimestamp,
-                'SDK',
-                cwdTracker.lastCwd,
-                modelId,
-                activeResponseContext.current
-              );
+              pacer.processingStarted();
+              try {
+                await processAgentResponse(
+                  '',
+                  session,
+                  this.dbManager,
+                  this.sessionManager,
+                  worker,
+                  (session.cumulativeInputTokens + session.cumulativeOutputTokens) - discoveryTokenBaseline,
+                  session.earliestPendingTimestamp,
+                  'SDK',
+                  cwdTracker.lastCwd,
+                  modelId,
+                  activeResponseContext.current,
+                  turnEmptyOutputReason ?? 'no-content-blocks'
+                );
+              } finally {
+                pacer.processingFinished();
+              }
               discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+              flushPendingMemoryIdLog();
             }
           }
           turnDispatchedText = false;
-          // Only a final result releases input prefetch. Assistant frames can
-          // arrive in pieces and must never acknowledge a later prompt.
-          turnGate.complete();
+          turnEmptyOutputReason = undefined;
+          // The result frame is the one turn boundary every outcome passes
+          // through — XML, empty/prose, and the failed-turn re-queue above,
+          // which never reaches processAgentResponse. Opening the feed per text
+          // frame instead would let a multi-frame turn release it early (#4066).
+          pacer.answer();
         }
       }
+    } catch (error) {
+      // A missing binary (ENOENT) or a Windows .cmd/.bat shim that cannot be
+      // launched without a shell (EINVAL) surfaces here as a raw spawn error.
+      // Left unclassified it is a generic failure, retried on every later
+      // observation; classified, the setup problem is reported once, like the
+      // findClaudeExecutable guard at the top of startSession. The resolved path
+      // goes with it, so the recheck gate does not re-run the same file. Any
+      // other error keeps its own shape.
+      if (isSpawnFailure(error)) this.recordAndThrowClassified(error, claudePath);
+      throw error;
     } finally {
-      turnGate.dispose();
+      // Whatever ended the stream (throw, quota break, abort), nothing will
+      // answer the feed's last prompt any more.
+      pacer.close();
       // Safety net for paths where the SDK never invoked the spawn factory;
       // a leaked reservation would occupy an agent slot until worker restart.
       slotReservation.release();
@@ -653,7 +864,8 @@ export class ClaudeProvider {
     const sessionDuration = Date.now() - session.startTime;
     logger.success('SDK', 'Agent completed', {
       sessionId: session.sessionDbId,
-      duration: `${(sessionDuration / 1000).toFixed(1)}s`
+      duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+      ...observerUsageLogFields(session)
     });
   }
 
@@ -718,8 +930,9 @@ export class ClaudeProvider {
     modelId: string,
     claudePath: string,
     signal: AbortSignal,
-  ): Promise<string | null> {
-    return this.runStandaloneObserverPrompt(
+  ): Promise<CompressedField | null> {
+    // The CLI reports no finish reason, so a reply it returns counts as whole.
+    const condensed = await this.runStandaloneObserverPrompt(
       buildFieldCompressionPrompt(text, budgetChars),
       {
         sessionDbId: session.sessionDbId,
@@ -730,6 +943,7 @@ export class ClaudeProvider {
       modelId,
       claudePath,
     );
+    return condensed ? { text: condensed, truncated: false } : null;
   }
 
   /** Format a stored summary through the same hardened Claude SDK path as summaries. */
@@ -759,12 +973,18 @@ export class ClaudeProvider {
     activeResponseContext: { current: ReturnType<typeof snapshotResponseContext> },
     worker?: WorkerRef,
     compressField?: FieldCompressor,
-    turnGate?: ObserverTurnGate,
+    pacer: ObserverResponsePacer = new ObserverResponsePacer(),
   ): AsyncIterableIterator<SDKUserMessage> {
     const mode = ModeManager.getInstance().getActiveMode();
     const manualReplayAtStart = this.sessionManager.getManualReplayCandidate?.(session.sessionDbId) ?? null;
 
-    const isInitPrompt = session.lastPromptNumber === 1;
+    // Prompt 0 means no user_prompts row was ever written for this session
+    // (a transcript-ingested turn with no anchor). Treat it, like the genuine
+    // first prompt, as an init: a self-contained prompt the observer can act
+    // on — never a continuation that expects a resumed conversation it never
+    // had, which the model rejects as prose and the batch is then dropped
+    // (#3653).
+    const isInitPrompt = session.lastPromptNumber <= 1;
     logger.info('SDK', 'Creating message generator', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
@@ -773,33 +993,45 @@ export class ClaudeProvider {
       promptType: isInitPrompt ? 'INIT' : 'CONTINUATION'
     });
 
-    // A permit-backed replay is a one-message recovery process: no init prompt,
-    // session context, compression request, or rebuilt body may precede it.
+    let answeredBeforeSend = pacer.mark();
     if (!manualReplayAtStart) {
-      const priorContext = await loadSessionStartContext(session, cwdTracker.lastCwd);
-      const initPrompt = isInitPrompt
-        ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
-        : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
-      activeResponseContext.current = snapshotResponseContext(session);
+    // Release claims a previous generation left unconfirmed (a quota-guard
+    // abort does not reset them) BEFORE the init prompt goes out. The iterator
+    // resets them too, but only once the init reply has been awaited — and that
+    // reply would otherwise confirm the stale claim unanswered (#4066).
+    await this.sessionManager.resetProcessingToPending(session.sessionDbId);
 
-      session.conversationHistory.push({ role: 'user', content: initPrompt });
+    // Brief the generation with the same session-start context a new Claude Code
+    // session gets, so a conversation that starts partway through continues from
+    // the memory rather than from nothing (#3800).
+    const priorContext = await loadSessionStartContext(session, cwdTracker.lastCwd);
+    const initPrompt = isInitPrompt
+      ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
+      : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
+    activeResponseContext.current = snapshotResponseContext(session);
 
-      session.lastPromptSentAt = Date.now();
-      session.lastGeneratorSource = 'init';
-      turnGate?.begin();
-      yield {
-        type: 'user',
-        message: {
-          role: 'user',
-          content: initPrompt
-        },
-        session_id: session.contentSessionId,
-        parent_tool_use_id: null,
-        isSynthetic: true
-      };
-      if (turnGate && !await turnGate.wait()) return;
+    // This SDK process never resumes, so the proxy history starts over with it.
+    openObserverGeneration(session, initPrompt);
+
+    session.lastPromptSentAt = Date.now();
+    session.lastGeneratorSource = 'init';
+    answeredBeforeSend = pacer.mark();
+    yield {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: initPrompt
+      },
+      session_id: session.contentSessionId,
+      parent_tool_use_id: null,
+      isSynthetic: true
+    };
+    if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
     }
 
+    // Each pass waits for the previous prompt's answer at the bottom of the loop,
+    // BEFORE the iterator is pulled again, so nothing is claimed while a prompt
+    // is still unanswered (#4066).
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
       session.pendingAgentId = message.agentId ?? null;
       session.pendingAgentType = message.agentType ?? null;
@@ -868,13 +1100,13 @@ export class ClaudeProvider {
         // conversation server-side, but conversationHistory tracks every prompt
         // fed into it, so its size is the proxy for how close that conversation
         // is to the ceiling (#3800).
-        if (shouldRecycleConversation(session.conversationHistory, this.conversationMaxChars())) {
+        if (shouldRecycleConversation(session.conversationHistory, this.conversationMaxChars(session), session.lastContextTokens)) {
           await recycleObserverConversation(
             session,
             this.sessionManager,
             worker,
             'budget',
-            `conversation reached ${conversationChars(session.conversationHistory)} chars`,
+            describeGenerationUsage(session.conversationHistory, session.lastContextTokens),
           );
           return;
         }
@@ -882,11 +1114,16 @@ export class ClaudeProvider {
         // An oversized payload is condensed by a bounded model pass before the
         // prompt is built, so the observation carries a summary of the whole
         // field rather than a head/tail slice with the middle cut out (#3800).
+        // The field cap scales with the model's window (#3625).
+        const fieldMaxChars = observationFieldMaxChars(session.observerContextWindowTokens);
         const optimized = compressField
           ? await optimizeObservationFields(
               { toolInput: message.tool_input, toolOutput: message.tool_response },
               compressField,
               { sessionDbId: session.sessionDbId, toolName: message.tool_name },
+              fieldMaxChars,
+              resolveFieldOptimizeTimeoutMs,
+              session.observerContextWindowTokens,
             )
           : { toolInput: message.tool_input, toolOutput: message.tool_response };
 
@@ -905,7 +1142,7 @@ export class ClaudeProvider {
           // 顺带，<occurred_at> 的语义本来就该是「它发生的时刻」。
           created_at_epoch: message._originalTimestamp,
           cwd: message.cwd
-        });
+        }, fieldMaxChars, takeObserverSchemaReminder(session));
         if (message.recoveryTaskId) {
           try {
             this.dbManager.getObserverTaskStore().recordPreparedPrompt(
@@ -923,7 +1160,7 @@ export class ClaudeProvider {
 
         session.lastPromptSentAt = Date.now();
         session.lastGeneratorSource = 'ingest';
-        turnGate?.begin();
+        answeredBeforeSend = pacer.mark();
         yield {
           type: 'user',
           message: {
@@ -934,6 +1171,7 @@ export class ClaudeProvider {
           parent_tool_use_id: null,
           isSynthetic: true
         };
+        if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
       } else if (message.type === 'summarize') {
         const summaryPrompt = buildSummaryPrompt({
           id: session.sessionDbId,
@@ -948,7 +1186,7 @@ export class ClaudeProvider {
 
         session.lastPromptSentAt = Date.now();
         session.lastGeneratorSource = 'summarize';
-        turnGate?.begin();
+        answeredBeforeSend = pacer.mark();
         yield {
           type: 'user',
           message: {
@@ -959,11 +1197,50 @@ export class ClaudeProvider {
           parent_tool_use_id: null,
           isSynthetic: true
         };
+        if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
       }
       // Wait BEFORE the iterator claims another buffered message. This also
       // keeps the init response from confirming inputs it has not read yet.
-      if (turnGate && !await turnGate.wait()) return;
     }
+  }
+
+  /**
+   * Hold the feed until the prompt just yielded has been answered (#4066).
+   * Returns false when the generator should end instead of pulling more work.
+   *
+   * The wait sits outside the drain, so a slow reply never counts as drain
+   * idleness. Nothing else watches a live-but-silent SDK child, though: the
+   * drain's idle timeout used to catch it once the unpaced feed had claimed
+   * everything. The same window is applied here, but a stall preserves the
+   * claimed batch ('transport' exit) instead of finalizing the session and
+   * dropping the backlog the way an idle exit does.
+   */
+  private async awaitObserverAnswer(
+    session: ActiveSession,
+    pacer: ObserverResponsePacer,
+    answeredBeforeSend: number,
+  ): Promise<boolean> {
+    const stallMs = this.responseStallMs();
+    const outcome = await pacer.waitForAnswer(answeredBeforeSend, session.abortController.signal, stallMs);
+    if (outcome === 'answered') return !session.abortController.signal.aborted;
+    if (outcome === 'stalled') {
+      logger.warn('SDK', 'Observer prompt went unanswered; preserving the claimed batch and stopping this generation', {
+        sessionId: session.sessionDbId,
+        waitedMs: stallMs,
+        claimed: session.claimedMessageIds.length,
+      });
+      // Abort before releasing the claims: the pacer has already fenced the SDK
+      // loop, and killing the stream first means no late frame can be processed
+      // between the release and the abort.
+      session.abortReason = 'transport:response_stall';
+      try {
+        session.abortController.abort();
+      } catch {
+        // best-effort
+      }
+      await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+    }
+    return false;
   }
 
   private getModelId(): string {

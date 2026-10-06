@@ -15,7 +15,11 @@ export function spawnHidden(
   args?: readonly string[],
   options?: SpawnOptions
 ): ChildProcess {
-  return spawn(command, args ?? [], { windowsHide: true, ...options });
+  // windowsHide MUST win over caller options. Node's `detached: true` on
+  // Windows still allocates a console for the child (#3521); callers that
+  // need a background daemon on win32 must use Start-Process -WindowStyle
+  // Hidden (see ProcessManager.spawnDetachedWorkerDaemon), not detached.
+  return spawn(command, args ?? [], { ...options, windowsHide: true });
 }
 
 export const WINDOWS_CMD_EXTENSIONS = new Set(['.cmd', '.bat']);
@@ -33,6 +37,11 @@ export interface SpawnSyncInvocation {
 
 export function quoteWindowsCmdArgument(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
+}
+
+/** True when `command` is a natively-spawnable Windows binary (.exe/.com), not a .cmd/.bat shim. */
+export function isWindowsNativeExecutable(command: string): boolean {
+  return WINDOWS_NATIVE_EXTENSIONS.has(extname(command).toLowerCase());
 }
 
 /** Every PATH hit for `command`, in `where` order (PATH order). */
@@ -70,15 +79,14 @@ export function selectWindowsCommandCandidate(
   candidates: string[],
   resolveShim?: (shimPath: string) => string | null,
 ): string | null {
-  const native = candidates.find(candidate =>
-    WINDOWS_NATIVE_EXTENSIONS.has(extname(candidate).toLowerCase()));
+  const native = candidates.find(isWindowsNativeExecutable);
   if (native) return native;
 
   const shim = candidates.find(candidate =>
     WINDOWS_CMD_EXTENSIONS.has(extname(candidate).toLowerCase()));
   if (shim && resolveShim) {
     const resolved = resolveShim(shim);
-    if (resolved && WINDOWS_NATIVE_EXTENSIONS.has(extname(resolved).toLowerCase())) {
+    if (resolved && isWindowsNativeExecutable(resolved)) {
       return resolved;
     }
   }
@@ -123,8 +131,9 @@ export function buildSpawnSyncInvocation(
   platform: NodeJS.Platform = process.platform,
 ): SpawnSyncInvocation {
   const invocationOptions: SpawnSyncOptionsWithStringEncoding = {
-    ...(platform === 'win32' ? { windowsHide: true } : {}),
     ...options,
+    // Force hide on Windows last so callers cannot override it off (#3521).
+    ...(platform === 'win32' ? { windowsHide: true } : {}),
   };
 
   if (platform === 'win32' && WINDOWS_CMD_EXTENSIONS.has(extname(command).toLowerCase())) {

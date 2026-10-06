@@ -51,13 +51,15 @@
 // FAILURE CONTRACT (same swallow-and-log posture as CloudSync.notify()):
 // nothing here ever throws into a caller, blocks a write, or crashes the
 // worker. Failures back off (30 s doubling to 10 min, dominating the poll
-// tier) and repeated failure of the SAME page logs distinctly (wedge
-// visibility) — no dead-letter machinery this phase. NO long-polling (prime
+// tier; unforced pullOnce() calls honor it too) and repeated failure of the
+// SAME page logs distinctly (wedge visibility). A single op that can never
+// apply is not a page failure: SyncApply sets it aside in
+// sync_pull_quarantine and the cursor moves on. NO long-polling (prime
 // directive #4): every request is a plain short GET with an AbortSignal
 // timeout.
 
 import { logger } from '../../utils/logger.js';
-import type { SyncApply, SyncOp } from './SyncApply.js';
+import type { SyncApply, SyncOp, UndecodableOp } from './SyncApply.js';
 import {
   assertCanonicalDecimal,
   canonicalDecimalToSafeInteger,
@@ -88,9 +90,22 @@ function localPayload(payload: Record<string, unknown> | null): Record<string, u
   return result;
 }
 
-function decodeChanges(values: unknown[]): SyncOp[] {
-  return values.map(value => {
-    const decoded = decodeHubChange(value as CanonicalHubChange);
+function decodeChanges(values: unknown[]): Array<SyncOp | UndecodableOp> {
+  return values.map((value): SyncOp | UndecodableOp => {
+    let decoded: ReturnType<typeof decodeHubChange>;
+    try {
+      decoded = decodeHubChange(value as CanonicalHubChange);
+    } catch (error) {
+      // One change we cannot decode must not fail the whole page forever:
+      // keep its seq (the page stays contiguous) and let SyncApply set it
+      // aside. A change without a valid seq is a broken page — that throws.
+      const seq = assertCanonicalDecimal((value as { seq?: unknown } | null)?.seq, { positive: true });
+      return {
+        seq,
+        undecodable: error instanceof Error ? error.message : String(error),
+        raw: JSON.stringify(value),
+      };
+    }
     const body = decoded.body;
     return {
       seq: decoded.seq,
@@ -158,6 +173,12 @@ export interface SyncClientOptions {
   backoffInitialMs?: number;
   backoffMaxMs?: number;
   /**
+   * Pause after a 401/403 (bad token or lapsed subscription): the same
+   * credentials cannot succeed, so pulls re-check at this interval and the
+   * advisory socket stays down meanwhile. Default 1h.
+   */
+  authPauseMs?: number;
+  /**
    * pullOnce() skips when a pull finished this recently — protects the
    * hot context-inject path from hammering the hub on hook bursts while
    * keeping session-start data at worst this stale.
@@ -215,6 +236,9 @@ export class SyncClient {
   private readonly requestTimeoutMs: number;
   private readonly backoffInitialMs: number;
   private readonly backoffMaxMs: number;
+  private readonly authPauseMs: number;
+  /** Epoch ms until which the socket lane stays down after a 401/403 pull. */
+  private authPausedUntil = 0;
   private readonly minPullGapMs: number;
   private readonly isSessionActive: (() => boolean) | null;
   private readonly now: () => number;
@@ -236,6 +260,8 @@ export class SyncClient {
   private lastPullFinishedAt = 0;
   /** 0 = healthy; doubles per consecutive failed cycle. */
   private backoffMs = 0;
+  /** Hints and socket recovery must wait for the failed HTTP pull's retry. */
+  private transientRetryAt = 0;
   private failStreak = 0;
   private failCursor: string | null = null;
 
@@ -275,6 +301,7 @@ export class SyncClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.backoffInitialMs = options.backoffInitialMs ?? 30_000;
     this.backoffMaxMs = options.backoffMaxMs ?? 600_000;
+    this.authPauseMs = options.authPauseMs ?? 3_600_000;
     this.minPullGapMs = options.minPullGapMs ?? 2_000;
     this.isSessionActive = options.isSessionActive ?? null;
     this.now = options.now ?? Date.now;
@@ -368,10 +395,13 @@ export class SyncClient {
   onHeadSeq(headSeq: string): void {
     try {
       if (this.stopped || !this.started) return;
+      // head_seq only arrives from a SUCCESSFUL push: the server accepts
+      // these credentials again, so lift a pull-side auth pause now.
+      this.clearAuthPause();
       const head = assertCanonicalDecimal(headSeq);
       if (compareCanonicalDecimals(head, this.apply.getCursor()) <= 0) return;
       this.resumeIfSuspended(); // socket back up alongside the loop
-      this.schedule(0); // also resumes a suspended loop
+      this.schedule(Math.max(0, this.transientRetryAt - this.now()));
     } catch (error) {
       try {
         logger.debug('SYNC_CLIENT', 'onHeadSeq failed (non-blocking)', {},
@@ -386,11 +416,12 @@ export class SyncClient {
    * timeoutMs. Never throws; failure = the caller proceeds with local data.
    * Counts as session activity and resumes a suspended loop.
    *
-   * `force` (socket paths only — self-heal, reconnect catch-up, advance
-   * frames) bypasses the min-gap skip: those pulls are the correctness net
-   * for a lane that just failed or reconnected, and with the socket live the
-   * poll tier is stretched, so "wait for the next poll" could mean minutes.
-   * Single-flight still holds either way.
+   * Unforced calls (the context-inject hook) skip while the failure backoff
+   * is running: the background loop owns that retry. Without this, every
+   * hook re-fetched the same failing page — 2,000+ times in one wedge — and
+   * loaded a hub that was already failing. `force` bypasses the backoff and
+   * the min-gap skip; socket callers check the backoff themselves first.
+   * Single-flight holds.
    */
   async pullOnce(options: { timeoutMs?: number; force?: boolean } = {}): Promise<void> {
     try {
@@ -400,7 +431,10 @@ export class SyncClient {
       const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
       const skip =
         this.pulling || // a cycle is already fetching — don't stack a second
-        (!options.force && this.now() - this.lastPullFinishedAt < this.minPullGapMs);
+        (!options.force && (
+          this.transientRetryAt > this.now()
+          || this.now() - this.lastPullFinishedAt < this.minPullGapMs
+        ));
       if (!skip) {
         await this.pullCycle(this.now() + timeoutMs);
       }
@@ -434,8 +468,24 @@ export class SyncClient {
     this.timer = timer;
   }
 
+  /** Lift the 401/403 pause (credentials proven good) and restore the normal ladder. */
+  private clearAuthPause(): void {
+    if (this.authPausedUntil === 0) return;
+    this.authPausedUntil = 0;
+    this.backoffMs = 0;
+    this.transientRetryAt = 0;
+    logger.info('SYNC_CLIENT', 'Sync credentials accepted again; resuming pulls and the advisory socket');
+    if (this.started && !this.stopped) this.connectSocket();
+  }
+
   private async tick(): Promise<void> {
     if (this.stopped) return;
+    const pausedFor = Math.max(this.authPausedUntil, this.transientRetryAt) - this.now();
+    if (pausedFor > 0) {
+      // Early hints wait out the existing deadline without extending it.
+      this.schedule(pausedFor);
+      return;
+    }
     // Background cycles have no overall deadline — each page request is
     // individually timeout-bounded and the cycle is page-capped.
     await this.pullCycle(Number.MAX_SAFE_INTEGER);
@@ -510,6 +560,9 @@ export class SyncClient {
    */
   private async pullCycle(deadlineMs: number): Promise<void> {
     if (this.pulling) return;
+    // Auth pause (401/403): every lane waits it out, including forced and
+    // session-start pulls — the same credentials cannot succeed sooner.
+    if (this.authPausedUntil > this.now()) return;
     this.pulling = true;
     try {
       let pages = 0;
@@ -576,6 +629,8 @@ export class SyncClient {
         this.failStreak = 0;
         this.failCursor = null;
         this.backoffMs = 0;
+        this.transientRetryAt = 0;
+        this.clearAuthPause();
 
         if (page.more !== true || decodedOps.length === 0) return;
         if (pages >= this.maxPagesPerCycle) return;
@@ -605,6 +660,8 @@ export class SyncClient {
     // pollModeOnly gate: while the hub says poll, the socket lane stays
     // down — that is the kill switch doing its job (un-pinning hub DOs).
     if (!this.wsEnabled || this.stopped || this.socket || !this.webSocketImpl || this.pollModeOnly) return;
+    // Auth pause: a socket with rejected credentials would only reconnect-loop.
+    if (this.authPausedUntil > this.now()) return;
     try {
       const ws = new this.webSocketImpl(this.wsUrl, {
         // Bun extension: headers on the constructor (plan Phase 0.3) — the
@@ -650,7 +707,7 @@ export class SyncClient {
     this.pingTimer = pingTimer;
     // Catch up over HTTP once: frames sent while we were disconnected are
     // gone (advisory lane), so close the gap the moment the fast path is up.
-    void this.pullOnce({ force: true });
+    this.pullForSocket();
   }
 
   private handleSocketClose(ws: SyncSocketLike): void {
@@ -700,7 +757,7 @@ export class SyncClient {
         if (compareCanonicalDecimals(head, this.apply.getCursor()) <= 0) {
           return; // already caught up (an HTTP pull raced the frame)
         }
-        void this.pullOnce({ force: true });
+        this.pullForSocket();
         return;
       }
       throw new Error(`unknown socket frame type: ${String(frame.type)}`);
@@ -717,6 +774,13 @@ export class SyncClient {
     }
     if (ops.length === 0) return; // vacuous frame — nothing to do
     const decodedOps = decodeChanges(ops);
+    // The socket is advisory: a change it delivered that we cannot decode is
+    // an anomaly, not a set-aside. Self-heal over HTTP from the unchanged
+    // cursor; that lane sets the change aside only if the hub's own copy is
+    // undecodable too.
+    if (decodedOps.some(op => 'undecodable' in op)) {
+      throw new Error('op frame carries a change that cannot be decoded');
+    }
     const seqs = decodedOps.map(op => op.seq);
     for (let i = 1; i < seqs.length; i++) {
       if (seqs[i] !== incrementCanonicalDecimal(seqs[i - 1]!)) {
@@ -795,15 +859,27 @@ export class SyncClient {
       this.teardownSocket();
       this.setSocketLive(false);
       if (!this.stopped) {
-        void this.pullOnce({ force: true }); // the lane-2 self-heal — HTTP is the truth
+        this.pullForSocket(); // the lane-2 self-heal — HTTP is the truth
         this.scheduleReconnect();
       }
     } catch { /* advisory: never propagate */ }
   }
 
+  /** Socket recovery skips the min-gap, but honors a transient HTTP failure. */
+  private pullForSocket(): void {
+    if (this.stopped) return;
+    const remaining = this.transientRetryAt - this.now();
+    if (remaining > 0) {
+      this.schedule(remaining);
+      return;
+    }
+    void this.pullOnce({ force: true });
+  }
+
   /** Full-jitter backoff: delay = random(0, min(cap, base·2^attempt)). */
   private scheduleReconnect(): void {
     if (!this.wsEnabled || this.stopped || this.reconnectTimer || this.socket || this.pollModeOnly) return;
+    if (this.authPausedUntil > this.now()) return;
     const exp = Math.min(this.wsAttempts, 30); // clamp 2^n against overflow
     const ceiling = Math.min(this.wsBackoffMaxMs, this.wsBackoffBaseMs * 2 ** exp);
     const delay = this.random() * ceiling;
@@ -881,9 +957,32 @@ export class SyncClient {
       this.failCursor = cursor;
       this.failStreak = 1;
     }
+    if (/^sync hub pull 40[13]:/.test(err.message)) {
+      // 401/403: retrying on the normal ladder cannot succeed (#4231-class
+      // storm). Hold pulls and the socket for the auth pause; CloudSync owns
+      // the user-facing status for this cause.
+      const firstPause = this.authPausedUntil === 0;
+      this.backoffMs = Math.max(this.backoffMs, this.authPauseMs);
+      this.authPausedUntil = this.now() + this.authPauseMs;
+      if (this.socket) {
+        this.teardownSocket();
+        this.setSocketLive(false);
+      }
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (firstPause) {
+        logger.warn('SYNC_CLIENT', 'Pull rejected by the sync server (auth); pausing pulls', {
+          pauseMs: this.authPauseMs,
+        }, err);
+      }
+      return;
+    }
     this.backoffMs = this.backoffMs === 0
       ? this.backoffInitialMs
       : Math.min(this.backoffMs * 2, this.backoffMaxMs);
+    this.transientRetryAt = this.now() + this.backoffMs;
     if (this.failStreak >= 3) {
       logger.warn('SYNC_CLIENT', 'Pull wedged: the same page keeps failing; backing off and retrying', {
         cursor,
