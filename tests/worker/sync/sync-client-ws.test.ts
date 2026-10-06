@@ -314,6 +314,26 @@ describe('SyncClient advisory WebSocket', () => {
     expect(apply.getCursor()).toBe('1'); // healed over HTTP
   });
 
+  it('self-heals on a frame carrying an undecodable change instead of setting it aside', async () => {
+    const { state, impl } = makeHub({ epoch: '1' });
+    const { ctor, sockets } = makeWsFactory();
+    const client = makeClient(impl, ctor);
+    client.start();
+    await sleep(30);
+    sockets[0].open();
+    await sleep(30);
+
+    // The hub's own copy is valid; only the socket delivery is corrupted.
+    state.ops = [hubOp(1, '11')];
+    sockets[0].message(opFrame('1', [{ ...hubOp(1, '11'), body: 'not json{' }]));
+    await sleep(50);
+
+    expect(sockets[0].closeCalls).toBeGreaterThanOrEqual(1);
+    expect(apply.getCursor()).toBe('1'); // healed over HTTP from the unchanged cursor
+    expect(count('observations')).toBe(1);
+    expect(count('sync_pull_quarantine')).toBe(0);
+  });
+
   it('self-heals on an unknown frame type', async () => {
     const { impl } = makeHub({ epoch: '1' });
     const { ctor, sockets } = makeWsFactory();
@@ -416,6 +436,24 @@ describe('SyncClient advisory WebSocket', () => {
     sockets[0].message(advanceFrame('1', 5)); // nothing new
     await sleep(50);
     expect(state.requests.length).toBe(baseline);
+  });
+
+  it('socket catch-up and advance hints honor a failed HTTP pull retry deadline', async () => {
+    const { state, impl } = makeHub({ epoch: '1', ops: [hubOp(1, '11')] });
+    state.failStatus = 502;
+    const { ctor, sockets } = makeWsFactory();
+    makeClient(impl, ctor, { backoffInitialMs: 200, backoffMaxMs: 200 }).start();
+    await sleep(25);
+    expect(state.requests).toHaveLength(1);
+    state.failStatus = null;
+    sockets[0].open();
+    sockets[0].message(advanceFrame('1', 1));
+    await sleep(50);
+    expect(state.requests).toHaveLength(1);
+    expect(apply.getCursor()).toBe('0');
+    await sleep(200);
+    expect(state.requests).toHaveLength(2);
+    expect(apply.getCursor()).toBe('1');
   });
 
   it('reconnects with bounded full-jitter backoff and keeps HTTP polling alive', async () => {

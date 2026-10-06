@@ -6,6 +6,7 @@ import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../
 import { parseAgentXml } from '../../sdk/parser.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { extractObservationFileEvidence, sanitizeObservationFiles, normalizeSummaryForStorage, attachObservationFilesToSummary } from './agents/ResponseProcessor.js';
+import { getWorkerPort } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 
 export function gatewayQueueEnabled(): boolean { return !!process.env.CLAUDE_MEM_LLM_QUEUE_URL; }
@@ -31,7 +32,11 @@ export function initializeQueueTables(db: ReturnType<DatabaseManager['getConnect
   db.run(`CREATE TABLE IF NOT EXISTS observer_queue_batches (
     id TEXT PRIMARY KEY, session_db_id INTEGER NOT NULL, body TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending', result TEXT, receipt TEXT,
-    acknowledged INTEGER NOT NULL DEFAULT 0, error TEXT, created_at INTEGER NOT NULL)`);
+    acknowledged INTEGER NOT NULL DEFAULT 0, error TEXT, created_at INTEGER NOT NULL,
+    checked_at INTEGER NOT NULL DEFAULT 0)`);
+  if (!(db.prepare('PRAGMA table_info(observer_queue_batches)').all() as any[]).some(c=>c.name==='checked_at')) {
+    db.run('ALTER TABLE observer_queue_batches ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0');
+  }
   db.run(`CREATE TABLE IF NOT EXISTS observer_queue_members (
     task_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL)`);
 }
@@ -145,20 +150,30 @@ export class GatewayObserverQueue {
   async processBatch(batch: any): Promise<void> {
     const db = this.manager.getConnection();
     if (batch.receipt) {
-      await this.request('/v1/queue/ack', {business_key:'claude_mem.observation',
+      const ack = await this.request('/v1/queue/ack', {business_key:'claude_mem.observation',
         idempotency_key:batch.id,receipt:JSON.parse(batch.receipt)});
+      if (ack.job?.request_key !== batch.id || ack.job?.business_key !== 'claude_mem.observation' ||
+          ack.job.business_receipt?.state !== JSON.parse(batch.receipt).state ||
+          ack.job.business_receipt?.reference !== JSON.parse(batch.receipt).reference) {
+        throw new Error('observer_business_ack_identity_mismatch');
+      }
       db.prepare('UPDATE observer_queue_batches SET acknowledged=1 WHERE id=?').run(batch.id);
       return;
     }
     const rows = this.members(batch.id);
-    const value = await this.request('/v1/queue/submit', {
-      request:JSON.parse(batch.body),task_ids:rows.map(r=>r.id),scenario:'observer_batch',
-    },batch.id);
+    const value = batch.state === 'pending'
+      ? await this.request('/v1/queue/submit', {
+          request:JSON.parse(batch.body),task_ids:rows.map(r=>r.id),scenario:'observer_batch',
+        },batch.id)
+      : await this.request('/v1/queue/status', {business_key:'claude_mem.observation',idempotency_key:batch.id});
     const job = value.job;
     if (!job || job.request_key !== batch.id || job.business_key !== 'claude_mem.observation') {
       throw new Error('observer_queue_identity_mismatch');
     }
-    if (job.state === 'queued' || job.state === 'running') return;
+    if (job.state === 'queued' || job.state === 'running') {
+      db.prepare("UPDATE observer_queue_batches SET state='submitted' WHERE id=?").run(batch.id);
+      return;
+    }
     if (job.state !== 'succeeded') {
       if (!['failed','reconciliation'].includes(job.state)) throw new Error('invalid_observer_queue_state');
       db.transaction(() => {
@@ -187,7 +202,7 @@ export class GatewayObserverQueue {
     const store = this.manager.getSessionStore();
     // The database relation is stable; it is not a provider conversation ID.
     const memoryId = store.ensureMemorySessionIdRegistered(batch.session_db_id,
-      'queue-'+first.content_session_id, 0) || 'queue-'+first.content_session_id;
+      'queue-'+first.content_session_id, getWorkerPort()) || 'queue-'+first.content_session_id;
     const evidence = extractObservationFileEvidence(rows.map(row => ({
       ...JSON.parse(row.payload), type: row.kind === 'summary' ? 'summarize' : 'observation',
     })));
@@ -215,12 +230,13 @@ export class GatewayObserverQueue {
     // fill gateway slots; this does not impose a model-execution concurrency limit.
     for (let i=0;i<8;i++) if (!this.prepareBatch()) break;
     const batches = this.manager.getConnection().prepare(`SELECT * FROM observer_queue_batches
-      WHERE state='pending' OR (state='reconciliation' AND error!='invalid_model_output') OR (receipt IS NOT NULL AND acknowledged=0) ORDER BY created_at LIMIT 64`).all() as any[];
+      WHERE state IN ('pending','submitted') OR (state='reconciliation' AND error!='invalid_model_output') OR (receipt IS NOT NULL AND acknowledged=0) ORDER BY checked_at,created_at,id LIMIT 64`).all() as any[];
     // Short submit/status operations only. No long-lived SDK process or session.
     for (const batch of batches) {
       if (this.stopped) return;
       try { await this.processBatch(batch); }
       catch (error) { if (!this.stopped) logger.error('QUEUE','Observer batch remains durable',{batchId:batch.id},error as Error); }
+      finally { this.manager.getConnection().prepare('UPDATE observer_queue_batches SET checked_at=? WHERE id=?').run(Date.now(),batch.id); }
     }
   }
   private async run(): Promise<void> {

@@ -40,6 +40,15 @@ import {
 } from '../services/hooks/runtime-selector.js';
 import { normalizePlatformSource } from '../shared/platform-source.js';
 import { getAdvertisedMcpToolsForRuntime } from './mcp-tool-visibility.js';
+import { getProjectContext, type ProjectContext } from '../utils/project-name.js';
+import { withCheckoutProjects } from './checkout-search-scope.js';
+
+/** This server's checkout (Claude Code starts it in the workspace), resolved once. */
+let workspaceCheckout: ProjectContext | null = null;
+function currentCheckout(): ProjectContext {
+  workspaceCheckout ??= getProjectContext(process.cwd());
+  return workspaceCheckout;
+}
 
 let mcpServerDirResolutionFailed = false;
 const mcpServerDir = (() => {
@@ -323,20 +332,20 @@ const handleObservationSearch = wrapHandler('observation_search', async (args: O
 
 interface ObservationContextArgs {
   projectId?: string;
-  query: string;
+  // Optional: omit for "recent" (recency-ordered) context instead of a
+  // relevance-ranked search (plan-24 step 4, #2991).
+  query?: string;
   limit?: number;
   platformSource?: string | null;
 }
 
 const handleObservationContext = wrapHandler('observation_context', async (args: ObservationContextArgs) => {
   const ctx = requireServerForObservationTool('observation_context');
-  if (typeof args?.query !== 'string' || args.query.trim().length === 0) {
-    throw new Error('observation_context: "query" is required');
-  }
+  const hasQuery = typeof args?.query === 'string' && args.query.trim().length > 0;
   const projectId = args.projectId && args.projectId.trim().length > 0 ? args.projectId : ctx.projectId;
   const request: ServerContextObservationsRequest = {
     projectId,
-    query: args.query,
+    ...(hasQuery ? { query: args.query } : {}),
     ...(args.limit !== undefined ? { limit: args.limit } : {}),
     ...(args.platformSource !== undefined ? { platformSource: normalizeMcpPlatformSource(args.platformSource) } : {}),
   };
@@ -528,7 +537,7 @@ NEVER fetch full details without filtering first. 10x token savings.`,
         };
         return formatJsonResult(await sb.client.searchObservations(request));
       }
-      return await callWorker('/api/search', { query: args });
+      return await callWorker('/api/search', { query: withCheckoutProjects(args ?? {}, currentCheckout()) });
     }
   },
   {
@@ -589,6 +598,43 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     handler: async (args: any) => {
       return await callWorker('/api/tool-uses/batch', { body: args });
     }
+  },
+  {
+    name: 'work_state_write',
+    description: 'Your canonical to-do list and working state for this project, kept across sessions: whatever is still open is shown at the start of every session. Each call appends one entry to a list. To-do item: fields {"task": "<name>", "status": "todo" | "doing" | "done" | "dropped", ...details}. State on the list itself: any other fields (the latest value of each key wins; null clears a key; "status": "done" closes the list). Returns what is still open in the list. Params: list (required), fields (required).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list: { type: 'string', description: 'The to-do list or tracked thing this entry belongs to, e.g. "release" or "auth-refactor"' },
+        fields: {
+          type: 'object',
+          description: 'Keys to set. Include "task" to update a to-do item. Values are strings, numbers, booleans, or null to clear a key.',
+          additionalProperties: { type: ['string', 'number', 'boolean', 'null'] },
+        },
+      },
+      required: ['list', 'fields'],
+      additionalProperties: false,
+    },
+    handler: async (args: any) => callWorker('/api/work-state/entries', {
+      body: { cwd: process.cwd(), list: args?.list, fields: args?.fields },
+      text: true,
+    }),
+  },
+  {
+    name: 'work_state_read',
+    description: "Read this project's to-do lists and working state written with work_state_write: every open item, or one list, with done and dropped items when includeClosed is true. Params: list, includeClosed.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list: { type: 'string', description: 'Read only this list' },
+        includeClosed: { type: 'boolean', description: 'Also show done and dropped items and closed lists' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args: any) => callWorker('/api/work-state', {
+      query: { cwd: process.cwd(), list: args?.list, includeClosed: args?.includeClosed },
+      text: true,
+    }),
   },
   {
     name: 'session_start_context',
@@ -670,16 +716,15 @@ NEVER fetch full details without filtering first. 10x token savings.`,
   },
   {
     name: 'observation_context',
-    description: 'Get top-N relevant observations for context injection. Returns matched observations AND a pre-joined context string suitable for prompt injection. Calls /v1/context. Server runtime only.',
+    description: 'Get top-N relevant observations for context injection. Returns matched observations AND a pre-joined context string suitable for prompt injection. Calls /v1/context. Server runtime only. Omit "query" for recency-ordered "recent" context instead of a relevance-ranked search.',
     inputSchema: {
       type: 'object',
       properties: {
         projectId: { type: 'string' },
-        query: { type: 'string', description: 'Search query (required)' },
+        query: { type: 'string', description: 'Optional search query. Omit for recency-ordered recent context.' },
         platformSource: { type: 'string', description: 'Optional platform source filter, e.g. claude, codex, cursor' },
-        limit: { type: 'number', description: 'Max observations (default 10, max 50)' },
+        limit: { type: 'number', description: 'Max observations (default 10 with a query, 50 without; max 200)' },
       },
-      required: ['query'],
       additionalProperties: false,
     },
     handler: async (args: any) => handleObservationContext(args ?? {}),
@@ -881,11 +926,12 @@ NEVER fetch full details without filtering first. 10x token savings.`,
   },
   {
     name: 'rebuild_corpus',
-    description: 'Rebuild a knowledge corpus from its stored filter — re-runs the search to refresh with new observations. Does not re-prime the session.',
+    description: 'Rebuild a knowledge corpus from its stored filter — re-runs the search to refresh with new observations. Does not re-prime the session. Refuses and keeps the existing corpus if the rebuild would drop a large share of observations, unless force is set.',
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Name of the corpus to rebuild' }
+        name: { type: 'string', description: 'Name of the corpus to rebuild' },
+        force: { type: 'boolean', description: 'Accept a rebuild that shrinks the corpus significantly instead of keeping the existing one' }
       },
       required: ['name'],
       additionalProperties: true

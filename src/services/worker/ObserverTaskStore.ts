@@ -247,6 +247,10 @@ export class ObserverTaskStore {
     this.db.transaction(() => { for (const id of ids) update.run(reason, id); })();
   }
 
+  isGatewayOwned(taskId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM observer_queue_inputs WHERE task_id=?').get(taskId);
+  }
+
   /** On restart, no in-RAM claim can prove whether an old queued row was sent. */
   markStrandedQueuedForReconciliation(): number {
     const result = this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',

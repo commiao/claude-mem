@@ -1,6 +1,6 @@
 # Durable observer batches
 
-Enable with `CLAUDE_MEM_LLM_QUEUE_URL` (private HTTPS origin, or loopback HTTP)
+Enable with `CLAUDE_MEM_LLM_QUEUE_URL` (HTTPS origin, or loopback HTTP)
 and `CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE` (the caller token, never a provider key).
 Default business limits: at most 20 inputs and 64,000 serialized request bytes
 per batch. `CLAUDE_MEM_LLM_BATCH_ITEMS` permits 1–20, and

@@ -183,6 +183,23 @@ describe('mutation sites', () => {
       }
     });
 
+    it('prepares the repair statements once per store, not once per prompt (#3537)', () => {
+      store.updateMemorySessionId(1, 'mem-a');
+      const prepare = spyOn(db, 'prepare');
+      try {
+        // Re-registration re-runs the whole repair: per prompt a rev bump, a
+        // supersede DELETE and an INSERT.
+        store.updateMemorySessionId(1, 'mem-b');
+        const repairPrepares = prepare.mock.calls
+          .map(([sql]) => String(sql))
+          .filter(sql => /sync_outbox|FROM user_prompts|SET sync_rev = \?/.test(sql));
+        expect(repairPrepares).toEqual([]);
+        expect(outboxRows(db).map(op => op.body.fields.memory_session_id)).toEqual(['mem-b', 'mem-b']);
+      } finally {
+        prepare.mockRestore();
+      }
+    });
+
     it('updateMemorySessionId emits nothing when the id is unchanged', () => {
       store.updateMemorySessionId(1, 'mem-late');
       expect(outboxRows(db).length).toBe(2);

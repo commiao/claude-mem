@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { GatewayObserverQueue } from '../../src/services/worker/GatewayObserverQueue.js';
+import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
 import { ModeManager } from '../../src/services/domain/ModeManager.js';
@@ -40,6 +41,19 @@ describe('durable gateway observer batches', () => {
     expect(tasks.get(owned)?.state).toBe('queued');
     expect(tasks.get(legacy)?.state).toBe('reconciliation');
   });
+  it('never routes queue-owned input into the SDK when queue configuration is removed', async () => {
+    const id=add(1);
+    const sessions=new SessionManager(manager);
+    const prior=process.env.CLAUDE_MEM_LLM_QUEUE_URL;
+    delete process.env.CLAUDE_MEM_LLM_QUEUE_URL;
+    try {
+      await expect(sessions.queueObservation(session, {recoveryTaskId:id} as any))
+        .rejects.toThrow('gateway_owned_task_requires_queue_runtime');
+      expect(sessions.getMessageBuffer().getPendingCount(session)).toBe(0);
+    } finally {
+      if(prior!==undefined) process.env.CLAUDE_MEM_LLM_QUEUE_URL=prior;
+    }
+  });
   it('uses bounded independent batches from the same source session', () => {
     for(let n=1;n<=5;n++) add(n);
     const worker=queue();
@@ -61,6 +75,19 @@ describe('durable gateway observer batches', () => {
     expect(batches()[0].body).toBe(first);
     expect(db.prepare("SELECT count(*) AS n FROM observer_tasks WHERE state='running'").get()).toEqual({n:5});
   });
+  it('polls past the first 64 unfinished batches without starving later work', async () => {
+    config.maxItems=1;
+    for(let i=0;i<65;i++) add(i);
+    const seen=new Set<string>();
+    const worker=queue(async (_url:any,req:any)=>{
+      const key=req.headers['Idempotency-Key'] || JSON.parse(req.body).idempotency_key;
+      seen.add(key);
+      return Response.json({version:1,job:{request_key:key,business_key:'claude_mem.observation',state:'queued'}});
+    });
+    while(worker.prepareBatch()) {}
+    await worker.cycle();expect(seen.size).toBe(64);
+    await worker.cycle();expect(seen.size).toBe(65);
+  });
   it('explicitly holds oversized input before any model request', () => {
     const id=add(1,{payload:JSON.stringify({tool_name:'Read',tool_input:'{}',tool_response:'x'.repeat(70000)})});
     expect(queue().prepareBatch()).toBe(true);
@@ -76,7 +103,7 @@ describe('durable gateway observer batches', () => {
     await restarted.processBatch(batches()[0]);
     expect(seen[0].body).toBe(seen[1].body);
     expect(seen[0].headers['Idempotency-Key']).toBe(seen[1].headers['Idempotency-Key']);
-    expect(batches()[0].state).toBe('pending');
+    expect(batches()[0].state).toBe('submitted');
   });
   it('commits business result and receipt together then acknowledges without another submit', async () => {
     const id=add(1); const paths:string[]=[];
@@ -85,7 +112,7 @@ describe('durable gateway observer batches', () => {
     await worker.processBatch(batches()[0]);
     expect(tasks.get(id)?.state).toBe('succeeded');
     expect(batches()[0].acknowledged).toBe(0);
-    const restarted=queue(async(url:any,req:any)=>{paths.push(url);return Response.json({version:1});});
+    const restarted=queue(async(url:any,req:any)=>{paths.push(url);const payload=JSON.parse(req.body);return Response.json({version:1,job:{request_key:payload.idempotency_key,business_key:payload.business_key,business_receipt:{reference:payload.receipt.reference,state:payload.receipt.state}}});});
     await restarted.processBatch(batches()[0]);
     expect(batches()[0].acknowledged).toBe(1);
     expect(paths.map(p=>new URL(p).pathname)).toEqual(['/v1/queue/submit','/v1/queue/ack']);
