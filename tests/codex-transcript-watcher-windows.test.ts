@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { readFileSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
+import { TranscriptWatcher } from '../src/services/transcripts/watcher.js';
 
 const watcherSource = readFileSync(
   join(__dirname, '..', 'src', 'services', 'transcripts', 'watcher.ts'),
@@ -9,8 +10,9 @@ const watcherSource = readFileSync(
 
 describe('Codex transcript ingestion on Windows (#2192)', () => {
   it('normalizes backslashes to forward slashes before passing the path to scanGlob', () => {
-    expect(watcherSource).toContain('normalizeGlobPattern');
-    expect(watcherSource).toContain("inputPath.replace(/\\\\/g, '/')");
+    const watcher = Object.create(TranscriptWatcher.prototype) as any;
+    expect(watcher.normalizeGlobPattern('nested\\*.jsonl'))
+      .toBe(resolve('nested', '*.jsonl').replace(/\\/g, '/'));
     expect(watcherSource).toMatch(/scanGlob\(this\.normalizeGlobPattern\(/);
   });
 
