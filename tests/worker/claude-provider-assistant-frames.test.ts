@@ -1,3 +1,4 @@
+import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
 import { describe, it, expect, beforeEach, afterEach, afterAll, mock, spyOn } from 'bun:test';
 import type { ActiveSession } from '../../src/services/worker-types.js';
 
@@ -396,6 +397,9 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
 
 describe('ClaudeProvider backlog flow control', () => {
   it('waits for each result before claiming another input, including the init result', async () => {
+    const settings = spyOn(SettingsDefaultsManager, 'loadFromFile').mockReturnValue({
+      ...SettingsDefaultsManager.getAllDefaults(), CLAUDE_MEM_OBSERVE_BARE_PROMPTS: 'true',
+    });
     const session = createSession();
     session.claimedMessageIds = [];
     const harness = createHarness(session);
@@ -434,6 +438,7 @@ describe('ClaudeProvider backlog flow control', () => {
     try {
       await harness.provider.startSession(session);
     } finally {
+      settings.mockRestore();
       driveQuery = undefined;
       session.abortController.abort();
     }

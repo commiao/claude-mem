@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { afterEach, beforeEach, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { appendFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -25,6 +26,7 @@ beforeEach(() => {
     if (!accepting) throw new Error('database is locked');
     return createSDKSession(...args);
   }) as SessionStore['createSDKSession'];
+  const tasks = new ObserverTaskStore(store.db);
   setIngestContext({
     sessionManager: {
       queueObservation: (_sessionDbId: number, message: any) => {
@@ -37,7 +39,7 @@ beforeEach(() => {
         });
       },
     } as any,
-    dbManager: { getSessionStore: () => store } as any,
+    dbManager: { getSessionStore: () => store, getObserverTaskStore: () => tasks } as any,
     eventBroadcaster: { broadcastObservationQueued: () => {} } as any,
     ensureGeneratorRunning: async () => {},
   });

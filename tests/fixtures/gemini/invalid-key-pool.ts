@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { strict as assert } from 'node:assert';
 import { spyOn } from 'bun:test';
 import { SessionStore } from '../../../src/services/sqlite/SessionStore.ts';
@@ -8,7 +9,7 @@ import { SettingsDefaultsManager } from '../../../src/shared/SettingsDefaultsMan
 
 const scenario = process.argv[2];
 const store = new SessionStore(':memory:');
-const db: any = { getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id), getChromaSync: () => null, getCloudSync: () => null };
+const db: any = { getObserverTaskStore: () => new ObserverTaskStore(store.db), getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id), getChromaSync: () => null, getCloudSync: () => null };
 const manager = new SessionManager(db);
 const id = store.createSDKSession('owned-keypool-session', 'owned-keypool-project', 'Inspect owned file');
 const session = manager.initializeSession(id);

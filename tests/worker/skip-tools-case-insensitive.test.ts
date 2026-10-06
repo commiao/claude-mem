@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
@@ -29,13 +30,14 @@ describe('CLAUDE_MEM_SKIP_TOOLS matches tool names case-insensitively', () => {
     skipToolsSetting = ' read , bash ';
     queued = [];
     store = new SessionStore(new Database(':memory:'));
+    const tasks = new ObserverTaskStore(store.db);
     setIngestContext({
       sessionManager: {
         queueObservation: async (sessionDbId: number, data: unknown) => {
           queued.push({ sessionDbId, data });
         },
       } as any,
-      dbManager: { getSessionStore: () => store } as any,
+      dbManager: { getSessionStore: () => store, getObserverTaskStore: () => tasks } as any,
       eventBroadcaster: { broadcastObservationQueued: mock(() => {}) } as any,
       ensureGeneratorRunning: mock(async () => {}),
     });

@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { strict as assert } from 'node:assert';
 import { mock } from 'bun:test';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +41,7 @@ try {
         mode.loadMode('code');
         const store = new SessionStore(':memory:');
         cleanup.push(() => store.close());
-        const db = { getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id),
+        const db = { getObserverTaskStore: () => new ObserverTaskStore(store.db), getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id),
           getChromaSync: () => null, getCloudSync: () => null } as unknown as DatabaseManager;
         const manager = new SessionManager(db);
         const contentId = `owned-summary-${kind}`;
