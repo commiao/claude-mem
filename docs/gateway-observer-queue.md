@@ -1,7 +1,11 @@
 # Durable observer batches
 
 Enable with `CLAUDE_MEM_LLM_QUEUE_URL` (HTTPS origin, or loopback HTTP)
-and `CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE` (the caller token, never a provider key).
+and either `CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE` (a raw caller token) or
+`CLAUDE_MEM_LLM_QUEUE_TOKEN_ENV_FILE` (the existing credvault-managed consumer
+`.env`, whose AUTH_TOKEN and API_KEY must agree). The source is reread on each
+HTTP request so central token rotation takes effect without another secret copy.
+Both forms contain a caller token, never a provider key.
 Default business limits: at most 20 inputs and 64,000 serialized request bytes
 per batch. `CLAUDE_MEM_LLM_BATCH_ITEMS` permits 1–20, and
 `CLAUDE_MEM_LLM_BATCH_BYTES` permits 4,096–256,000.
