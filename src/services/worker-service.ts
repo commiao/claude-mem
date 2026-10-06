@@ -1,3 +1,4 @@
+import { GatewayObserverQueue, gatewayQueueEnabled, queueConfig } from './worker/GatewayObserverQueue.js';
 
 import path from 'path';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
@@ -217,6 +218,7 @@ export class WorkerService implements WorkerRef {
   private readonly deferredSessionEndQueue = new DeferredSessionEndQueue();
 
   private dbManager: DatabaseManager;
+  private gatewayObserverQueue: GatewayObserverQueue | null = null;
   private observerMailbox: ObserverMailboxBridge | null = null;
   private sessionRoutes: SessionRoutes | null = null;
   private sessionManager: SessionManager;
@@ -560,6 +562,10 @@ export class WorkerService implements WorkerRef {
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
       this.sessionManager.recoverStrandedObserverTasks();
+      if (gatewayQueueEnabled()) {
+        this.gatewayObserverQueue = new GatewayObserverQueue(this.dbManager, queueConfig());
+        this.gatewayObserverQueue.start();
+      }
       const reconciliationForwarder = settings.CLAUDE_MEM_RECONCILIATION_FORWARDER_URL;
       const reconciliationTokenFile = settings.CLAUDE_MEM_RECONCILIATION_CALLER_TOKEN_FILE;
       if (reconciliationForwarder && reconciliationTokenFile) {
@@ -912,6 +918,8 @@ export class WorkerService implements WorkerRef {
       isShuttingDown: () => this.isShuttingDown,
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
+        await this.gatewayObserverQueue?.stop();
+        this.gatewayObserverQueue = null;
         this.observerMailbox?.stop();
         this.observerMailbox = null;
         if (this.deferredSessionEndReplayTimer !== null) {

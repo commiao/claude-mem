@@ -249,7 +249,7 @@ function dedupeStable(values: string[]): string[] {
   return deduped;
 }
 
-function sanitizeObservationFiles(
+export function sanitizeObservationFiles(
   observations: ParsedObservation[],
   fileEvidence: ObservationFileEvidence
 ): ParsedObservation[] {
@@ -680,7 +680,7 @@ export async function processAgentResponse(
   }
 }
 
-function normalizeSummaryForStorage(summary: ParsedSummary | null): {
+export function normalizeSummaryForStorage(summary: ParsedSummary | null): {
   request: string;
   investigated: string;
   learned: string;

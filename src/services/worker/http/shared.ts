@@ -1,3 +1,4 @@
+import { gatewayQueueEnabled } from '../GatewayObserverQueue.js';
 
 import { logger } from '../../../utils/logger.js';
 import type { SessionManager } from '../SessionManager.js';
@@ -152,6 +153,9 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
       contentSessionId: payload.contentSessionId,
       sourceId: payload.toolUseId || null,
       enqueuedAtEpoch: firstEnqueueTime,
+      ...(gatewayQueueEnabled() ? { queueContext: {
+        project: dbManager.getSessionById(sessionDbId).project, userPrompt: '',
+      }} : {}),
       payload: JSON.stringify({
         tool_name: payload.toolName,
         tool_input: cleanedToolInput,

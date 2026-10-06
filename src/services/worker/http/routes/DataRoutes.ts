@@ -447,7 +447,7 @@ export class DataRoutes extends BaseRouteHandler {
     // #2756 — additive: sessions currently parked in waitForSlot, never a
     // breaking change to existing isProcessing/queueDepth consumers.
     const parkedSessions = getParkedSlotWaiterCount();
-    res.json({ isProcessing, queueDepth, parkedSessions });
+    res.json({ isProcessing, queueDepth, parkedSessions, durableQueue: this.sessionManager.getDurableQueueStatus() });
   });
 
   private parsePaginationParams(req: Request): { offset: number; limit: number; project?: string; platformSource?: string } {

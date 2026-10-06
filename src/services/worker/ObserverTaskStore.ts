@@ -1,3 +1,4 @@
+import { initializeQueueTables, ownQueueInput } from './GatewayObserverQueue.js';
 import { createHash, randomUUID } from 'crypto';
 import type { Database } from 'bun:sqlite';
 import { logger } from '../../utils/logger.js';
@@ -10,6 +11,8 @@ export interface ObserverTaskInput {
   sourceId: string | null;
   payload: string;
   enqueuedAtEpoch?: number;
+  queueContext?: { project: string; userPrompt: string };
+  queueKind?: string;
 }
 
 export interface ObserverTaskRow extends Omit<ObserverTaskInput, 'enqueuedAtEpoch'> {
@@ -45,6 +48,7 @@ export type RetryReservation =
 /** Durable source and state for observer work. The RAM message id is never an identity. */
 export class ObserverTaskStore {
   constructor(private readonly db: Database) {
+    initializeQueueTables(db);
     db.run(`CREATE TABLE IF NOT EXISTS observer_tasks (
       id TEXT PRIMARY KEY,
       session_db_id INTEGER NOT NULL,
@@ -119,14 +123,21 @@ export class ObserverTaskStore {
   }
 
   create(input: ObserverTaskInput): string {
+    return this.db.transaction(() => this.createSource(input))();
+  }
+
+  private createSource(input: ObserverTaskInput): string {
     const id = randomUUID();
     const epoch = input.enqueuedAtEpoch ?? Date.now();
     if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error('invalid_observer_enqueue_time');
-    this.db.prepare(`INSERT INTO observer_tasks
+    const inserted = this.db.prepare(`INSERT INTO observer_tasks
       (id, session_db_id, content_session_id, source_id, payload, enqueued_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_db_id, source_id) DO NOTHING`)
       .run(id, input.sessionDbId, input.contentSessionId, input.sourceId, input.payload, epoch);
+    if (inserted.changes && input.queueContext) {
+      ownQueueInput(this.db, id, input.queueContext, input.queueKind);
+    }
     if (input.sourceId) {
       const row = this.db.prepare('SELECT id, payload FROM observer_tasks WHERE session_db_id = ? AND source_id = ?')
         .get(input.sessionDbId, input.sourceId) as { id: string; payload: string };
@@ -240,7 +251,8 @@ export class ObserverTaskStore {
   markStrandedQueuedForReconciliation(): number {
     const result = this.db.prepare(`UPDATE observer_tasks SET state = 'reconciliation',
       version = version + 1, updated_at = CURRENT_TIMESTAMP
-      WHERE state IN ('queued', 'running', 'retry_authorized')`).run();
+      WHERE state IN ('queued', 'running', 'retry_authorized')
+      AND id NOT IN (SELECT task_id FROM observer_queue_inputs)`).run();
     return result.changes;
   }
 

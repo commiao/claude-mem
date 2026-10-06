@@ -1,3 +1,4 @@
+import { gatewayQueueEnabled } from '../../GatewayObserverQueue.js';
 
 import express, { Request, Response } from 'express';
 import { z } from 'zod';
@@ -200,6 +201,7 @@ export class SessionRoutes extends BaseRouteHandler {
   }
 
   private async ensureGeneratorRunningLocked(sessionDbId: number, source: string): Promise<void> {
+    if (gatewayQueueEnabled()) return;
     const session = this.sessionManager.getSession(sessionDbId);
     if (!session) return;
 

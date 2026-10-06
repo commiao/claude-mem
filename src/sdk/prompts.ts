@@ -227,7 +227,7 @@ function truncateObservationField(value: unknown, maxChars: number = OBS_PROMPT_
   return `${head}\n... <elided chars="${elidedChars}" original_size_chars="${raw.length}" reason="oversize" /> ...\n${tail}`;
 }
 
-export function buildObservationPrompt(obs: Observation): string {
+export function buildObservationPrompt(obs: Observation, fieldMaxChars: number = OBS_PROMPT_FIELD_MAX_CHARS): string {
   let toolInput: any;
   let toolOutput: any;
 
@@ -257,8 +257,8 @@ export function buildObservationPrompt(obs: Observation): string {
   return `<observed_from_primary_session${operationMarker}>
   <what_happened>${obs.tool_name}</what_happened>
   <occurred_at>${new Date(obs.created_at_epoch).toISOString()}</occurred_at>${obs.cwd ? `\n  <working_directory>${obs.cwd}</working_directory>` : ''}
-  <parameters>${truncateObservationField(stripImagePayloads(toolInput))}</parameters>
-  <outcome>${truncateObservationField(stripImagePayloads(toolOutput))}</outcome>
+  <parameters>${truncateObservationField(stripImagePayloads(toolInput), fieldMaxChars)}</parameters>
+  <outcome>${truncateObservationField(stripImagePayloads(toolOutput), fieldMaxChars)}</outcome>
 </observed_from_primary_session>
 
 If a <parameters> or <outcome> block above contains an "<elided chars=... />" marker, that field was truncated to fit the observer's context window. Describe only what you can see in the kept portion and do not infer details about the elided range.

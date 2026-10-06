@@ -1,3 +1,5 @@
+import { gatewayQueueEnabled } from './GatewayObserverQueue.js';
+import { createHash } from 'crypto';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
 import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationData } from '../worker-types.js';
@@ -370,6 +372,10 @@ export class SessionManager {
   }
 
   async queueObservation(sessionDbId: number, data: ObservationData): Promise<void> {
+    if (gatewayQueueEnabled()) {
+      if (!data.recoveryTaskId) throw new Error('durable_observer_task_required');
+      return;
+    }
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
@@ -409,6 +415,16 @@ export class SessionManager {
       session = this.initializeSession(sessionDbId);
     }
 
+    if (gatewayQueueEnabled()) {
+      this.dbManager.getObserverTaskStore().create({
+        sessionDbId, contentSessionId: session.contentSessionId,
+        sourceId: 'summary:'+createHash('sha256').update(JSON.stringify([
+          session.lastPromptNumber,lastAssistantMessage || ''])).digest('hex'),
+        payload: JSON.stringify({last_assistant_message:lastAssistantMessage || '',prompt_number:session.lastPromptNumber}),
+        queueKind: 'summary', queueContext: {project:session.project,userPrompt:session.userPrompt || ''},
+      });
+      return;
+    }
     const message: PendingMessage = {
       type: 'summarize',
       last_assistant_message: lastAssistantMessage
@@ -607,7 +623,21 @@ export class SessionManager {
     return this.sessions.size;
   }
 
+  getDurableQueueStatus(): object | null {
+    if (!gatewayQueueEnabled()) return null;
+    const db = this.dbManager.getConnection();
+    return {mode:'gateway', tasks:db.prepare(`SELECT t.state,
+      CASE WHEN i.task_id IS NULL THEN 'legacy' ELSE 'gateway' END AS owner,count(*) AS count
+      FROM observer_tasks t LEFT JOIN observer_queue_inputs i ON i.task_id=t.id GROUP BY t.state,owner`).all(),
+      batches:db.prepare('SELECT state,count(*) AS count FROM observer_queue_batches GROUP BY state').all()};
+  }
+
   getTotalQueueDepth(): number {
+    if (gatewayQueueEnabled()) {
+      const row = this.dbManager.getConnection().prepare(`SELECT count(*) AS count FROM observer_tasks
+        WHERE state IN ('queued','running','reconciliation')`).get() as {count:number};
+      return row.count;
+    }
     return this.buffer.getTotalDepth();
   }
 
