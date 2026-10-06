@@ -366,7 +366,11 @@ describe('SearchRoutes Welcome Hint', () => {
       countQueryStub = mock(() => ({ count: 7 }));
       prepareStub = mock(() => ({ get: countQueryStub }));
       mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
-      workStateEntriesStub.mockImplementation(releaseEntries);
+      // Both request keys are checkout aliases. Match the scope annotation
+      // supplied by SessionStore.getWorkStateEntries for those explicit keys.
+      workStateEntriesStub.mockImplementation(() => releaseEntries().map(entry => ({
+        ...entry, scope_project: '/path/worktree',
+      })));
       const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
       const res = createMockRes();
 
@@ -378,8 +382,13 @@ describe('SearchRoutes Welcome Hint', () => {
       expect(body).toStartWith('# Work state: your to-do lists and working state');
       expect(body).toContain('\n\nStill open:\n- release: version=13.25.3, status=active, updated 1 minute ago\n  - [todo] publish, updated 1 minute ago');
       expect(body).toEndWith('\n\nCONTEXT_FROM_GENERATOR');
-      const sectionLength = body.length - '\n\nCONTEXT_FROM_GENERATOR'.length;
-      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: sectionLength + 2 }), false);
+      // The budget is reserved for the section as rendered with its time
+      // placeholders (cacheable form), which are never shorter than the filled text.
+      const renderedEntries = (workStateEntriesStub.mock.results[0] as { value: any[] }).value;
+      const placeholderSectionLength = buildWorkStateContextSection(renderedEntries, 'placeholders').length;
+      const filledSectionLength = body.length - '\n\nCONTEXT_FROM_GENERATOR'.length;
+      expect(placeholderSectionLength).toBeGreaterThanOrEqual(filledSectionLength);
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: placeholderSectionLength + 2 }), false);
     });
 
     it('leads the welcome hint with what is still open', async () => {

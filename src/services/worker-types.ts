@@ -1,5 +1,6 @@
 
 import type { Response } from 'express';
+import type { PaidSendBudget } from './worker/paid-send-budget.js';
 
 export interface ConversationMessage {
   role: 'user' | 'assistant';
@@ -92,6 +93,12 @@ export interface ActiveSession {
    */
   consecutiveUnattendedGatewayResumes?: number;
   /**
+   * The paid-send allowance of the batch most recently sent (paid-send-budget.ts),
+   * shared by withRetry, transport resumes, stall resumes and Codex retries.
+   * Spent, the batch is parked instead of resent.
+   */
+  paidSendBudget?: PaidSendBudget;
+  /**
    * The delayed resume a response stall scheduled. Any generator start cancels
    * it, so a stale timer never restarts a session a newer generation paused.
    */
@@ -142,6 +149,12 @@ export interface ActiveSession {
    * reading is never recorded (#2957).
    */
   lastContextTokens?: number;
+  /**
+   * Random id of the current observer generation, minted at every generation
+   * start (openObserverGeneration), so a recycled or restarted conversation
+   * gets a new one. OpenRouter-family requests send it as `trace.trace_id`.
+   */
+  observerGenerationId?: string;
   /**
    * The finish reason an HTTP provider reported for the reply about to be
    * processed ('length' / 'MAX_TOKENS' = cut off at the output-token cap).

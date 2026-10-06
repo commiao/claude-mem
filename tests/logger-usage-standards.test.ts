@@ -53,6 +53,9 @@ const EXCLUDED_PATTERNS = [
   /sqlite\/project-read-keys\.ts$/,  // Pure project-scope SQL builders plus one read query; logging happens at the search/context call sites
   /servers\/checkout-search-scope\.ts$/,  // Pure MCP search-args transform; no side effects or error paths
   /sync\/prompt-text-clamp\.ts$/,  // Pure prompt_text bound (SQL column fragment + clamp); CloudSync logs and quarantines at the drain (#3537)
+  /worker\/paid-send-budget\.ts$/,  // Pure per-batch paid-send counter; spends and exhaustion are logged at the provider call sites
+  /servers\/corpus-worker-stream\.ts$/,  // MCP SSE transport; every failure throws to callWorker in mcp-server.ts, which logs it
+  /servers\/worker-restart\.ts$/,  // MCP refused-connection retry; the restart is logged by ensureWorkerConnection and failures by callWorker in mcp-server.ts
 ];
 
 const HIGH_PRIORITY_PATTERNS = [

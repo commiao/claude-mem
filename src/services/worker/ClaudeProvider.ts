@@ -42,7 +42,7 @@ import {
   windowAwareConversationMaxChars,
 } from '../../shared/observer-recycle.js';
 import { resolveContextWindowTokens, observationFieldMaxChars } from './context-window.js';
-import { recycleObserverConversation, loadSessionStartContext, openObserverGeneration } from './session/recycle-conversation.js';
+import { recycleObserverConversation, loadSessionStartContext, openObserverGeneration, observesBarePrompts } from './session/recycle-conversation.js';
 import { ObserverResponsePacer } from './session/response-pacer.js';
 import { IDLE_TIMEOUT_MS } from './SessionMessageBuffer.js';
 import { optimizeObservationFields, buildFieldCompressionPrompt, type CompressedField, type FieldCompressor } from './field-optimizer.js';
@@ -52,6 +52,7 @@ import { telemetryBuffer } from '../telemetry/buffer.js';
 import { captureEvent } from '../telemetry/telemetry.js';
 import { clearDependencyStatus, recordClaudeCliSetupRequired, OBSERVER_DIR_UNUSABLE_CODE } from '../../shared/dependency-health.js';
 import { clearClaudeCliSelfHealAttempts } from './stale-spawn-recovery.js';
+import { paidSendBudgetForClaimedBatch } from './paid-send-budget.js';
 import { createHash } from 'crypto';
 const REPLAY_HEADER_NAMES = new Set([
   'x-credvault-replay-permit', 'x-credvault-replay-prompt-sha256', 'x-credvault-replay-step-id',
@@ -661,9 +662,20 @@ export class ClaudeProvider {
             }, truncatedResponse);
           }
 
-          if (typeof textContent === 'string' && textContent.includes('Invalid API key')) {
+          // Only the CLI's own auth-failure status line; an observation may quote the phrase (#4253).
+          if (
+            message.error === 'authentication_failed' &&
+            /^Invalid API key(?: · (?:Fix external API key|Please run \/login))?$/.test(textContent.trim())
+          ) {
             throw new Error('Invalid API key: check your API key configuration in ~/.claude-mem/settings.json or ~/.claude-mem/.env');
           }
+
+          // The frame names the model that served the turn (an alias such as
+          // `haiku` arrives as its dated id). It is read off the CLI's stdout,
+          // so a frame without one keeps the requested model, as the other
+          // providers do.
+          const reportedModel = message.message.model;
+          const servedModel = typeof reportedModel === 'string' && reportedModel ? reportedModel : modelId;
 
           pacer.processingStarted();
           try {
@@ -677,7 +689,7 @@ export class ClaudeProvider {
               originalTimestamp,
               'SDK',
               cwdTracker.lastCwd,
-              modelId,
+              servedModel,
               activeResponseContext.current,
               emptyOutputReason
             );
@@ -993,6 +1005,13 @@ export class ClaudeProvider {
       promptType: isInitPrompt ? 'INIT' : 'CONTINUATION'
     });
 
+    let pendingInitPrompt: string | null = null;
+    const withPendingInitPrompt = (prompt: string): string => {
+      if (pendingInitPrompt === null) return prompt;
+      const combined = `${pendingInitPrompt}\n\n${prompt}`;
+      pendingInitPrompt = null;
+      return combined;
+    };
     let answeredBeforeSend = pacer.mark();
     if (!manualReplayAtStart) {
     // Release claims a previous generation left unconfirmed (a quota-guard
@@ -1013,20 +1032,21 @@ export class ClaudeProvider {
     // This SDK process never resumes, so the proxy history starts over with it.
     openObserverGeneration(session, initPrompt);
 
-    session.lastPromptSentAt = Date.now();
-    session.lastGeneratorSource = 'init';
-    answeredBeforeSend = pacer.mark();
-    yield {
-      type: 'user',
-      message: {
-        role: 'user',
-        content: initPrompt
-      },
-      session_id: session.contentSessionId,
-      parent_tool_use_id: null,
-      isSynthetic: true
-    };
-    if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
+    const observeBarePrompt = observesBarePrompts();
+    pendingInitPrompt = observeBarePrompt ? null : initPrompt;
+    if (observeBarePrompt) {
+      session.lastPromptSentAt = Date.now();
+      session.lastGeneratorSource = 'init';
+      answeredBeforeSend = pacer.mark();
+      yield {
+        type: 'user',
+        message: { role: 'user', content: initPrompt },
+        session_id: session.contentSessionId,
+        parent_tool_use_id: null,
+        isSynthetic: true
+      };
+      if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
+    }
     }
 
     // Each pass waits for the previous prompt's answer at the bottom of the loop,
@@ -1115,6 +1135,11 @@ export class ClaudeProvider {
         // prompt is built, so the observation carries a summary of the whole
         // field rather than a head/tail slice with the middle cut out (#3800).
         // The field cap scales with the model's window (#3625).
+        // A newer user prompt may arrive while the payload is being condensed.
+        activeResponseContext.current = {
+          ...snapshotResponseContext(session),
+          promptNumber: message.prompt_number ?? session.lastPromptNumber,
+        };
         const fieldMaxChars = observationFieldMaxChars(session.observerContextWindowTokens);
         const optimized = compressField
           ? await optimizeObservationFields(
@@ -1143,10 +1168,11 @@ export class ClaudeProvider {
           created_at_epoch: message._originalTimestamp,
           cwd: message.cwd
         }, fieldMaxChars, takeObserverSchemaReminder(session));
+        const requestPrompt = withPendingInitPrompt(obsPrompt);
         if (message.recoveryTaskId) {
           try {
             this.dbManager.getObserverTaskStore().recordPreparedPrompt(
-              message.recoveryTaskId, obsPrompt, message._originalTimestamp);
+              message.recoveryTaskId, requestPrompt, message._originalTimestamp);
           } catch (error) {
             // Never send a rebuilt prompt with a different body under the same
             // durable business task. Reconciliation must inspect this drift.
@@ -1154,7 +1180,6 @@ export class ClaudeProvider {
             throw error;
           }
         }
-        activeResponseContext.current = snapshotResponseContext(session);
 
         session.conversationHistory.push({ role: 'user', content: obsPrompt });
 
@@ -1165,7 +1190,7 @@ export class ClaudeProvider {
           type: 'user',
           message: {
             role: 'user',
-            content: obsPrompt
+            content: requestPrompt
           },
           session_id: session.contentSessionId,
           parent_tool_use_id: null,
@@ -1180,7 +1205,10 @@ export class ClaudeProvider {
           user_prompt: session.userPrompt,
           last_assistant_message: message.last_assistant_message || ''
         }, mode);
-        activeResponseContext.current = snapshotResponseContext(session);
+        activeResponseContext.current = {
+          ...snapshotResponseContext(session),
+          promptNumber: message.prompt_number ?? session.lastPromptNumber,
+        };
 
         session.conversationHistory.push({ role: 'user', content: summaryPrompt });
 
@@ -1191,7 +1219,7 @@ export class ClaudeProvider {
           type: 'user',
           message: {
             role: 'user',
-            content: summaryPrompt
+            content: withPendingInitPrompt(summaryPrompt)
           },
           session_id: session.contentSessionId,
           parent_tool_use_id: null,
@@ -1233,6 +1261,9 @@ export class ClaudeProvider {
       // loop, and killing the stream first means no late frame can be processed
       // between the release and the abort.
       session.abortReason = 'transport:response_stall';
+      // The unanswered prompt may have been billed: it counts against the
+      // batch's paid-send budget, read before the reset forgets the claims.
+      paidSendBudgetForClaimedBatch(session)?.recordPaidSend();
       try {
         session.abortController.abort();
       } catch {
