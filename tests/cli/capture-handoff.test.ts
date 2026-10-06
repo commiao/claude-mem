@@ -57,9 +57,10 @@ test('handoff delivery rejects HTTP failures instead of acknowledging a fallback
   const { executeWithWorkerFallback } = await import('../../src/shared/worker-utils.js');
   const originalFetch = globalThis.fetch;
   process.env.CLAUDE_MEM_HANDOFF_REPLAY = 'g';
+  const ready = () => new Response('event: phase\ndata: {"phase":"ready"}\n\n', {headers: {'Content-Type': 'text/event-stream'}});
   try {
     for (const status of [400, 429, 503]) {
-      globalThis.fetch = (async (url: any) => new Response('{}', {
+      globalThis.fetch = (async (url: any) => String(url).endsWith('/api/ready') ? ready() : new Response('{}', {
         status: String(url).endsWith('/api/readiness') ? 200 : status,
       })) as typeof fetch;
       await expect(executeWithWorkerFallback('/api/sessions/observations', 'POST', {}, {
@@ -67,6 +68,7 @@ test('handoff delivery rejects HTTP failures instead of acknowledging a fallback
       })).rejects.toThrow(`Handoff worker returned ${status}`);
     }
     globalThis.fetch = (async (url: any) => {
+      if (String(url).endsWith('/api/ready')) return ready();
       if (String(url).endsWith('/api/readiness')) return new Response('{}');
       throw new Error('connection lost after request');
     }) as typeof fetch;
