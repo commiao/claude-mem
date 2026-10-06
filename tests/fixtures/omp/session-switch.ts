@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { strict as assert } from 'node:assert';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -13,7 +14,8 @@ const delayed=process.argv[3]==='delayed';
 const dataDir=process.env.CLAUDE_MEM_DATA_DIR!;
 const cwd=join(dataDir,'owned-project');mkdirSync(cwd,{recursive:true});
 const store=new SessionStore(':memory:');
-const db:any={getSessionStore:()=>store,getSessionById:(id:number)=>store.getSessionById(id),getChromaSync:()=>null,getCloudSync:()=>null};
+const tasks=new ObserverTaskStore(store.db);
+const db:any={getObserverTaskStore:()=>tasks,getSessionStore:()=>store,getSessionById:(id:number)=>store.getSessionById(id),getChromaSync:()=>null,getCloudSync:()=>null};
 const manager=new SessionManager(db);
 const broadcaster=new Proxy({},{get:()=>()=>{}}) as any;
 const route=new SessionRoutes(manager,db,{} as any,{} as any,{} as any,broadcaster,{} as any,{} as any) as any;

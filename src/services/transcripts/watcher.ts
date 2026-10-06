@@ -880,7 +880,9 @@ export class TranscriptWatcher {
   }
 
   private normalizeGlobPattern(inputPath: string): string {
-    return inputPath.replace(/\\/g, '/');
+    // Resolve parent segments before Bun.Glob scans a relative pattern.
+    // Otherwise ../ paths can miss files created after the initial scan.
+    return resolvePath(inputPath).replace(/\\/g, '/');
   }
 
   private hasGlob(inputPath: string): boolean {

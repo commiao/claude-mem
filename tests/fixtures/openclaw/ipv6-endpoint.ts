@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { strict as assert } from 'node:assert';
 import { SessionStore } from '../../../src/services/sqlite/SessionStore.ts';
 import { SessionManager } from '../../../src/services/worker/SessionManager.ts';
@@ -7,7 +8,7 @@ const scenario = process.argv[2];
 const host = scenario === 'ipv4-control' ? '127.0.0.1' : '::1';
 const configuredHost = scenario === 'ipv6-bracketed-control' ? '[::1]' : host;
 const store = new SessionStore(':memory:');
-const db: any = { getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id), getChromaSync: () => null, getCloudSync: () => null };
+const db: any = { getObserverTaskStore: () => new ObserverTaskStore(store.db), getSessionStore: () => store, getSessionById: (id: number) => store.getSessionById(id), getChromaSync: () => null, getCloudSync: () => null };
 const manager = new SessionManager(db);
 const broadcaster = new Proxy({}, { get: () => () => {} });
 const routes = new SessionRoutes(manager, db, {} as any, {} as any, {} as any, broadcaster as any, {} as any, {} as any) as any;

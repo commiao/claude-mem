@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { strict as assert } from 'node:assert';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,7 +11,7 @@ const host=scenario.startsWith('ipv6')?'::1':scenario==='default'?'127.0.0.1':'0
 if(scenario.endsWith('-env')||scenario==='env-over-file')process.env.CLAUDE_MEM_WORKER_HOST=host;
 else delete process.env.CLAUDE_MEM_WORKER_HOST;
 const store=new SessionStore(':memory:');
-const db:any={getSessionStore:()=>store,getSessionById:(id:number)=>store.getSessionById(id),getChromaSync:()=>null,getCloudSync:()=>null};
+const db:any={getObserverTaskStore: () => new ObserverTaskStore(store.db), getSessionStore:()=>store,getSessionById:(id:number)=>store.getSessionById(id),getChromaSync:()=>null,getCloudSync:()=>null};
 const manager=new SessionManager(db);
 setIngestContext({dbManager:db,sessionManager:manager,eventBroadcaster:{broadcastObservationQueued(){}} as any,ensureGeneratorRunning:async()=>{}});
 let posts=0;const urls:string[]=[];

@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../../src/services/worker/ObserverTaskStore.js';
 import { strict as assert } from 'node:assert';
 import { spyOn } from 'bun:test';
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
@@ -30,7 +31,7 @@ try {
  const mode = ModeManager.getInstance() as any; const priorMode=mode.activeMode,priorId=mode.activeModeId;
  cleanup.push(()=>{mode.activeMode=priorMode;mode.activeModeId=priorId});mode.loadMode('code');
  const store = new SessionStore(':memory:');cleanup.push(()=>store.close());
- const db:any={getSessionStore:()=>store,getSessionById:(id:number)=>store.getSessionById(id),getChromaSync:()=>null,getCloudSync:()=>null};
+ const db:any={getObserverTaskStore: () => new ObserverTaskStore(store.db), getSessionStore:()=>store,getSessionById:(id:number)=>store.getSessionById(id),getChromaSync:()=>null,getCloudSync:()=>null};
  const manager = new SessionManager(db);setIngestContext({dbManager:db,sessionManager:manager,eventBroadcaster:{broadcastObservationQueued(){}} as any,ensureGeneratorRunning:async()=>{}});
  let captured:any;
  // Resolves once the worker has ingested the fire-and-forget POST, so the checks below wait for ingestion itself rather than a guessed delay.

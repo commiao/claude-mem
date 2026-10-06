@@ -1,3 +1,4 @@
+import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
@@ -24,6 +25,7 @@ beforeEach(() => {
     if (failure === 'session-resolution') throw new Error('database is locked');
     return createSDKSession(...args);
   }) as SessionStore['createSDKSession'];
+  const tasks = new ObserverTaskStore(store.db);
   setIngestContext({
     sessionManager: {
       queueObservation: (_sessionDbId: number, message: (typeof queued)[number]) => {
@@ -31,7 +33,7 @@ beforeEach(() => {
         queued.push(message);
       },
     } as any,
-    dbManager: { getSessionStore: () => store } as any,
+    dbManager: { getSessionStore: () => store, getObserverTaskStore: () => tasks } as any,
     eventBroadcaster: { broadcastObservationQueued: () => {} } as any,
     ensureGeneratorRunning: async () => {
       if (failure === 'generator-kick') throw new Error('kick failed');

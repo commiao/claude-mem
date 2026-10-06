@@ -217,6 +217,7 @@ function makeQueue(session: ActiveSession, messages: unknown[]) {
       return 0;
     },
     getClaimedMessages: () => [],
+        markClaimedSkipped: () => {},
     getMessageBuffer: () => ({ getPendingCount: () => pending.length }),
   };
 }

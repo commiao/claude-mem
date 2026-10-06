@@ -345,6 +345,7 @@ describe('an output failure consumes only its own batch; the work behind it is s
         confirmClaimedMessages,
         resetProcessingToPending: async () => {},
         getClaimedMessages: () => [],
+        markClaimedSkipped: () => {},
       },
     };
   }

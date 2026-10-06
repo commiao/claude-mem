@@ -1112,10 +1112,6 @@ export class ClaudeProvider {
           throw new Error('manual_replay_queue_identity_missing');
         }
 
-        if (message.prompt_number !== undefined) {
-          session.lastPromptNumber = message.prompt_number;
-        }
-
         // Retire a full generation BEFORE yielding. The SDK holds the real
         // conversation server-side, but conversationHistory tracks every prompt
         // fed into it, so its size is the proxy for how close that conversation
