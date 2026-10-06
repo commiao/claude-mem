@@ -1,6 +1,7 @@
 /** Business batching/persistence only. The gateway owns all model execution limits. */
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
+import { parseEnv } from 'util';
 import type { DatabaseManager } from './DatabaseManager.js';
 import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
 import { parseAgentXml } from '../../sdk/parser.js';
@@ -10,20 +11,23 @@ import { getWorkerPort } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 
 export function gatewayQueueEnabled(): boolean { return !!process.env.CLAUDE_MEM_LLM_QUEUE_URL; }
-export interface QueueConfig { url: string; tokenFile: string; maxItems: number; maxBytes: number; }
+export interface QueueConfig { url: string; tokenFile: string; tokenEnv?: boolean; maxItems: number; maxBytes: number; }
 export function queueConfig(): QueueConfig {
   const url = new URL(process.env.CLAUDE_MEM_LLM_QUEUE_URL!);
   if (url.username || url.password || url.search || url.hash || url.pathname !== '/' ||
       !(url.protocol === 'https:' || (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)))) {
     throw new Error('observer_queue_requires_private_gateway_origin');
   }
-  const tokenFile = process.env.CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE;
+  const rawFile = process.env.CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE;
+  const envFile = process.env.CLAUDE_MEM_LLM_QUEUE_TOKEN_ENV_FILE;
+  if (rawFile && envFile) throw new Error('observer_queue_token_source_ambiguous');
+  const tokenFile = rawFile || envFile;
   if (!tokenFile) throw new Error('observer_queue_token_file_required');
   const maxItems = Number(process.env.CLAUDE_MEM_LLM_BATCH_ITEMS || 20);
   const maxBytes = Number(process.env.CLAUDE_MEM_LLM_BATCH_BYTES || 64000);
   if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 20 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 4096 || maxBytes > 256000) throw new Error('invalid_observer_batch_budget');
-  return {url: url.origin, tokenFile, maxItems, maxBytes};
+  return {url: url.origin, tokenFile, tokenEnv: !!envFile, maxItems, maxBytes};
 }
 
 export function initializeQueueTables(db: ReturnType<DatabaseManager['getConnection']>): void {
@@ -61,7 +65,10 @@ export class GatewayObserverQueue {
   async stop(): Promise<void> { this.stopped = true; this.abort.abort(); await this.loop; }
 
   private async request(path: string, body: object, key?: string): Promise<any> {
-    const token = readFileSync(this.config.tokenFile, 'utf8').trim();
+    const raw = readFileSync(this.config.tokenFile, 'utf8');
+    const env = this.config.tokenEnv ? parseEnv(raw) : null;
+    const token = env ? env.ANTHROPIC_AUTH_TOKEN : raw.trim();
+    if (env && (!token || env.ANTHROPIC_API_KEY !== token)) throw new Error('managed_gateway_caller_mismatch');
     if (!token) throw new Error('empty_observer_gateway_token');
     const response = await this.fetcher(this.config.url+path, {
       method:'POST', redirect:'error', signal: AbortSignal.any([this.abort.signal, AbortSignal.timeout(10000)]),

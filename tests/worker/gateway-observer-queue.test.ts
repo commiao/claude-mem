@@ -32,9 +32,20 @@ describe('durable gateway observer batches', () => {
   function batches(): any[] {return db.prepare('SELECT * FROM observer_queue_batches ORDER BY created_at,id').all() as any[];}
   function queue(fetcher: any=()=>{throw new Error('no network allowed');}) { return new GatewayObserverQueue(manager,config,fetcher); }
   function response(req: any, state='succeeded', stop='end_turn') {
-    return Response.json({version:1,job:{request_key:req.headers['Idempotency-Key'],business_key:'claude_mem.observation',state,
+    return Response.json({version:1,job:{request_key:req.headers['Idempotency-Key'] || JSON.parse(req.body).idempotency_key,business_key:'claude_mem.observation',state,
       response:{model:'gateway-business-model',stop_reason:stop,content:[{type:'text',text:'<skip_summary reason="no durable facts"/>'}],usage:{input_tokens:5,output_tokens:2}}}});
   }
+  it('rereads the managed caller source after token rotation', async () => {
+    add(1);config.tokenEnv=true;
+    const seen:string[]=[];
+    const worker=queue(async (_url:any,req:any)=>{seen.push(req.headers.Authorization);return response(req,'queued');});
+    worker.prepareBatch();
+    for(const token of ['first-caller','rotated-caller']) {
+      writeFileSync(config.tokenFile, `ANTHROPIC_AUTH_TOKEN="${token}"\nANTHROPIC_API_KEY="${token}"\n`);
+      await worker.processBatch(batches()[0]);
+    }
+    expect(seen).toEqual(['Bearer first-caller','Bearer rotated-caller']);
+  });
   it('persists source ownership atomically and never adopts old SDK rows', () => {
     const owned=add(1), legacy=add(2,{queueContext:undefined});
     expect(tasks.markStrandedQueuedForReconciliation()).toBe(1);
