@@ -21,7 +21,7 @@
     <string>/usr/bin/python3</string>
     <string>/Users/mac/.local/share/claude-mem/current/deploy/drift_status.py</string>
     <string>--repo</string>
-    <string>/Users/mac/workspace_claudeCode/claude-mem-fork</string>
+    <string>/Users/mac/work-ai/claude-mem-fork</string>
     <string>--status</string>
     <string>/Users/mac/.cache/claude-mem/source-drift.status</string>
   </array>
