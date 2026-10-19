@@ -1,4 +1,4 @@
-import { gatewayQueueEnabled } from './GatewayObserverQueue.js';
+import { gatewayQueueEnabled, readQueueHold } from './GatewayObserverQueue.js';
 import { createHash } from 'crypto';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
@@ -59,6 +59,14 @@ type ReadyTransportResume = {
   session: ActiveSession;
   state: TransportResumeState;
 };
+
+/** paused: the gateway paused the route (§6.3: shown as a gateway breaker, not a failure). */
+function durableGatewayState(hold: ReturnType<typeof readQueueHold>): object {
+  if (!hold) return {state:'open'};
+  return {state:hold.kind === 'paused' ? 'paused' : 'retry_backoff', source:'model_gateway', reason:hold.code,
+    message:hold.message, since:new Date(hold.since).toISOString(), next_probe_at:new Date(hold.until).toISOString(),
+    probe_batch:hold.batch_id};
+}
 
 export class SessionManager {
   private dbManager: DatabaseManager;
@@ -753,6 +761,15 @@ export class SessionManager {
     if (ids.length) this.dbManager.getObserverTaskStore().recordPersistedOutcome(ids, outcome);
   }
 
+  /** A definite refusal (gateway disposition `failed`): never resent, never reconciled. */
+  async failClaimed(sessionDbId: number, outcome: string): Promise<void> {
+    const ids = this.getClaimedMessages(sessionDbId)
+      .map(message => message.recoveryTaskId)
+      .filter((id): id is string => !!id);
+    if (ids.length) this.dbManager.getObserverTaskStore().recordFailed(ids, outcome);
+    await this.confirmClaimedMessages(sessionDbId);
+  }
+
   markClaimedSkipped(sessionDbId: number, reason: string): void {
     const ids = this.getClaimedMessages(sessionDbId)
       .map(message => message.recoveryTaskId)
@@ -926,7 +943,9 @@ export class SessionManager {
     return {mode:'gateway', tasks:db.prepare(`SELECT t.state,
       CASE WHEN i.task_id IS NULL THEN 'legacy' ELSE 'gateway' END AS owner,count(*) AS count
       FROM observer_tasks t LEFT JOIN observer_queue_inputs i ON i.task_id=t.id GROUP BY t.state,owner`).all(),
-      batches:db.prepare('SELECT state,count(*) AS count FROM observer_queue_batches GROUP BY state').all()};
+      batches:db.prepare('SELECT state,count(*) AS count FROM observer_queue_batches GROUP BY state').all(),
+      // The model gateway's own hold on this route, apart from any business-side switch.
+      gateway:durableGatewayState(readQueueHold(db))};
   }
 
   /**

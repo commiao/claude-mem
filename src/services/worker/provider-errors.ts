@@ -82,6 +82,12 @@ export interface ProviderErrorDetail {
   /** Overrides the outcome derived from `kind`; see PaidSendOutcome. */
   paidSendOutcome?: PaidSendOutcome;
   /**
+   * The model gateway's disposition (retry/paused/failed/reconciliation) when
+   * the error carried one; see gateway-disposition.ts. Only `reconciliation`
+   * marks the claimed work for reconciliation.
+   */
+  gatewayDisposition?: string;
+  /**
    * A streamed request failed in transport (network error, idle timeout, a
    * stream that ended early) before the model produced any output. withRetry's
    * `retryBeforeOutput` may resend such a failure once, against the batch's
@@ -102,6 +108,7 @@ export class ClassifiedProviderError extends Error {
   /** Set by the provider, or by withRetry for the batch it sent; see ProviderErrorDetail. */
   clientAttemptId?: string;
   readonly paidSendOutcome?: PaidSendOutcome;
+  readonly gatewayDisposition?: string;
   /** Set by the streaming request path; see ProviderErrorDetail.failedBeforeOutput. */
   failedBeforeOutput?: boolean;
 
@@ -140,6 +147,9 @@ export class ClassifiedProviderError extends Error {
     }
     if (opts.failedBeforeOutput !== undefined) {
       this.failedBeforeOutput = opts.failedBeforeOutput;
+    }
+    if (opts.gatewayDisposition !== undefined) {
+      this.gatewayDisposition = opts.gatewayDisposition;
     }
   }
 }

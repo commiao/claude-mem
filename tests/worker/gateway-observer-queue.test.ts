@@ -20,7 +20,7 @@ describe('durable gateway observer batches', () => {
     tasks=new ObserverTaskStore(db);
     session=store.createSDKSession('source-session','project','user request');
     manager={getConnection:()=>db,getSessionStore:()=>store,getObserverTaskStore:()=>tasks,getCloudSync:()=>null};
-    config={url:'http://127.0.0.1:39000',tokenFile:join(dir,'token'),maxItems:2,maxBytes:64000};
+    config={url:'http://127.0.0.1:39000',tokenFile:join(dir,'token'),maxItems:2,maxBytes:64000,submitsPerMinute:600};
     ModeManager.getInstance().loadMode('code');
   });
   afterEach(() => {db.close();rmSync(dir,{recursive:true,force:true});});

@@ -882,6 +882,65 @@ describe('ResponseProcessor', () => {
       );
     });
 
+    // fleet-ops model-gateway-integration §7: a gateway refusal the CLI returns
+    // as the whole response is handled by its disposition, not as transport prose.
+    describe('model gateway disposition in the response text', () => {
+      function gatewayManager() {
+        return {
+          markClaimedSkipped: mock(() => {}),
+          markClaimedNeedsReconciliation: mock(() => {}),
+          failClaimed: mock(() => Promise.resolve()),
+          getMessageIterator: async function* () { yield* []; },
+          getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+          confirmClaimedMessages: mock(() => Promise.resolve(0)),
+          resetProcessingToPending: mock(() => Promise.resolve(0)),
+        } as any;
+      }
+      const envelope = (error: object) => `API Error: 503 ${JSON.stringify({ type: 'error', error })}`;
+
+      it('paused: keeps the batch, pauses on the gateway window, no reconciliation', async () => {
+        const manager = gatewayManager();
+        const session = createMockSession();
+        await processAgentResponse(envelope({ code: 'business_route_disabled', disposition: 'paused' }),
+          session, mockDbManager, manager, mockWorker, 100, null, 'TestAgent');
+        expect(session.abortReason).toBe('quota:gateway_paused');
+        expect(session.abortController.signal.aborted).toBe(true);
+        expect(manager.resetProcessingToPending).toHaveBeenCalledWith(1);
+        expect(manager.markClaimedNeedsReconciliation).not.toHaveBeenCalled();
+        expect(manager.failClaimed).not.toHaveBeenCalled();
+      });
+
+      it('retry: keeps the batch and backs off, no reconciliation', async () => {
+        const manager = gatewayManager();
+        const session = createMockSession();
+        await processAgentResponse(envelope({ code: 'cost_limit_exceeded', disposition: 'retry', same_key: true }),
+          session, mockDbManager, manager, mockWorker, 100, null, 'TestAgent');
+        expect(session.abortReason).toBe('quota:gateway_retry');
+        expect(manager.resetProcessingToPending).toHaveBeenCalledWith(1);
+        expect(manager.markClaimedNeedsReconciliation).not.toHaveBeenCalled();
+      });
+
+      it('failed: marks the batch failed and does not resend it', async () => {
+        const manager = gatewayManager();
+        const session = createMockSession();
+        await processAgentResponse(envelope({ code: 'cost_limit_exceeded', disposition: 'failed' }),
+          session, mockDbManager, manager, mockWorker, 100, null, 'TestAgent');
+        expect(manager.failClaimed).toHaveBeenCalledWith(1, 'gateway_failed:cost_limit_exceeded');
+        expect(manager.resetProcessingToPending).not.toHaveBeenCalled();
+        expect(manager.markClaimedNeedsReconciliation).not.toHaveBeenCalled();
+        expect(session.abortReason).toBeFalsy();
+      });
+
+      it('reconciliation: the only gateway answer written for reconciliation', async () => {
+        const manager = gatewayManager();
+        const session = createMockSession();
+        await processAgentResponse(`API Error: 408 ${JSON.stringify({ type: 'error', error: { code: 'provider_timeout', disposition: 'reconciliation' } })}`,
+          session, mockDbManager, manager, mockWorker, 100, null, 'TestAgent');
+        expect(manager.markClaimedNeedsReconciliation).toHaveBeenCalledWith(1);
+        expect(session.abortReason).toBe('transport:observer_text');
+      });
+    });
+
     it('still confirms ordinary prose so low-signal batches do not loop', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
       const resetProcessingToPending = mock(() => Promise.resolve(0));

@@ -241,6 +241,12 @@ export class ObserverTaskStore {
     this.db.transaction(() => { for (const id of ids) update.run(outcome, id); })();
   }
 
+  recordFailed(ids: string[], outcome: string): void {
+    const update = this.db.prepare(`UPDATE observer_tasks SET state = 'failed', outcome = ?,
+      version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state IN ('queued', 'running')`);
+    this.db.transaction(() => { for (const id of ids) update.run(outcome, id); })();
+  }
+
   recordSkipped(ids: string[], reason: string): void {
     const update = this.db.prepare(`UPDATE observer_tasks SET state = 'skipped', outcome = ?,
       version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state IN ('queued', 'running')`);

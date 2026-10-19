@@ -9,9 +9,38 @@ import { ModeManager } from '../domain/ModeManager.js';
 import { extractObservationFileEvidence, sanitizeObservationFiles, normalizeSummaryForStorage, attachObservationFilesToSummary } from './agents/ResponseProcessor.js';
 import { getWorkerPort } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
+import { bodyGatewayDisposition, jobErrorDisposition, type GatewayDisposition } from './gateway-disposition.js';
 
 export function gatewayQueueEnabled(): boolean { return !!process.env.CLAUDE_MEM_LLM_QUEUE_URL; }
-export interface QueueConfig { url: string; tokenFile: string; tokenEnv?: boolean; maxItems: number; maxBytes: number; }
+export interface QueueConfig { url: string; tokenFile: string; tokenEnv?: boolean; maxItems: number; maxBytes: number;
+  /** Submits per minute; the gateway maintainer's per-minute limit for claude_mem.observation. */
+  submitsPerMinute?: number; }
+/** credvault config/routes.nas.json claude_mem.observation limits.requests_per_minute (2026-10-19). */
+export const DEFAULT_SUBMITS_PER_MINUTE = 60;
+/** A paused route is probed this often (fleet-ops integration §6.3: kg-hub uses 300 s). */
+export const PAUSE_PROBE_MS = 300_000;
+/** retry without retry_after_seconds: 15 s doubling per consecutive refusal, capped. */
+export const RETRY_BACKOFF_BASE_MS = 15_000;
+export const MAX_HOLD_MS = 900_000;
+/** A failed job that the gateway says may be retried gets this many new keys. */
+export const MAX_REKEYS = 3;
+/** An unknown outcome is re-read on this interval, never re-sent. */
+export const RECONCILIATION_RECHECK_MS = 60_000;
+
+/** A non-2xx queue response with the gateway's own error body. */
+export class GatewayQueueHttpError extends Error {
+  constructor(readonly status: number, readonly body: unknown) {
+    super(`observer_queue_http_${status}`);
+    this.name = 'GatewayQueueHttpError';
+  }
+}
+
+/** The route-wide hold the gateway asked for; persisted so a restart keeps it. */
+export interface QueueHold { kind: 'paused' | 'retry'; code: string | null; message: string | null;
+  batch_id: string | null; since: number; until: number; streak: number; }
+export function readQueueHold(db: ReturnType<DatabaseManager['getConnection']>): QueueHold | null {
+  return (db.prepare('SELECT kind,code,message,batch_id,since,until,streak FROM observer_queue_hold WHERE id=1').get() as QueueHold | null) ?? null;
+}
 export function queueConfig(): QueueConfig {
   const url = new URL(process.env.CLAUDE_MEM_LLM_QUEUE_URL!);
   if (url.username || url.password || url.search || url.hash || url.pathname !== '/' ||
@@ -25,9 +54,11 @@ export function queueConfig(): QueueConfig {
   if (!tokenFile) throw new Error('observer_queue_token_file_required');
   const maxItems = Number(process.env.CLAUDE_MEM_LLM_BATCH_ITEMS || 20);
   const maxBytes = Number(process.env.CLAUDE_MEM_LLM_BATCH_BYTES || 64000);
+  const submitsPerMinute = Number(process.env.CLAUDE_MEM_LLM_SUBMITS_PER_MINUTE || DEFAULT_SUBMITS_PER_MINUTE);
   if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 20 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 4096 || maxBytes > 256000) throw new Error('invalid_observer_batch_budget');
-  return {url: url.origin, tokenFile, tokenEnv: !!envFile, maxItems, maxBytes};
+  if (!Number.isSafeInteger(submitsPerMinute) || submitsPerMinute < 1 || submitsPerMinute > 600) throw new Error('invalid_observer_submit_rate');
+  return {url: url.origin, tokenFile, tokenEnv: !!envFile, maxItems, maxBytes, submitsPerMinute};
 }
 
 export function initializeQueueTables(db: ReturnType<DatabaseManager['getConnection']>): void {
@@ -38,9 +69,13 @@ export function initializeQueueTables(db: ReturnType<DatabaseManager['getConnect
     state TEXT NOT NULL DEFAULT 'pending', result TEXT, receipt TEXT,
     acknowledged INTEGER NOT NULL DEFAULT 0, error TEXT, created_at INTEGER NOT NULL,
     checked_at INTEGER NOT NULL DEFAULT 0)`);
-  if (!(db.prepare('PRAGMA table_info(observer_queue_batches)').all() as any[]).some(c=>c.name==='checked_at')) {
-    db.run('ALTER TABLE observer_queue_batches ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0');
+  const columns = (db.prepare('PRAGMA table_info(observer_queue_batches)').all() as any[]).map(c=>c.name);
+  for (const column of ['checked_at','next_check_at','attempt']) if (!columns.includes(column)) {
+    db.run(`ALTER TABLE observer_queue_batches ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
   }
+  db.run(`CREATE TABLE IF NOT EXISTS observer_queue_hold (
+    id INTEGER PRIMARY KEY CHECK (id=1), kind TEXT NOT NULL, code TEXT, message TEXT, batch_id TEXT,
+    since INTEGER NOT NULL, until INTEGER NOT NULL, streak INTEGER NOT NULL DEFAULT 0)`);
   db.run(`CREATE TABLE IF NOT EXISTS observer_queue_members (
     task_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL)`);
 }
@@ -57,8 +92,10 @@ export class GatewayObserverQueue {
   private stopped = false;
   private loop?: Promise<void>;
   private abort = new AbortController();
+  /** Submit times within the last minute; the throttle in front of the route limit (§7.3). */
+  private submits: number[] = [];
   constructor(private manager: DatabaseManager, private config: QueueConfig,
-              private fetcher: typeof fetch = fetch) {
+              private fetcher: typeof fetch = fetch, private now: () => number = Date.now) {
     initializeQueueTables(manager.getConnection());
   }
   start(): void { this.loop = this.run(); }
@@ -75,7 +112,11 @@ export class GatewayObserverQueue {
       headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`,
                ...(key ? {'Idempotency-Key':key} : {})}, body:JSON.stringify(body),
     });
-    if (!response.ok) throw new Error(`observer_queue_http_${response.status}`);
+    if (!response.ok) {
+      let body: unknown = null;
+      try { body = await response.json(); } catch {}
+      throw new GatewayQueueHttpError(response.status, body);
+    }
     const value: any = await response.json();
     if (value.version !== 1) throw new Error('observer_queue_contract_mismatch');
     return value;
@@ -139,7 +180,7 @@ export class GatewayObserverQueue {
       const raw = JSON.stringify(body);
       const id = 'cmq-'+createHash('sha256').update(JSON.stringify(selected.map(r=>r.id))).digest('hex');
       db.prepare('INSERT INTO observer_queue_batches(id,session_db_id,body,created_at) VALUES(?,?,?,?)')
-        .run(id,first.session_db_id,raw,Date.now());
+        .run(id,first.session_db_id,raw,this.now());
       for (const row of selected) {
         db.prepare('INSERT INTO observer_queue_members(task_id,batch_id) VALUES(?,?)').run(row.id,id);
         db.prepare("UPDATE observer_tasks SET state='running',version=version+1 WHERE id=?").run(row.id);
@@ -178,18 +219,38 @@ export class GatewayObserverQueue {
       throw new Error('observer_queue_identity_mismatch');
     }
     if (job.state === 'queued' || job.state === 'running') {
-      db.prepare("UPDATE observer_queue_batches SET state='submitted' WHERE id=?").run(batch.id);
+      // The gateway keeps a refused job queued and re-dispatches it under the
+      // same key itself; the business only stops adding to the route.
+      const refusal = job.state === 'queued' && job.error ? jobErrorDisposition(job.error) : null;
+      if (refusal?.disposition === 'paused' || refusal?.disposition === 'retry') {
+        const until = this.arm(refusal, batch.id);
+        db.prepare('UPDATE observer_queue_batches SET state=?,error=?,next_check_at=? WHERE id=?')
+          .run(refusal.disposition === 'paused' ? 'paused' : 'submitted',JSON.stringify(job.error),until,batch.id);
+        return;
+      }
+      db.prepare("UPDATE observer_queue_batches SET state='submitted',error=NULL,next_check_at=0 WHERE id=?").run(batch.id);
       return;
     }
     if (job.state !== 'succeeded') {
       if (!['failed','reconciliation'].includes(job.state)) throw new Error('invalid_observer_queue_state');
+      const outcome = job.state === 'failed' ? jobErrorDisposition(job.error) : null;
+      if ((outcome?.disposition === 'retry' || outcome?.disposition === 'paused') && (batch.attempt ?? 0) < MAX_REKEYS) {
+        // A terminal job the gateway says may be retried: the old key already
+        // has its terminal record, so the same request goes out under a new key.
+        this.rekey(batch, job.error, outcome, true);
+        return;
+      }
+      // Only reconciliation, or a failed job without a disposition, is unknown (§7.2).
+      const failed = outcome?.disposition === 'failed' || outcome?.disposition === 'retry' || outcome?.disposition === 'paused';
       db.transaction(() => {
-        db.prepare('UPDATE observer_queue_batches SET state=?,error=? WHERE id=?')
-          .run(job.state,JSON.stringify(job.error || {}),batch.id);
-        if (job.state === 'failed') db.prepare('UPDATE observer_queue_batches SET receipt=? WHERE id=?')
+        db.prepare('UPDATE observer_queue_batches SET state=?,error=?,next_check_at=? WHERE id=?')
+          .run(failed ? 'failed' : 'reconciliation',JSON.stringify(job.error || {}),
+               failed ? 0 : this.now()+RECONCILIATION_RECHECK_MS,batch.id);
+        // The receipt is immutable: an unknown outcome gets none until it is settled.
+        if (failed) db.prepare('UPDATE observer_queue_batches SET receipt=? WHERE id=?')
           .run(JSON.stringify({state:'failed',reference:'sqlite:observer_queue_batches:'+batch.id}),batch.id);
         for (const row of rows) db.prepare('UPDATE observer_tasks SET state=?,version=version+1 WHERE id=?')
-          .run(job.state === 'failed' ? 'failed' : 'reconciliation',row.id);
+          .run(failed ? 'failed' : 'reconciliation',row.id);
       })();
       return;
     }
@@ -232,18 +293,139 @@ export class GatewayObserverQueue {
     this.manager.getCloudSync()?.notify();
   }
 
+  /** Same request, new idempotency key; an old gateway job keeps its failed receipt. */
+  private rekey(batch: any, error: unknown, outcome: GatewayDisposition, hasJob: boolean): void {
+    const db = this.manager.getConnection(), attempt = (batch.attempt ?? 0)+1;
+    const id = 'cmq-'+createHash('sha256').update(JSON.stringify({retry_of:batch.id,attempt})).digest('hex');
+    db.transaction(() => {
+      db.prepare('INSERT OR IGNORE INTO observer_queue_batches(id,session_db_id,body,created_at,attempt) VALUES(?,?,?,?,?)')
+        .run(id,batch.session_db_id,batch.body,this.now(),attempt);
+      db.prepare('UPDATE observer_queue_members SET batch_id=? WHERE batch_id=?').run(id,batch.id);
+      db.prepare("UPDATE observer_queue_batches SET state='superseded',error=?,receipt=? WHERE id=?")
+        .run(JSON.stringify(error || {}),
+             hasJob ? JSON.stringify({state:'failed',reference:'sqlite:observer_queue_batches:'+batch.id}) : null,batch.id);
+    })();
+    this.arm(outcome, id);
+  }
+
+  hold(): QueueHold | null { return readQueueHold(this.manager.getConnection()); }
+  private holdActive(): boolean { const hold = this.hold(); return !!hold && hold.until > this.now(); }
+  private clearHold(): void { this.manager.getConnection().prepare('DELETE FROM observer_queue_hold WHERE id=1').run(); }
+
+  /** Stop the route for the gateway's wait; returns when the batch is next looked at. */
+  private arm(refusal: GatewayDisposition, batchId: string): number {
+    const now = this.now(), prior = this.hold();
+    // A pause outranks a backoff: a retry seen while paused does not shorten the probe interval.
+    if (prior && prior.until > now && prior.kind === 'paused' && refusal.disposition === 'retry') return prior.until;
+    const kind = refusal.disposition === 'paused' ? 'paused' : 'retry';
+    const streak = prior?.kind === kind ? prior.streak+1 : 0;
+    const wait = refusal.retryAfterMs ?? (kind === 'paused' ? PAUSE_PROBE_MS : RETRY_BACKOFF_BASE_MS*2**Math.min(streak,6));
+    const until = now+Math.min(Math.max(wait,1000),MAX_HOLD_MS);
+    this.manager.getConnection().prepare(`INSERT OR REPLACE INTO observer_queue_hold(id,kind,code,message,batch_id,since,until,streak)
+      VALUES(1,?,?,?,?,?,?,?)`).run(kind,refusal.code ?? null,refusal.message ?? null,batchId,
+        prior?.kind === kind ? prior.since : now,until,streak);
+    if (prior?.kind !== kind) logger.warn('QUEUE', kind === 'paused'
+      ? 'Model gateway paused this route; new batches stop until a probe sees it back'
+      : 'Model gateway deferred this route; backing off before the next submit',
+      {code:refusal.code,until:new Date(until).toISOString(),batchId});
+    return until;
+  }
+
+  /** The route throttle (§7.3): never more submits per minute than the route allows. */
+  private takeSubmitSlot(): boolean {
+    const now = this.now();
+    this.submits = this.submits.filter(t => t > now-60_000);
+    if (this.submits.length >= (this.config.submitsPerMinute ?? DEFAULT_SUBMITS_PER_MINUTE)) return false;
+    this.submits.push(now);
+    return true;
+  }
+
+  /** A queue call refused with the gateway's error body (not a job outcome). */
+  private refused(batch: any, error: unknown): void {
+    if (!(error instanceof GatewayQueueHttpError) || batch.receipt) return;
+    const refusal = bodyGatewayDisposition(error.body);
+    if (refusal?.disposition === 'paused') this.arm(refusal, batch.id);
+    else if (refusal?.disposition === 'retry') {
+      if (!refusal.sameKey && batch.state === 'pending' && (batch.attempt ?? 0) < MAX_REKEYS) this.rekey(batch, error.body, refusal, false);
+      else this.arm(refusal, batch.id);
+    } else if (refusal?.disposition === 'failed' && batch.state === 'pending') {
+      // Refused at submit: no job exists, so there is no receipt to give.
+      const db = this.manager.getConnection();
+      db.transaction(() => {
+        db.prepare("UPDATE observer_queue_batches SET state='failed',error=? WHERE id=?").run(JSON.stringify(error.body),batch.id);
+        for (const row of this.members(batch.id)) db.prepare("UPDATE observer_tasks SET state='failed',version=version+1 WHERE id=?").run(row.id);
+      })();
+    }
+  }
+
+  /** True when the gateway answered (a job state, or a refusal with a disposition). */
+  private async attempt(batch: any): Promise<boolean> {
+    try { await this.processBatch(batch); return true; }
+    catch (error) {
+      if (this.stopped) return false;
+      this.refused(batch, error);
+      logger.error('QUEUE','Observer batch remains durable',{batchId:batch.id},error as Error);
+      return error instanceof GatewayQueueHttpError && !!bodyGatewayDisposition(error.body);
+    }
+    finally { this.manager.getConnection().prepare('UPDATE observer_queue_batches SET checked_at=? WHERE id=?').run(this.now(),batch.id); }
+  }
+
+  /**
+   * While the gateway holds the route nothing is batched or submitted. When the
+   * wait is over, one probe (the batch that met the refusal) goes first; the
+   * route reopens only if the gateway no longer refuses it.
+   */
+  private async probe(): Promise<boolean> {
+    const hold = this.hold();
+    if (!hold) return false;
+    if (hold.until > this.now()) return true;
+    const db = this.manager.getConnection();
+    const batch = db.prepare(`SELECT * FROM observer_queue_batches WHERE id=? AND receipt IS NULL
+      AND state IN ('pending','submitted','paused')`).get(hold.batch_id) as any;
+    if (batch) {
+      if (batch.state === 'pending') this.takeSubmitSlot();
+      const answered = await this.attempt(batch);
+      if (this.holdActive()) return true;
+      if (!answered) {
+        // No answer from the gateway (network, relay): wait another interval.
+        db.prepare('UPDATE observer_queue_hold SET until=? WHERE id=1')
+          .run(this.now()+(hold.kind === 'paused' ? PAUSE_PROBE_MS : RETRY_BACKOFF_BASE_MS));
+        return true;
+      }
+    }
+    this.clearHold();
+    return false;
+  }
+
   async cycle(): Promise<void> {
+    const db = this.manager.getConnection();
+    if (await this.probe()) {
+      // Business receipts are not model calls; they still drain while held.
+      for (const batch of db.prepare(`SELECT * FROM observer_queue_batches WHERE receipt IS NOT NULL
+        AND acknowledged=0 ORDER BY checked_at,created_at,id LIMIT 64`).all() as any[]) {
+        if (this.stopped) return;
+        await this.attempt(batch);
+      }
+      return;
+    }
     // Preparing several independent batches lets a single busy source session
     // fill gateway slots; this does not impose a model-execution concurrency limit.
-    for (let i=0;i<8;i++) if (!this.prepareBatch()) break;
-    const batches = this.manager.getConnection().prepare(`SELECT * FROM observer_queue_batches
-      WHERE state IN ('pending','submitted') OR (state='reconciliation' AND error!='invalid_model_output') OR (receipt IS NOT NULL AND acknowledged=0) ORDER BY checked_at,created_at,id LIMIT 64`).all() as any[];
+    // At most 8 prepared batches wait for a submit slot.
+    const waiting = () => (db.prepare("SELECT count(*) AS n FROM observer_queue_batches WHERE state='pending' AND receipt IS NULL").get() as any).n;
+    for (let i=0;i<8 && waiting()<8;i++) if (!this.prepareBatch()) break;
+    const batches = db.prepare(`SELECT * FROM observer_queue_batches
+      WHERE (state IN ('pending','submitted','paused') OR (state='reconciliation' AND error!='invalid_model_output')
+        OR (receipt IS NOT NULL AND acknowledged=0)) AND (next_check_at<=? OR (receipt IS NOT NULL AND acknowledged=0))
+      ORDER BY checked_at,created_at,id LIMIT 64`).all(this.now()) as any[];
     // Short submit/status operations only. No long-lived SDK process or session.
     for (const batch of batches) {
       if (this.stopped) return;
-      try { await this.processBatch(batch); }
-      catch (error) { if (!this.stopped) logger.error('QUEUE','Observer batch remains durable',{batchId:batch.id},error as Error); }
-      finally { this.manager.getConnection().prepare('UPDATE observer_queue_batches SET checked_at=? WHERE id=?').run(Date.now(),batch.id); }
+      const submits = batch.state === 'pending' && !batch.receipt;
+      // A refusal met earlier in this cycle stops every further submit and
+      // status read; receipts still go through.
+      if (!batch.receipt && this.holdActive()) continue;
+      if (submits && !this.takeSubmitSlot()) continue;
+      await this.attempt(batch);
     }
   }
   private async run(): Promise<void> {

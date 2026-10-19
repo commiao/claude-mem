@@ -32,6 +32,8 @@ import {
   recordAuthCooldown,
   recordQuotaExhausted,
   QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS,
+  GATEWAY_PAUSED_WINDOW,
+  isGatewayWindow,
 } from '../../../shared/quota-cooldown.js';
 import {
   CODEX_COOLDOWN_REFUSAL_CODE,
@@ -238,8 +240,16 @@ export async function startGeneratorWithProvider(
         return;
       }
 
-      // A locally withheld request never reached a provider.
-      if (classified?.code !== CODEX_COOLDOWN_REFUSAL_CODE) {
+      // The model gateway said what this refusal is: only `reconciliation` is
+      // an unknown outcome. retry/paused were refused before any provider call,
+      // so the batch waits for a later generator; failed is never resent.
+      const gatewayDisposition = classified?.gatewayDisposition;
+      if (gatewayDisposition === 'retry' || gatewayDisposition === 'paused') {
+        await sessionManager.resetProcessingToPending(session.sessionDbId);
+      } else if (gatewayDisposition === 'failed') {
+        await sessionManager.failClaimed(session.sessionDbId, `gateway_failed:${classified?.code ?? 'unknown'}`);
+      } else if (classified?.code !== CODEX_COOLDOWN_REFUSAL_CODE) {
+        // A locally withheld request never reached a provider.
         sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);
       }
 
@@ -376,9 +386,17 @@ export async function startGeneratorWithProvider(
       // A thrown classified error was already booked by the catch, once: it
       // is never re-booked here as a spent allowance (a rate limit is not
       // one), nor given a breaker over a cmem fallback's window.
-      if (normalizedReason === 'quota' && !failureBooked) {
+      const quotaWindow = reason?.split(':')[1];
+      if (normalizedReason === 'quota' && !failureBooked && isGatewayWindow(quotaWindow)) {
+        // The model gateway deferred or paused this route (ResponseProcessor):
+        // hold requests for the window, then one probe. Not an observer
+        // failure, so nothing is booked in the health ledger (§6.3).
+        recordQuotaExhausted(provider, quotaWindow === GATEWAY_PAUSED_WINDOW
+          ? 'Model gateway paused this route' : 'Model gateway deferred this route',
+          quotaWindow, undefined, session.observerProfile);
+      } else if (normalizedReason === 'quota' && !failureBooked) {
         const quotaMessage = 'Provider reported the inference allowance exhausted';
-        recordQuotaExhausted(provider, quotaMessage, reason?.split(':')[1], undefined, session.observerProfile);
+        recordQuotaExhausted(provider, quotaMessage, quotaWindow, undefined, session.observerProfile);
         // Quota returned as assistant prose never throws, so it never reaches
         // the .catch above and never armed the health ledger. Without this the
         // session-start warning is structurally blind to an entire outage
@@ -520,6 +538,12 @@ function bookClassifiedFailure(
   error: ClassifiedProviderError,
 ): number | null {
   let resumeAfterMs: number | null = null;
+  if (error.kind === 'gateway_paused') {
+    // A paused gateway route is a deliberate stop, not a failure (§6.3): hold
+    // requests and probe once per window, without touching the health ledger.
+    recordQuotaExhausted(provider, error.message, GATEWAY_PAUSED_WINDOW, undefined, session.observerProfile);
+    return null;
+  }
   switch (error.kind) {
     case 'quota_exhausted':
       // A spent allowance: withhold requests for a cooldown, then let one
@@ -554,6 +578,8 @@ function bookClassifiedFailure(
       break;
     }
   }
+  // A gateway retry (a per-minute admission limit) is a deferral, not an outage.
+  if (error.gatewayDisposition === 'retry') return resumeAfterMs;
   recordObserverFailure(provider, {
     message: error.message,
     kind: error.kind,
