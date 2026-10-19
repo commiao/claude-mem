@@ -18,6 +18,7 @@ plugin/data/
 plugin/data.backup/
 plugin/evals-read-gate/results/
 package-lock.json
+!build-lock/package-lock.json
 bun.lock
 !plugin/bun.lock
 !workers/sync-hub/bun.lock
