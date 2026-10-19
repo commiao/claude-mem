@@ -18,7 +18,8 @@ import { notifyGrokBotIndex } from '../../integrations/GrokBotIndexWriter.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { recordObserverFailure, recordObserverSuccess } from '../../../shared/observer-health.js';
-import { clearQuotaCooldown } from '../../../shared/quota-cooldown.js';
+import { clearQuotaCooldown, GATEWAY_PAUSED_WINDOW, GATEWAY_RETRY_WINDOW } from '../../../shared/quota-cooldown.js';
+import { gatewayDispositionFromText } from '../gateway-disposition.js';
 import { recycleObserverConversation } from '../session/recycle-conversation.js';
 import { clearRejectedOutput, recordRejectedOutput } from '../session/OutputRecovery.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
@@ -439,6 +440,38 @@ export async function processAgentResponse(
     'claude';
 
   if (!parsed.valid) {
+    // A model-gateway refusal returned as the whole response: its disposition
+    // decides (fleet-ops model-gateway-integration §7), before any prose rule —
+    // a paused route answers 503, which would otherwise read as a transport
+    // fault and be written for reconciliation.
+    const gateway = gatewayDispositionFromText(text);
+    if (gateway?.disposition === 'failed') {
+      session.consecutiveInvalidOutputs = 0;
+      await sessionManager.failClaimed(session.sessionDbId, `gateway_failed:${gateway.code ?? 'unknown'}`);
+      worker?.broadcastProcessingStatus?.();
+      logger.error('PARSER', `${agentName} request refused by the model gateway; batch marked failed`, {
+        sessionId: session.sessionDbId, code: gateway.code,
+      });
+      return null;
+    }
+    if (gateway?.disposition === 'paused' || gateway?.disposition === 'retry') {
+      session.consecutiveInvalidOutputs = 0;
+      await sessionManager.resetProcessingToPending(session.sessionDbId);
+      session.abortReason = `quota:${gateway.disposition === 'paused' ? GATEWAY_PAUSED_WINDOW : GATEWAY_RETRY_WINDOW}`;
+      try {
+        session.abortController.abort();
+      } catch {
+        // best-effort; AbortController.abort() should not throw in normal use.
+      }
+      worker?.broadcastProcessingStatus?.();
+      logger.warn('PARSER', gateway.disposition === 'paused'
+        ? `Model gateway paused this route; ${agentName} keeps the batch and probes after the cooldown`
+        : `Model gateway deferred this request; ${agentName} keeps the batch and backs off`, {
+        sessionId: session.sessionDbId, code: gateway.code,
+      });
+      return null;
+    }
+
     // The conversation filled up. Retire it and start a fresh generation
     // seeded with this session's own observations, rather than re-queueing into
     // a conversation that can only keep growing.
@@ -497,7 +530,7 @@ export async function processAgentResponse(
     // run. Preserve the batch like the quota and auth cases above; confirming
     // it here would turn a transient network fault into permanent data loss
     // (#3752).
-    if (isTransportFailureObserverOutput(text)) {
+    if (gateway?.disposition === 'reconciliation' || isTransportFailureObserverOutput(text)) {
       session.consecutiveInvalidOutputs = 0;
 
       sessionManager.markClaimedNeedsReconciliation(session.sessionDbId);

@@ -33,6 +33,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
 import { describeObserverOutputShape, formatEmptyOutputReason } from '../../sdk/output-classifier.js';
 import { ClassifiedProviderError, isClassified } from './provider-errors.js';
+import { bodyGatewayDisposition, gatewayDispositionFromText, type GatewayDisposition } from './gateway-disposition.js';
 import { resolveSummaryTierModel, resolveTierAlias } from './model-aliases.js';
 import { accumulateClaudeUsage, observerUsageLogFields } from './observer-usage.js';
 import {
@@ -124,6 +125,18 @@ function isSpawnFailure(error: unknown): boolean {
 }
 
 /**
+ * The model gateway's disposition on a Claude error: the Anthropic SDK keeps the
+ * error body on `error`, other wrappers on `body`, and the CLI quotes it in the
+ * message (`API Error: 503 {...}`).
+ */
+function claudeGatewayDisposition(err: unknown, message: string): GatewayDisposition | null {
+  const errAny = err as { error?: unknown; body?: unknown } | null;
+  let body = errAny?.body;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = null; } }
+  return bodyGatewayDisposition(errAny?.error) ?? bodyGatewayDisposition(body) ?? gatewayDispositionFromText(message);
+}
+
+/**
  * Classify a ClaudeProvider error (executable spawn failures, SDK errors,
  * Anthropic API errors). Provider-specific because it relies on:
  *   - SDK error class names (e.g. OverloadedError) when present
@@ -159,6 +172,27 @@ export function classifyClaudeError(err: unknown): ClassifiedProviderError {
   // for it would cost more than the retry.
   if (message.startsWith(`${OBSERVER_WORKING_DIRECTORY_ERROR_PREFIX}: `)) {
     return new ClassifiedProviderError(message, { kind: 'setup_required', code: OBSERVER_DIR_UNUSABLE_CODE, cause: err });
+  }
+
+  // Through the model gateway the error says what to do next (fleet-ops
+  // model-gateway-integration §7). It decides before any status or code: a 503
+  // can be a paused route, and cost_limit_exceeded is a retry or a failure.
+  const gateway = claudeGatewayDisposition(err, message);
+  if (gateway) {
+    const detail = { cause: err, gatewayDisposition: gateway.disposition, ...(gateway.code ? { code: gateway.code } : {}) };
+    switch (gateway.disposition) {
+      case 'paused':
+        return new ClassifiedProviderError(message, { kind: 'gateway_paused', paidSendOutcome: 'refused_before_work', ...detail });
+      case 'retry':
+        return new ClassifiedProviderError(message, {
+          kind: 'rate_limit', paidSendOutcome: 'refused_before_work',
+          ...(gateway.retryAfterMs !== undefined ? { retryAfterMs: gateway.retryAfterMs } : {}), ...detail,
+        });
+      case 'failed':
+        return new ClassifiedProviderError(message, { kind: 'unrecoverable', paidSendOutcome: 'rejected', ...detail });
+      default:
+        return new ClassifiedProviderError(message, { kind: 'transient', paidSendOutcome: 'ambiguous', ...detail });
+    }
   }
 
   // Anthropic auth failures.

@@ -196,7 +196,21 @@ export const RATE_LIMIT_RECHECK_COOLDOWN_MS = 90_000;
  * or absent window keeps the full quota cooldown, so an unfamiliar provider is
  * never treated as transient by accident.
  */
-const TRANSIENT_QUOTA_WINDOWS = new Set(['rate_limit']);
+const TRANSIENT_QUOTA_WINDOWS = new Set(['rate_limit', 'gateway_retry']);
+
+/**
+ * Windows armed by the model gateway's disposition field (fleet-ops
+ * model-gateway-integration §7). `gateway_retry` is a refusal before any
+ * provider call (a per-minute admission limit): it clears like a rate limit.
+ * `gateway_paused` is a paused route (business breaker, provider circuit): it is
+ * probed on a long bounded interval, never booked as an observer failure.
+ */
+export const GATEWAY_RETRY_WINDOW = 'gateway_retry';
+export const GATEWAY_PAUSED_WINDOW = 'gateway_paused';
+export const GATEWAY_PAUSED_RECHECK_COOLDOWN_MS = 300_000;
+export function isGatewayWindow(window: string | undefined): boolean {
+  return window === GATEWAY_RETRY_WINDOW || window === GATEWAY_PAUSED_WINDOW;
+}
 
 /**
  * The cooldown an armed window is entitled to. Read from the window rather than
@@ -210,6 +224,7 @@ const TRANSIENT_QUOTA_WINDOWS = new Set(['rate_limit']);
  * `syncObserverHealthQuotaCooldown`, where it overrides this.
  */
 export function resolveQuotaCooldownMs(window: string | undefined): number {
+  if (window === GATEWAY_PAUSED_WINDOW) return GATEWAY_PAUSED_RECHECK_COOLDOWN_MS;
   return window !== undefined && TRANSIENT_QUOTA_WINDOWS.has(window)
     ? RATE_LIMIT_RECHECK_COOLDOWN_MS
     : QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS;
