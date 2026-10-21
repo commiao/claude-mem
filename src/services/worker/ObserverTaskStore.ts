@@ -671,10 +671,15 @@ export class ObserverTaskStore {
   }
 
   listReportableAfter(afterId: string, limit = 20): ObserverTaskRow[] {
+    // `+state` keeps the planner off idx_observer_tasks_state. With that index it
+    // matched every task, read each row's payload and sorted them all to return
+    // 20: 267 MB per call at 40k tasks, every 10 s on the mailbox tick, blocking
+    // /api/health for 0.5–3.5 s (2026-10-22). The primary key walks id > ? in
+    // order and stops after `limit` rows.
     return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
       content_session_id AS contentSessionId, source_id AS sourceId, payload,
       state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
-      WHERE state IN ('queued', 'running', 'reconciliation', 'succeeded', 'skipped', 'failed')
+      WHERE +state IN ('queued', 'running', 'reconciliation', 'succeeded', 'skipped', 'failed')
         AND id > ? ORDER BY id LIMIT ?`)
       .all(afterId, Math.min(Math.max(limit, 1), 100)) as ObserverTaskRow[];
   }
