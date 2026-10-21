@@ -2626,7 +2626,7 @@ For more info: https://docs.claude-mem.ai/antigravity-cli/setup
       WHERE state = ? ORDER BY created_at, id LIMIT ?`).all(e,Math.min(Math.max(r,1),500))}listReportableAfter(e,r=20){return this.db.prepare(`SELECT id, session_db_id AS sessionDbId,
       content_session_id AS contentSessionId, source_id AS sourceId, payload,
       state, actual_calls AS actualCalls, version, outcome FROM observer_tasks
-      WHERE state IN ('queued', 'running', 'reconciliation', 'succeeded', 'skipped', 'failed')
+      WHERE +state IN ('queued', 'running', 'reconciliation', 'succeeded', 'skipped', 'failed')
         AND id > ? ORDER BY id LIMIT ?`).all(e,Math.min(Math.max(r,1),100))}};Co();var Uve=require("os"),Fve=require("crypto");Z();Rp();Xe();Te();zp();var KI=`
 \u2026[truncated by cloud sync at 200000 bytes; the full prompt stays on the device that captured it]`,_4=`
         CASE WHEN length(CAST(up.prompt_text AS BLOB)) > 200000
