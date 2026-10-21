@@ -78,6 +78,15 @@ export function initializeQueueTables(db: ReturnType<DatabaseManager['getConnect
     since INTEGER NOT NULL, until INTEGER NOT NULL, streak INTEGER NOT NULL DEFAULT 0)`);
   db.run(`CREATE TABLE IF NOT EXISTS observer_queue_members (
     task_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL)`);
+  // Every batch row carries its request body (and later its result) ahead of the
+  // state columns, so a scan that filters on state reads every body's overflow
+  // pages: ~440 MB and ~3 s per scan at 17k batches (2026-10-22), synchronously
+  // on the worker's event loop. The poll loop only ever looks at open batches and
+  // unacknowledged receipts; these indexes keep it off the bodies.
+  db.run('CREATE INDEX IF NOT EXISTS idx_observer_queue_batches_state ON observer_queue_batches(state, next_check_at)');
+  db.run(`CREATE INDEX IF NOT EXISTS idx_observer_queue_batches_unacked ON observer_queue_batches(acknowledged)
+    WHERE receipt IS NOT NULL`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_observer_queue_members_batch ON observer_queue_members(batch_id)');
 }
 
 /** Save the immutable business context in the same transaction as source ingress. */
@@ -411,11 +420,13 @@ export class GatewayObserverQueue {
     // Preparing several independent batches lets a single busy source session
     // fill gateway slots; this does not impose a model-execution concurrency limit.
     // At most 8 prepared batches wait for a submit slot.
-    const waiting = () => (db.prepare("SELECT count(*) AS n FROM observer_queue_batches WHERE state='pending' AND receipt IS NULL").get() as any).n;
-    for (let i=0;i<8 && waiting()<8;i++) if (!this.prepareBatch()) break;
-    const batches = db.prepare(`SELECT * FROM observer_queue_batches
-      WHERE (state IN ('pending','submitted','paused') OR (state='reconciliation' AND error!='invalid_model_output')
-        OR (receipt IS NOT NULL AND acknowledged=0)) AND (next_check_at<=? OR (receipt IS NOT NULL AND acknowledged=0))
+    let waiting = (db.prepare("SELECT count(*) AS n FROM observer_queue_batches WHERE state='pending' AND receipt IS NULL").get() as any).n;
+    for (let i=0;i<8 && waiting<8;i++) { if (!this.prepareBatch()) break; waiting++; }
+    // Each branch is answered from its own index; only the selected rows are read.
+    const batches = db.prepare(`SELECT * FROM observer_queue_batches WHERE id IN (
+        SELECT id FROM observer_queue_batches WHERE state IN ('pending','submitted','paused','reconciliation')
+          AND next_check_at<=? AND (state!='reconciliation' OR error!='invalid_model_output')
+        UNION SELECT id FROM observer_queue_batches WHERE receipt IS NOT NULL AND acknowledged=0)
       ORDER BY checked_at,created_at,id LIMIT 64`).all(this.now()) as any[];
     // Short submit/status operations only. No long-lived SDK process or session.
     for (const batch of batches) {
