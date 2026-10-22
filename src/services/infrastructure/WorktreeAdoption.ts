@@ -1,15 +1,83 @@
 
 import path from 'path';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { logger } from '../../utils/logger.js';
 import { getPathModeProjectContext, getProjectContext } from '../../utils/project-name.js';
 import { ChromaSync, MergedIntoProjectTarget } from '../sync/ChromaSync.js';
 import { emitRemapProject, hasSyncLane } from '../sync/remap-outbox.js';
-import { paths } from '../../shared/paths.js';
+import { paths, USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { openConfiguredSqliteDatabase } from '../sqlite/connection.js';
 
 const DEFAULT_DATA_DIR = paths.dataDir();
+
+/**
+ * Which repositories still owe a Chroma `merged_into_project` patch for rows
+ * they already adopted. Without it every start re-collected every adopted row
+ * to retry the patch (5,539 ids on one install, 2026-10-22) — with Chroma off,
+ * a patch that could only fail, logged as an ERROR per repository after a
+ * chroma-mcp prewarm.
+ *
+ * A missing file predates the record: every repository may owe a patch, so
+ * each is retried once (`legacyRetryAll` until it lands, then `done`).
+ */
+interface ChromaPatchState {
+  version: 1;
+  legacyRetryAll: boolean;
+  /** Repositories whose patch landed since the record began (legacy mode only). */
+  done: string[];
+  /** Repositories whose last patch failed, or was skipped with Chroma off. */
+  pending: string[];
+}
+
+const CHROMA_PATCH_STATE_FILE = 'worktree-adoption-chroma.json';
+
+function readChromaPatchState(dataDirectory: string): ChromaPatchState {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(dataDirectory, CHROMA_PATCH_STATE_FILE), 'utf8'));
+    if (raw?.version === 1 && Array.isArray(raw.pending) && Array.isArray(raw.done)) {
+      return { version: 1, legacyRetryAll: raw.legacyRetryAll === true, done: raw.done, pending: raw.pending };
+    }
+  } catch {
+    // Missing or unreadable: fall through to the legacy retry-everything state.
+  }
+  return { version: 1, legacyRetryAll: true, done: [], pending: [] };
+}
+
+function chromaPatchOwed(state: ChromaPatchState, parentProject: string): boolean {
+  return state.pending.includes(parentProject)
+    || (state.legacyRetryAll && !state.done.includes(parentProject));
+}
+
+function recordChromaPatch(dataDirectory: string, parentProject: string, owed: boolean): void {
+  const state = readChromaPatchState(dataDirectory);
+  const pending = new Set(state.pending);
+  const done = new Set(state.done);
+  if (owed) {
+    pending.add(parentProject);
+    done.delete(parentProject);
+  } else {
+    pending.delete(parentProject);
+    if (state.legacyRetryAll) done.add(parentProject);
+  }
+  const next: ChromaPatchState = { ...state, pending: [...pending].sort(), done: [...done].sort() };
+  const file = path.join(dataDirectory, CHROMA_PATCH_STATE_FILE);
+  try {
+    writeFileSync(`${file}.tmp`, JSON.stringify(next, null, 2));
+    renameSync(`${file}.tmp`, file);
+  } catch (err) {
+    // Losing the record only costs one more retry on the next start.
+    logger.warn('SYSTEM', 'Could not record worktree adoption Chroma patch state', {
+      parentProject,
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+
+function chromaEnabledInSettings(): boolean {
+  return SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_CHROMA_ENABLED !== 'false';
+}
 
 /** Let pending I/O callbacks (HTTP requests) run before more synchronous work. */
 function yieldToEventLoop(): Promise<void> {
@@ -170,9 +238,10 @@ function listOrphanProjectKeys(
   const prefix = `${parentProject}/`;
   // '0' is the byte after '/', so [prefix, upperBound) is exactly the children.
   const upperBound = `${parentProject}0`;
-  // Mirrors selectObsForPatch: already-adopted rows stay eligible so a Chroma
-  // patch that failed after the SQL commit can retry. The update itself is a
-  // no-op for them, so re-runs neither double-count nor bump sync revs.
+  // Mirrors selectObsForPatch: while a Chroma patch is owed, already-adopted
+  // rows stay eligible so a patch that failed after the SQL commit can retry.
+  // The update itself is a no-op for them, so re-runs neither double-count nor
+  // bump sync revs.
   const adoptedClause = includeAlreadyAdopted
     ? 'AND (merged_into_project IS NULL OR merged_into_project = ?)'
     : 'AND merged_into_project IS NULL';
@@ -342,9 +411,12 @@ export async function adoptMergedWorktrees(opts: {
   dataDirectory?: string;
   dryRun?: boolean;
   onlyBranch?: string;
+  /** Defaults to CLAUDE_MEM_CHROMA_ENABLED; with Chroma off nothing is patched. */
+  chromaEnabled?: boolean;
 } = {}): Promise<AdoptionResult> {
   const dataDirectory = opts.dataDirectory ?? DEFAULT_DATA_DIR;
   const dryRun = opts.dryRun ?? false;
+  const chromaEnabled = opts.chromaEnabled ?? chromaEnabledInSettings();
   const startCwd = opts.repoPath ?? process.cwd();
 
   const mainRepo = resolveMainRepoPath(startCwd);
@@ -404,6 +476,7 @@ export async function adoptMergedWorktrees(opts: {
     .filter((b): b is string => b !== null);
 
   const adoptedChromaTargets: MergedIntoProjectTarget[] = [];
+  let repatchAdopted = false;
 
   let db: import('bun:sqlite').Database | null = null;
   try {
@@ -428,15 +501,19 @@ export async function adoptMergedWorktrees(opts: {
     }
     const writerEvidence = readWriterEvidence(db, obsColumns, sumColumns);
 
+    // Rows adopted earlier are patched again only while this repository owes
+    // a patch; otherwise only the rows this run adopts are.
+    repatchAdopted = chromaEnabled && chromaPatchOwed(readChromaPatchState(dataDirectory), parentProject);
+    const patchScope = repatchAdopted
+      ? '(merged_into_project IS NULL OR merged_into_project = ?)'
+      : 'merged_into_project IS NULL';
+    const patchParams = (worktreeProject: string) =>
+      repatchAdopted ? [worktreeProject, parentProject] : [worktreeProject];
     const selectObsForPatch = db.prepare(
-      `SELECT id FROM observations
-       WHERE project = ?
-         AND (merged_into_project IS NULL OR merged_into_project = ?)`
+      `SELECT id FROM observations WHERE project = ? AND ${patchScope}`
     );
     const selectSumForPatch = db.prepare(
-      `SELECT id FROM session_summaries
-       WHERE project = ?
-         AND (merged_into_project IS NULL OR merged_into_project = ?)`
+      `SELECT id FROM session_summaries WHERE project = ? AND ${patchScope}`
     );
     const updateObs = db.prepare(
       'UPDATE observations SET merged_into_project = ? WHERE project = ? AND merged_into_project IS NULL'
@@ -454,14 +531,8 @@ export async function adoptMergedWorktrees(opts: {
     const syncLane = hasSyncLane(db);
 
     const adoptWorktreeInTransaction = (worktreeProject: string) => {
-      const rows = selectObsForPatch.all(
-        worktreeProject,
-        parentProject
-      ) as Array<{ id: number }>;
-      const summaryRows = selectSumForPatch.all(
-        worktreeProject,
-        parentProject
-      ) as Array<{ id: number }>;
+      const rows = selectObsForPatch.all(...patchParams(worktreeProject)) as Array<{ id: number }>;
+      const summaryRows = selectSumForPatch.all(...patchParams(worktreeProject)) as Array<{ id: number }>;
 
       let obsChanges: number;
       let sumChanges: number;
@@ -500,12 +571,12 @@ export async function adoptMergedWorktrees(opts: {
     ]);
 
     // `--branch` is a targeted squash-merge escape hatch; no orphan sweep.
-    const orphanProjects = opts.onlyBranch
-      ? []
-      : listOrphanProjectKeys(db, parentProject, liveWorktreeProjects, true, writerEvidence);
     result.orphanedWorktrees = opts.onlyBranch
       ? []
       : listOrphanProjectKeys(db, parentProject, liveWorktreeProjects, false, writerEvidence);
+    const orphanProjects = opts.onlyBranch || !repatchAdopted
+      ? result.orphanedWorktrees
+      : listOrphanProjectKeys(db, parentProject, liveWorktreeProjects, true, writerEvidence);
 
     const adoptionTargets: Array<{ project: string; label: string }> = [
       ...targets.map(wt => ({ project: getPathModeProjectContext(wt.path).primary, label: wt.path })),
@@ -551,28 +622,29 @@ export async function adoptMergedWorktrees(opts: {
     db?.close();
   }
 
-  if (!dryRun && adoptedChromaTargets.length > 0) {
+  if (!dryRun && !chromaEnabled) {
+    // Nothing to patch with Chroma off; rows adopted meanwhile are owed a patch
+    // for when it is turned back on.
+    if (adoptedChromaTargets.length > 0) recordChromaPatch(dataDirectory, parentProject, true);
+  } else if (!dryRun && adoptedChromaTargets.length > 0) {
     const chromaSync = new ChromaSync('claude-mem');
     try {
       await chromaSync.updateMergedIntoProject(adoptedChromaTargets, parentProject);
       result.chromaUpdates = adoptedChromaTargets.length;
+      recordChromaPatch(dataDirectory, parentProject, false);
     } catch (err) {
-      if (err instanceof Error) {
-        logger.error(
-          'SYSTEM',
-          'Worktree adoption Chroma patch failed (SQL already committed)',
-          { parentProject, sqliteIdCount: adoptedChromaTargets.length },
-          err
-        );
-      } else {
-        logger.error(
-          'SYSTEM',
-          'Worktree adoption Chroma patch failed (SQL already committed)',
-          { parentProject, sqliteIdCount: adoptedChromaTargets.length, error: String(err) }
-        );
-      }
+      // Retried on the next start: the record keeps the adopted rows eligible.
+      logger.warn('SYSTEM', 'Worktree adoption Chroma patch failed (SQL already committed; retried on next start)', {
+        parentProject,
+        sqliteIdCount: adoptedChromaTargets.length,
+        error: err instanceof Error ? err.message : String(err)
+      });
       result.chromaFailed = adoptedChromaTargets.length;
+      recordChromaPatch(dataDirectory, parentProject, true);
     }
+  } else if (!dryRun && repatchAdopted) {
+    // Owed, but nothing is left to patch.
+    recordChromaPatch(dataDirectory, parentProject, false);
   }
 
   if (
@@ -601,6 +673,7 @@ export async function adoptMergedWorktrees(opts: {
 export async function adoptMergedWorktreesForAllKnownRepos(opts: {
   dataDirectory?: string;
   dryRun?: boolean;
+  chromaEnabled?: boolean;
 } = {}): Promise<AdoptionResult[]> {
   const dataDirectory = opts.dataDirectory ?? DEFAULT_DATA_DIR;
   const dbPath = path.join(dataDirectory, 'claude-mem.db');
@@ -666,13 +739,15 @@ export async function adoptMergedWorktreesForAllKnownRepos(opts: {
     return results;
   }
 
+  const chromaEnabled = opts.chromaEnabled ?? chromaEnabledInSettings();
   for (const repoPath of uniqueParents) {
     await yieldToEventLoop();
     try {
       const result = await adoptMergedWorktrees({
         repoPath,
         dataDirectory,
-        dryRun: opts.dryRun
+        dryRun: opts.dryRun,
+        chromaEnabled
       });
       results.push(result);
     } catch (err) {

@@ -302,6 +302,14 @@ export class ChromaMcpManager {
       return;
     }
 
+    // The worker gates its own Chroma use on this setting, but other callers
+    // (worktree adoption's metadata patch) reached here and prewarmed uvx on
+    // every start just to fail. Read per attempt so a settings change applies
+    // without a restart; it is not a failed attempt, so no backoff is armed.
+    if (SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_CHROMA_ENABLED === 'false') {
+      throw new ChromaUnavailableError('Chroma is disabled via CLAUDE_MEM_CHROMA_ENABLED=false');
+    }
+
     const timeSinceLastFailure = Date.now() - this.lastConnectionFailureTimestamp;
     if (this.lastConnectionFailureTimestamp > 0 && timeSinceLastFailure < RECONNECT_BACKOFF_MS) {
       throw new ChromaUnavailableError(`chroma-mcp connection in backoff (${Math.ceil((RECONNECT_BACKOFF_MS - timeSinceLastFailure) / 1000)}s remaining)`);

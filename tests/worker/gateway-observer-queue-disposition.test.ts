@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -8,6 +8,7 @@ import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
 import { ModeManager } from '../../src/services/domain/ModeManager.js';
+import { logger } from '../../src/utils/logger.js';
 
 /**
  * The gateway's disposition field drives the queue (fleet-ops
@@ -282,5 +283,27 @@ describe('gateway observer queue follows the gateway disposition', () => {
     answer=(path,key)=>path==='/v1/queue/ack' ? job(key,'succeeded',{business_receipt:{state:'completed',reference:'sqlite:observer_queue_batches:'+key}}) : succeeded(key);
     await worker.cycle();
     expect(worker.hold()).toBeNull();
+  });
+  // Two batches failed their ack ~100 times each on 2026-10-22 00:52-00:58 and
+  // the log said only `observer_business_ack_identity_mismatch`: nothing showed
+  // which field the gateway answered differently, so the cause could not be
+  // told apart afterwards. The error now names each field, expected and got.
+  it('an ack mismatch names the field the gateway answered differently', async () => {
+    add();
+    answer=(path,key)=>path==='/v1/queue/ack' ? job(key,'succeeded',{business_receipt:null}) : succeeded(key);
+    const errors=spyOn(logger,'error');
+    try {
+      const worker=queue();
+      await worker.cycle(); // submit, store, receipt
+      await worker.cycle(); // ack
+      const ackKey=calls.find(c=>c.path==='/v1/queue/ack')!.key;
+      expect(batch(ackKey).acknowledged).toBe(0);
+      const message=errors.mock.calls.map(call=>(call[3] as Error | undefined)?.message ?? '').join('\n');
+      expect(message).toContain('observer_business_ack_identity_mismatch');
+      expect(message).toContain('business_receipt.state expected "completed" got undefined');
+      expect(message).not.toContain('request_key');
+    } finally {
+      errors.mockRestore();
+    }
   });
 });

@@ -1088,6 +1088,21 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
     });
   });
 
+  // A disabled Chroma was still prewarmed on every worker start: callers outside
+  // the worker's own gate (worktree adoption's metadata patch) reached
+  // ensureConnected, and each spawned uvx only to fail (2026-10-22).
+  it('refuses to connect, and spawns nothing, while Chroma is disabled', async () => {
+    mockedSettings = { CLAUDE_MEM_CHROMA_ENABLED: 'false' };
+    const mgr = ChromaMcpManager.getInstance();
+
+    await expect(mgr.callTool('chroma_list_collections', { limit: 1 })).rejects.toThrow('Chroma is disabled');
+    // Not a failed attempt: no reconnect backoff is armed.
+    await expect(mgr.callTool('chroma_list_collections', { limit: 1 })).rejects.toThrow('Chroma is disabled');
+
+    expect(prewarmSpawnCalls.length).toBe(0);
+    expect(transportCount).toBe(0);
+  });
+
   it('checks uvx availability before macOS certificate discovery can invoke uvx', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     ChromaMcpManager.setUvxAvailabilityProbeForTesting(() => false);
