@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { GatewayObserverQueue, MAX_HOLD_MS, MAX_REKEYS, PAUSE_PROBE_MS } from '../../src/services/worker/GatewayObserverQueue.js';
+import { GatewayObserverQueue, MAX_HOLD_MS, MAX_REKEYS, MAX_SAME_KEY_RETRIES, PAUSE_PROBE_MS } from '../../src/services/worker/GatewayObserverQueue.js';
 import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import { ObserverTaskStore } from '../../src/services/worker/ObserverTaskStore.js';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
@@ -237,6 +237,53 @@ describe('gateway observer queue follows the gateway disposition', () => {
     answer=(_path,key)=>job(key,'queued');
     await worker.cycle();
     expect(calls[1]).toEqual({path:'/v1/queue/submit',key:calls[0].key});
+  });
+
+  it('a terminal failed job that says paused is held as a pause under its original key (§6.3②)', async () => {
+    const id=add();
+    answer=(path,key)=>path==='/v1/queue/submit' ? job(key,'queued')
+      : job(key,'failed',{error:{code:'business_route_disabled',disposition:'paused'}});
+    const worker=queue();
+    await worker.cycle();          // submit
+    await worker.cycle();          // status → failed + paused
+    const key=calls[0].key;
+    for (let i=0;i<10;i++) { now+=PAUSE_PROBE_MS; await worker.cycle(); }
+    // Never a new key, never a failure, never a receipt: one status probe per interval.
+    expect(batches()).toHaveLength(1);
+    expect(batch(key)).toMatchObject({state:'paused',receipt:null});
+    expect(tasks.get(id)?.state).toBe('running');
+    expect(worker.hold()?.kind).toBe('paused');
+    expect(calls.slice(1).every(c=>c.path==='/v1/queue/status' && c.key===key)).toBe(true);
+    expect(calls).toHaveLength(12);
+  });
+
+  it('a submit refused with retry and same_key=true is retried under the same key a bounded number of times (§7.2)', async () => {
+    const id=add();
+    answer=()=>Response.json({error:{code:'cost_limit_exceeded',disposition:'retry',same_key:true,retry_after_seconds:30}},{status:429});
+    const worker=queue();
+    for (let i=0;i<30;i++) { await worker.cycle(); now+=MAX_HOLD_MS; }
+    const submits=calls.filter(c=>c.path==='/v1/queue/submit');
+    expect(submits).toHaveLength(1+MAX_SAME_KEY_RETRIES);
+    expect(new Set(submits.map(c=>c.key)).size).toBe(1);
+    // Ends as a temporary failure: no job exists, so no receipt; never reconciliation.
+    expect(batches()).toHaveLength(1);
+    expect(batches()[0]).toMatchObject({state:'failed',receipt:null});
+    expect(tasks.get(id)).toMatchObject({state:'failed',outcome:'gateway_retry_exhausted'});
+    expect(worker.hold()).toBeNull();
+  });
+
+  it('a submit refused with retry and same_key=false stops once the new keys are spent (§7.2)', async () => {
+    const id=add();
+    answer=()=>Response.json({error:{code:'http_start_admission_rejected',disposition:'retry',same_key:false}},{status:503});
+    const worker=queue();
+    for (let i=0;i<30;i++) { await worker.cycle(); now+=MAX_HOLD_MS; }
+    const submits=calls.filter(c=>c.path==='/v1/queue/submit');
+    // The original key and MAX_REKEYS new ones, each sent once, never back to an old key.
+    expect(submits).toHaveLength(1+MAX_REKEYS);
+    expect(new Set(submits.map(c=>c.key)).size).toBe(1+MAX_REKEYS);
+    expect(tasks.get(id)).toMatchObject({state:'failed',outcome:'gateway_retry_exhausted'});
+    expect(batches().every(b=>b.receipt===null)).toBe(true);
+    expect(batches().filter(b=>b.state==='failed')).toHaveLength(1);
   });
 
   it('a queue call refused as paused stops the route', async () => {
