@@ -65,6 +65,12 @@ export class ObserverTaskStore {
       UNIQUE(session_db_id, source_id)
     )`);
     db.run('CREATE INDEX IF NOT EXISTS idx_observer_tasks_state ON observer_tasks(state, session_db_id)');
+    // Covers the per-state ownership count behind /api/processing-status
+    // (SessionManager.getDurableQueueStatus): with only the index above, the join
+    // to observer_queue_inputs fetched every task row (each carrying its payload)
+    // to read its id, 4.2–4.3 s at 41k tasks on the worker's event loop, and the
+    // kg-hub capture probe calls it every ~150 s (2026-10-22).
+    db.run('CREATE INDEX IF NOT EXISTS idx_observer_tasks_state_id ON observer_tasks(state, id)');
     const columns = db.prepare('PRAGMA table_info(observer_tasks)').all() as Array<{ name: string }>;
     if (!columns.some(column => column.name === 'version')) {
       db.run('ALTER TABLE observer_tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1');

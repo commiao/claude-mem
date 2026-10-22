@@ -2488,7 +2488,7 @@ For more info: https://docs.claude-mem.ai/antigravity-cli/setup
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(session_db_id, source_id)
-    )`),e.run("CREATE INDEX IF NOT EXISTS idx_observer_tasks_state ON observer_tasks(state, session_db_id)");let r=e.prepare("PRAGMA table_info(observer_tasks)").all();r.some(s=>s.name==="version")||e.run("ALTER TABLE observer_tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1"),r.some(s=>s.name==="enqueued_at_epoch")||e.run("ALTER TABLE observer_tasks ADD COLUMN enqueued_at_epoch INTEGER"),e.run(`CREATE TABLE IF NOT EXISTS observer_task_prepared_prompts (
+    )`),e.run("CREATE INDEX IF NOT EXISTS idx_observer_tasks_state ON observer_tasks(state, session_db_id)"),e.run("CREATE INDEX IF NOT EXISTS idx_observer_tasks_state_id ON observer_tasks(state, id)");let r=e.prepare("PRAGMA table_info(observer_tasks)").all();r.some(s=>s.name==="version")||e.run("ALTER TABLE observer_tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1"),r.some(s=>s.name==="enqueued_at_epoch")||e.run("ALTER TABLE observer_tasks ADD COLUMN enqueued_at_epoch INTEGER"),e.run(`CREATE TABLE IF NOT EXISTS observer_task_prepared_prompts (
       task_id TEXT PRIMARY KEY,
       prompt TEXT NOT NULL,
       prompt_digest TEXT NOT NULL,
