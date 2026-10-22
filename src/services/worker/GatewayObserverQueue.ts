@@ -215,10 +215,18 @@ export class GatewayObserverQueue {
     if (batch.receipt) {
       const ack = await this.request('/v1/queue/ack', {business_key:'claude_mem.observation',
         idempotency_key:batch.id,receipt:JSON.parse(batch.receipt)});
-      if (ack.job?.request_key !== batch.id || ack.job?.business_key !== 'claude_mem.observation' ||
-          ack.job.business_receipt?.state !== JSON.parse(batch.receipt).state ||
-          ack.job.business_receipt?.reference !== JSON.parse(batch.receipt).reference) {
-        throw new Error('observer_business_ack_identity_mismatch');
+      const receipt = JSON.parse(batch.receipt);
+      // Name every field the gateway answered differently: a bare mismatch left
+      // two batches failing ~100 acks each with no way to tell why (2026-10-22).
+      const mismatched = ([
+        ['request_key', batch.id, ack.job?.request_key],
+        ['business_key', 'claude_mem.observation', ack.job?.business_key],
+        ['business_receipt.state', receipt.state, ack.job?.business_receipt?.state],
+        ['business_receipt.reference', receipt.reference, ack.job?.business_receipt?.reference],
+      ] as const).filter(([, expected, got]) => expected !== got)
+        .map(([field, expected, got]) => `${field} expected ${JSON.stringify(expected)} got ${JSON.stringify(got)}`);
+      if (mismatched.length) {
+        throw new Error(`observer_business_ack_identity_mismatch: ${mismatched.join('; ')} (gateway job state ${JSON.stringify(ack.job?.state)})`);
       }
       db.prepare('UPDATE observer_queue_batches SET acknowledged=1 WHERE id=?').run(batch.id);
       return;

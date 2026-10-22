@@ -17,11 +17,15 @@ import { tmpdir } from 'node:os';
 import * as realChromaMcpManager from '../../../src/services/sync/ChromaMcpManager.js';
 
 const realChromaMcpManagerSnapshot = { ...realChromaMcpManager };
+let chromaFails = false;
 
 mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
   ChromaMcpManager: {
     getInstance: () => ({
-      callTool: async () => ({})
+      callTool: async () => {
+        if (chromaFails) throw new Error('chroma-mcp connection in backoff');
+        return {};
+      }
     })
   }
 }));
@@ -32,6 +36,7 @@ import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
 let tempRoot: string | undefined;
 
 afterEach(() => {
+  chromaFails = false;
   if (tempRoot) {
     try { rmSync(tempRoot, { recursive: true, force: true }); } catch {}
   }
@@ -171,11 +176,11 @@ describe('orphaned worktree adoption (#2864)', () => {
 
   // The Chroma patch runs after the SQL commits and can fail on its own (the
   // data dir allows a single writer, so a CLI run loses to the live worker).
-  // selectObsForPatch matches `merged_into_project IS NULL OR = parent`
-  // precisely so a later run can re-patch. Orphan detection has to admit
-  // already-adopted keys too, or the retry it promises never happens and the
-  // vector metadata stays stale forever.
-  it('still collects Chroma targets for an already-adopted orphan', async () => {
+  // While a patch is owed, selectObsForPatch matches `merged_into_project IS
+  // NULL OR = parent` precisely so a later run can re-patch. Orphan detection
+  // has to admit already-adopted keys too, or the retry it promises never
+  // happens and the vector metadata stays stale forever.
+  it('still collects Chroma targets for an already-adopted orphan after a failed patch', async () => {
     tempRoot = mkdtempSync(path.join(tmpdir(), 'claude-mem-2864-orphan-'));
     const mainRepo = path.join(tempRoot, 'parent-repo');
     const worktree = path.join(tempRoot, 'retry-wt');
@@ -193,15 +198,17 @@ describe('orphaned worktree adoption (#2864)', () => {
     git(mainRepo, 'worktree', 'remove', '--force', worktree);
     git(mainRepo, 'worktree', 'prune');
 
-    const first = await adoptMergedWorktrees({ repoPath: mainRepo, dataDirectory });
+    chromaFails = true;
+    const first = await adoptMergedWorktrees({ repoPath: mainRepo, dataDirectory, chromaEnabled: true });
     expect(first.adoptedObservations).toBe(1);
-    expect(first.chromaUpdates).toBe(1);
+    expect(first.chromaFailed).toBe(1);
     expect(first.orphanedWorktrees).toEqual(['parent-repo/retry-wt']);
 
-    const second = await adoptMergedWorktrees({ repoPath: mainRepo, dataDirectory });
+    chromaFails = false;
+    const second = await adoptMergedWorktrees({ repoPath: mainRepo, dataDirectory, chromaEnabled: true });
     // SQL is a no-op the second time — no double counting, no spurious revs.
     expect(second.adoptedObservations).toBe(0);
-    // ...but the row is still offered to Chroma so a failed patch can recover.
+    // ...but the row is offered to Chroma again so the failed patch recovers.
     expect(second.chromaUpdates).toBe(1);
     // Reporting stays a changelog of what this run folded in, not a running
     // tally of everything ever adopted.
