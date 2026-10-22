@@ -24,6 +24,12 @@ export const RETRY_BACKOFF_BASE_MS = 15_000;
 export const MAX_HOLD_MS = 900_000;
 /** A failed job that the gateway says may be retried gets this many new keys. */
 export const MAX_REKEYS = 3;
+/**
+ * A submit refused with retry + same_key goes out again under the same key at
+ * most this many times (§7.2); with the backoff above that is ~16 minutes of
+ * refusals, or six retry_after_seconds waits.
+ */
+export const MAX_SAME_KEY_RETRIES = 6;
 /** An unknown outcome is re-read on this interval, never re-sent. */
 export const RECONCILIATION_RECHECK_MS = 60_000;
 
@@ -70,7 +76,7 @@ export function initializeQueueTables(db: ReturnType<DatabaseManager['getConnect
     acknowledged INTEGER NOT NULL DEFAULT 0, error TEXT, created_at INTEGER NOT NULL,
     checked_at INTEGER NOT NULL DEFAULT 0)`);
   const columns = (db.prepare('PRAGMA table_info(observer_queue_batches)').all() as any[]).map(c=>c.name);
-  for (const column of ['checked_at','next_check_at','attempt']) if (!columns.includes(column)) {
+  for (const column of ['checked_at','next_check_at','attempt','retries']) if (!columns.includes(column)) {
     db.run(`ALTER TABLE observer_queue_batches ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
   }
   db.run(`CREATE TABLE IF NOT EXISTS observer_queue_hold (
@@ -243,14 +249,24 @@ export class GatewayObserverQueue {
     if (job.state !== 'succeeded') {
       if (!['failed','reconciliation'].includes(job.state)) throw new Error('invalid_observer_queue_state');
       const outcome = job.state === 'failed' ? jobErrorDisposition(job.error) : null;
-      if ((outcome?.disposition === 'retry' || outcome?.disposition === 'paused') && (batch.attempt ?? 0) < MAX_REKEYS) {
+      if (outcome?.disposition === 'paused') {
+        // credvault keeps a paused job queued and never ends one failed with
+        // paused (execute_queued_request, 0253208); should it ever, a pause is
+        // still a pause (§6.3②): no failure, no receipt, no new key, the same
+        // key re-read on the long probe interval.
+        const until = this.arm(outcome, batch.id);
+        db.prepare("UPDATE observer_queue_batches SET state='paused',error=?,next_check_at=? WHERE id=?")
+          .run(JSON.stringify(job.error),until,batch.id);
+        return;
+      }
+      if (outcome?.disposition === 'retry' && (batch.attempt ?? 0) < MAX_REKEYS) {
         // A terminal job the gateway says may be retried: the old key already
         // has its terminal record, so the same request goes out under a new key.
         this.rekey(batch, job.error, outcome, true);
         return;
       }
       // Only reconciliation, or a failed job without a disposition, is unknown (§7.2).
-      const failed = outcome?.disposition === 'failed' || outcome?.disposition === 'retry' || outcome?.disposition === 'paused';
+      const failed = outcome?.disposition === 'failed' || outcome?.disposition === 'retry';
       db.transaction(() => {
         db.prepare('UPDATE observer_queue_batches SET state=?,error=?,next_check_at=? WHERE id=?')
           .run(failed ? 'failed' : 'reconciliation',JSON.stringify(job.error || {}),
@@ -355,16 +371,31 @@ export class GatewayObserverQueue {
     const refusal = bodyGatewayDisposition(error.body);
     if (refusal?.disposition === 'paused') this.arm(refusal, batch.id);
     else if (refusal?.disposition === 'retry') {
-      if (!refusal.sameKey && batch.state === 'pending' && (batch.attempt ?? 0) < MAX_REKEYS) this.rekey(batch, error.body, refusal, false);
-      else this.arm(refusal, batch.id);
-    } else if (refusal?.disposition === 'failed' && batch.state === 'pending') {
-      // Refused at submit: no job exists, so there is no receipt to give.
-      const db = this.manager.getConnection();
-      db.transaction(() => {
-        db.prepare("UPDATE observer_queue_batches SET state='failed',error=? WHERE id=?").run(JSON.stringify(error.body),batch.id);
-        for (const row of this.members(batch.id)) db.prepare("UPDATE observer_tasks SET state='failed',version=version+1 WHERE id=?").run(row.id);
-      })();
-    }
+      // A refused status read re-sends nothing; only a refused submit is bounded.
+      if (batch.state !== 'pending') this.arm(refusal, batch.id);
+      else if (refusal.sameKey ? (batch.retries ?? 0) < MAX_SAME_KEY_RETRIES : (batch.attempt ?? 0) < MAX_REKEYS) {
+        if (!refusal.sameKey) this.rekey(batch, error.body, refusal, false);
+        else {
+          this.manager.getConnection().prepare('UPDATE observer_queue_batches SET retries=retries+1 WHERE id=?').run(batch.id);
+          this.arm(refusal, batch.id);
+        }
+      } else {
+        // Retries spent: a temporary failure, never reconciliation (§7.2). The
+        // route still waits out the refusal before the next batch goes.
+        this.arm(refusal, batch.id);
+        this.failUnsubmitted(batch, error.body, 'gateway_retry_exhausted');
+      }
+    } else if (refusal?.disposition === 'failed' && batch.state === 'pending') this.failUnsubmitted(batch, error.body, null);
+  }
+
+  /** Refused at submit: no job exists, so there is no receipt to give. */
+  private failUnsubmitted(batch: any, body: unknown, outcome: string | null): void {
+    const db = this.manager.getConnection();
+    db.transaction(() => {
+      db.prepare("UPDATE observer_queue_batches SET state='failed',error=? WHERE id=?").run(JSON.stringify(body),batch.id);
+      for (const row of this.members(batch.id)) db.prepare("UPDATE observer_tasks SET state='failed',outcome=COALESCE(?,outcome),version=version+1 WHERE id=?")
+        .run(outcome,row.id);
+    })();
   }
 
   /** True when the gateway answered (a job state, or a refusal with a disposition). */
