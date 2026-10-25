@@ -108,6 +108,7 @@ const provider = new ClaudeProvider(db, manager);
 let stalledPromptNumber: number | undefined;
 if (kind === 'summary-stall') {
   stallFixture = true;
+  const savedResponseStallMs = (provider as any).responseStallMs;
   (provider as any).responseStallMs = () => 50;
   try { await provider.startSession(session); } catch (error) {
     if (session.abortReason !== 'transport:response_stall') throw error;
@@ -115,6 +116,10 @@ if (kind === 'summary-stall') {
   assert.equal(session.abortReason, 'transport:response_stall');
   assert.equal(manager.getTotalQueueDepth(), 1);
   stalledPromptNumber = session.lastPromptNumber;
+  // Only the deliberately stalled first attempt uses the tiny fault-injection
+  // deadline. Recovery must use the production budget: process startup under a
+  // full-suite load can legitimately exceed 50ms before the fixture can reply.
+  (provider as any).responseStallMs = savedResponseStallMs;
   stallFixture = false;
   session.abortController = new AbortController();
   session.abortReason = undefined;
