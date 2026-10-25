@@ -137,13 +137,15 @@ describe('TranscriptWatcher zstd (DSH session logs)', () => {
 
     writeFileSync(filePath, zstdFrame([userMessageEvent(0, 'already seen')]));
     await (watcher as any).addTailer(filePath, watch, dshSchema);
-    await waitForAsyncTail();
+    // Await the actual read/drain, rather than assuming disk IO finishes within 50 ms.
+    await (watcher as any).tailers.get(filePath)?.readTask;
     expect(sessionInitCalls.map(call => call.prompt)).toContain('already seen');
 
     // Rewrite the file with a new frame appended; only the new frame should replay.
     appendFileSync(filePath, zstdFrame([userMessageEvent(1, 'brand new')]));
     (watcher as any).tailers.get(filePath)?.poke();
-    await waitForAsyncTail();
+    // Await the actual read/drain, rather than assuming disk IO finishes within 50 ms.
+    await (watcher as any).tailers.get(filePath)?.readTask;
     watcher.stop();
 
     const prompts = sessionInitCalls.map(call => call.prompt);

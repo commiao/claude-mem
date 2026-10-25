@@ -101,6 +101,7 @@ describe.if(isPosix)('the #3378 invariant is enforced, not just documented', () 
       `claude-mem-sigterm-marker-${process.pid}-${Date.now()}`
     );
 
+    const ready = `${marker}.ready`;
     const child = spawn(
       '/bin/sh',
       // The root must OUTLIVE its child. `sleep 300 & wait` ends as soon as the
@@ -108,11 +109,13 @@ describe.if(isPosix)('the #3378 invariant is enforced, not just documented', () 
       // before the root signal lands — the trap never fires and the assertion
       // measures fixture timing rather than delivered signals. A self-looping
       // root stays alive until it is signalled directly.
-      ['-c', `trap 'touch "${marker}"; exit 0' TERM; while :; do sleep 1; done`],
+      ['-c', `trap 'printf fired > "${marker}"; exit 0' TERM; printf ready > "${ready}"; while :; do sleep 0.01; done`],
       { stdio: 'ignore' }
     );
     const rootPid = child.pid!;
-    await settle();
+    // The control proves delivery only after the trap is installed. Use shell
+    // builtins so executing a separate touch process cannot exceed the grace period.
+    expect(await waitUntil(() => fs.existsSync(ready), 10_000)).toBe(true);
 
     await killProcessTree(rootPid, { signalMode: 'immediate' });
     await waitUntil(() => !isPidAlive(rootPid), 10_000);
@@ -122,6 +125,7 @@ describe.if(isPosix)('the #3378 invariant is enforced, not just documented', () 
 
     const trapFired = fs.existsSync(marker);
     fs.rmSync(marker, { force: true });
+    fs.rmSync(ready, { force: true });
 
     expect(trapFired).toBe(false);
   }, 30_000);
@@ -134,6 +138,7 @@ describe.if(isPosix)('the #3378 invariant is enforced, not just documented', () 
       `claude-mem-sigterm-control-${process.pid}-${Date.now()}`
     );
 
+    const ready = `${marker}.ready`;
     const child = spawn(
       '/bin/sh',
       // The root must OUTLIVE its child. `sleep 300 & wait` ends as soon as the
@@ -141,11 +146,13 @@ describe.if(isPosix)('the #3378 invariant is enforced, not just documented', () 
       // before the root signal lands — the trap never fires and the assertion
       // measures fixture timing rather than delivered signals. A self-looping
       // root stays alive until it is signalled directly.
-      ['-c', `trap 'touch "${marker}"; exit 0' TERM; while :; do sleep 1; done`],
+      ['-c', `trap 'printf fired > "${marker}"; exit 0' TERM; printf ready > "${ready}"; while :; do sleep 0.01; done`],
       { stdio: 'ignore' }
     );
     const rootPid = child.pid!;
-    await settle();
+    // The control proves delivery only after the trap is installed. Use shell
+    // builtins so executing a separate touch process cannot exceed the grace period.
+    expect(await waitUntil(() => fs.existsSync(ready), 10_000)).toBe(true);
 
     await killProcessTree(rootPid);
     await waitUntil(() => !isPidAlive(rootPid), 10_000);
@@ -153,6 +160,7 @@ describe.if(isPosix)('the #3378 invariant is enforced, not just documented', () 
 
     const trapFired = fs.existsSync(marker);
     fs.rmSync(marker, { force: true });
+    fs.rmSync(ready, { force: true });
 
     expect(trapFired).toBe(true);
   }, 30_000);

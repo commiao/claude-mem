@@ -3,10 +3,10 @@ import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
 import { parseEnv } from 'util';
 import type { DatabaseManager } from './DatabaseManager.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
+import { buildObserverBatch, validateObserverProfile } from './ObserverBatchRequest.js';
 import { parseAgentXml } from '../../sdk/parser.js';
 import { ModeManager } from '../domain/ModeManager.js';
-import { extractObservationFileEvidence, sanitizeObservationFiles, normalizeSummaryForStorage, attachObservationFilesToSummary } from './agents/ResponseProcessor.js';
+import { extractObservationFileEvidence, sanitizeObservationFiles, normalizeSummaryForStorage, attachObservationFilesToSummary } from './agents/ObservationNormalization.js';
 import { getWorkerPort } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { bodyGatewayDisposition, jobErrorDisposition, type GatewayDisposition } from './gateway-disposition.js';
@@ -61,8 +61,7 @@ export function queueConfig(): QueueConfig {
   const maxItems = Number(process.env.CLAUDE_MEM_LLM_BATCH_ITEMS || 20);
   const maxBytes = Number(process.env.CLAUDE_MEM_LLM_BATCH_BYTES || 64000);
   const submitsPerMinute = Number(process.env.CLAUDE_MEM_LLM_SUBMITS_PER_MINUTE || DEFAULT_SUBMITS_PER_MINUTE);
-  if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 20 ||
-      !Number.isSafeInteger(maxBytes) || maxBytes < 4096 || maxBytes > 256000) throw new Error('invalid_observer_batch_budget');
+  validateObserverProfile({maxItems,maxBytes});
   if (!Number.isSafeInteger(submitsPerMinute) || submitsPerMinute < 1 || submitsPerMinute > 600) throw new Error('invalid_observer_submit_rate');
   return {url: url.origin, tokenFile, tokenEnv: !!envFile, maxItems, maxBytes, submitsPerMinute};
 }
@@ -149,49 +148,15 @@ export class GatewayObserverQueue {
           WHERE older.session_db_id=t.session_db_id AND older.enqueued_at_epoch<t.enqueued_at_epoch
           AND older.state IN ('queued','running','reconciliation'))) ORDER BY t.enqueued_at_epoch,t.id LIMIT 200`).all() as any[];
       if (!candidates.length) return false;
-      const first = candidates[0], context = JSON.parse(first.context), firstInput = JSON.parse(first.payload);
-      const mode = ModeManager.getInstance().getActiveMode();
-      const system = buildInitPrompt(context.project, first.content_session_id, context.userPrompt || '', mode) +
-        '\nThis request is an independent batch. Use only the supplied records. If none contains durable facts, output <skip_summary reason="no durable facts"/>.';
-      const selected: any[] = [], prompts: string[] = [];
-      const body: any = {model:'claude_mem.observation', max_tokens:4096, system,
-        messages:[{role:'user',content:''}]};
-      for (const row of candidates) {
-        if (row.session_db_id !== first.session_db_id) continue;
-        if (row.context !== first.context || row.kind !== first.kind) break;
-        if (selected.length >= (first.kind === 'summary' ? 1 : this.config.maxItems)) break;
-        const input = JSON.parse(row.payload);
-        if (input.prompt_number !== firstInput.prompt_number || input.agentId !== firstInput.agentId ||
-            input.agentType !== firstInput.agentType) break;
-        let prompt = first.kind === 'summary'
-          ? buildSummaryPrompt({id:row.session_db_id,memory_session_id:null,project:context.project,
-              user_prompt:context.userPrompt || '',last_assistant_message:input.last_assistant_message || ''}, mode)
-          : buildObservationPrompt({id:0,recoveryTaskId:row.id,tool_name:input.tool_name,
-              tool_input:input.tool_input,tool_output:input.tool_response,
-              created_at_epoch:row.enqueued_at_epoch,cwd:input.cwd}, Number.POSITIVE_INFINITY);
-        if (first.kind === 'summary') {
-          const prior = db.prepare(`SELECT title,facts,narrative FROM observations WHERE memory_session_id=
-            (SELECT memory_session_id FROM sdk_sessions WHERE id=?) ORDER BY created_at_epoch DESC,id DESC LIMIT 20`)
-            .all(first.session_db_id);
-          const bounded: unknown[] = [];
-          for (const fact of prior) {
-            if (Buffer.byteLength(JSON.stringify([...bounded,fact])) > 12000) break;
-            bounded.push(fact);
-          }
-          prompt += '\nPersisted observations (bounded most recent subset):\n'+JSON.stringify(bounded);
-        }
-        body.messages[0].content = [...prompts,prompt].join('\n\n');
-        if (Buffer.byteLength(JSON.stringify(body)) > this.config.maxBytes) {
-          if (!selected.length) {
-            db.prepare("UPDATE observer_tasks SET state='failed',outcome='batch_input_over_budget',version=version+1 WHERE id=?")
-              .run(row.id);
-            return true;
-          }
-          break;
-        }
-        selected.push(row); prompts.push(prompt);
+      const first = candidates[0];
+      const prior = first.kind === 'summary' ? db.prepare(`SELECT title,facts,narrative FROM observations
+        WHERE memory_session_id=(SELECT memory_session_id FROM sdk_sessions WHERE id=?)
+        ORDER BY created_at_epoch DESC,id DESC LIMIT 20`).all(first.session_db_id) : [];
+      const {selected,body,overBudget} = buildObserverBatch(candidates,ModeManager.getInstance().getActiveMode(),this.config,prior);
+      if (overBudget) {
+        db.prepare("UPDATE observer_tasks SET state='failed',outcome='batch_input_over_budget',version=version+1 WHERE id=?").run(first.id);
+        return true;
       }
-      body.messages[0].content = prompts.join('\n\n');
       const raw = JSON.stringify(body);
       const id = 'cmq-'+createHash('sha256').update(JSON.stringify(selected.map(r=>r.id))).digest('hex');
       db.prepare('INSERT INTO observer_queue_batches(id,session_db_id,body,created_at) VALUES(?,?,?,?)')

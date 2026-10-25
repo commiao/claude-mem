@@ -58,3 +58,12 @@ reports/
 # 构建产物：sourcemap。仓库从不跟踪它们（实测已跟踪数 0），但构建会生成，
 # 不忽略的话工作树永远是脏的 —— 而永远脏的工作树会盖住下一次真正的漂移。
 plugin/**/*.map
+# Local Python evaluation bytecode (no benchmark data belongs in the repository).
+__pycache__/
+*.pyc
+
+# Python business evaluation build outputs
+*.egg-info/
+adapters/evaluation/build/
+adapters/evaluation/dist/
+adapters/evaluation/src/claude_mem_eval/assets/
