@@ -71,7 +71,8 @@ for (const key of ['Enter', 'Space'] as const) {
         if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
         return result.result.value;
       };
-      const settle = () => evaluate('new Promise(async resolve => { for(let i=0;i<4;i++) await new Promise(requestAnimationFrame); resolve(true); })');
+      // Keyboard assertions need React's queued work, not compositor frames: native Escape can stop frame delivery in headless Chrome.
+      const settle = () => evaluate('new Promise(resolve => setTimeout(() => resolve(true), 0))');
       const press = async (value: 'Enter' | 'Space' | 'Escape') => {
         const code = value === 'Enter' ? 13 : value === 'Space' ? 32 : 27;
         const event = { key: value === 'Space' ? ' ' : value, code: value,
