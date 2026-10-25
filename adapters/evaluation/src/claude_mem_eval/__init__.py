@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+from llm_eval.json_bridge import JsonBridgeError, JsonBridgeRemoteError, run_json_bridge
 
 ASSETS = Path(__file__).parent / "assets"
 
@@ -14,15 +14,17 @@ ASSETS = Path(__file__).parent / "assets"
 def bridge(action, value):
     runtime = shutil.which("bun")
     if runtime is None:
-        raise ValueError("claude-mem-eval requires its tested Bun runtime")
+        raise JsonBridgeError("bun_runtime_missing")
     with tempfile.TemporaryDirectory(prefix="claude-mem-eval-private-") as directory:
         env = dict(os.environ, CLAUDE_MEM_DATA_DIR=directory, CLAUDE_MEM_MODES_DIR=str(ASSETS / "modes"))
-        result = subprocess.run([runtime, str(ASSETS / "bridge.cjs"), action, directory, str(ASSETS / "modes")],
-            input=json.dumps(value, ensure_ascii=False, allow_nan=False), text=True, capture_output=True, env=env,
-            cwd=directory, timeout=60)
-        if result.returncode:
-            raise ValueError("business bridge rejected input: " + result.stderr[-1500:])
-        return json.loads(result.stdout)
+        try:
+            return run_json_bridge([runtime, str(ASSETS / "bridge.cjs"), action, directory, str(ASSETS / "modes")],
+                value, env=env, cwd=directory, timeout=60)
+        except JsonBridgeRemoteError as exc:
+            if action == "build" and exc.code in {"invalid_bridge_arguments", "batch_input_over_budget",
+                                                  "captured_profile_mismatch", "empty_batch"}:
+                raise ValueError("business bridge rejected input: " + exc.code) from None
+            raise
 
 
 class Observation:
@@ -30,14 +32,16 @@ class Observation:
 
     def describe(self):
         provenance=json.loads((ASSETS/'provenance.json').read_text())
-        return {"sdk": 1, "id": "claude_mem." + self.kind, "version": "1", "policy_version": "mem-unvalidated-1",
+        return {"sdk": 1, "id": "claude_mem." + self.kind, "version": "1", "policy_version": "mem-unvalidated-2",
             "business_provenance":{"source_revision":provenance['source_revision'],
                                    "bridge_sha256":provenance['bridge_sha256']},
             "unit": "frozen source case; one or more independent requests", "modes": ["smoke", "admission", "blind"],
             "runtime": "Bun (bundled business bridge)", "production_route": "claude_mem.observation",
             "profile": {"maxItems":20,"maxBytes":64000,"max_tokens":4096,"source":"production ObserverBatchRequest"},
             "metrics": {"diagnostic_anchor_coverage": {"unit":"ratio","denominator":"labeled lexical anchors", "semantic_truth":False},
-                        "character_ratio": {"unit":"characters/characters","denominator":"source text characters", "tokens":False}},
+                        "character_ratio": {"unit":"characters/characters",
+                            "denominator":"serialized frozen business context characters (including persisted observations)",
+                            "source_measurement":"serialized_frozen_business_context_v1", "tokens":False}},
             "policy": {"minimum_cases":30,"minimum_random_reviews":10,"minimum_source_quote":1,
                        "minimum_identity":"local-observed","requires_output_budget":True,"calibrated":False}}
 
@@ -86,7 +90,7 @@ class Observation:
         skipped=bool(values) and all(v.get("skipped") for v in values)
         facts=[" ".join(f.casefold().split()) for o in observations for f in o.get("facts",[])]
         hits=sum(any(" ".join(a.casefold().split()) in normalized for a in f["anchors"]) for f in required)
-        source=json.dumps(case.get("records",case.get("request",case.get("last_assistant_message",""))),ensure_ascii=False)
+        source=json.dumps(self.review_source(case),ensure_ascii=False)
         return {"valid":bool(aggregate["valid"]),"skipped":skipped,
             "expected_action_correct":(skipped == (expected["action"]=="skip")) if expected.get("action") else None,
             "diagnostic_anchor_hits":hits,"diagnostic_anchor_total":len(required),
