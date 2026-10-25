@@ -61,3 +61,9 @@ plugin/**/*.map
 # Local Python evaluation bytecode (no benchmark data belongs in the repository).
 __pycache__/
 *.pyc
+
+# Python business evaluation build outputs
+*.egg-info/
+adapters/evaluation/build/
+adapters/evaluation/dist/
+adapters/evaluation/src/claude_mem_eval/assets/
