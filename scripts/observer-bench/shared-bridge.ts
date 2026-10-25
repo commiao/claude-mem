@@ -1,15 +1,26 @@
 /** Standalone business bridge: environment is set before importing production modules. */
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+let transport: any, request: any;
+let responseStarted = false;
+async function respond(value: unknown): Promise<void> {
+  responseStarted = true;
+  await transport.writeResponse(request, value);
+}
 
 async function main(): Promise<void> {
+  const helper = process.env.LLM_EVAL_JSON_BRIDGE_HELPER;
+  if (!helper) throw new Error('missing_shared_transport');
+  transport = await import(pathToFileURL(helper).href);
+  request = transport.readRequest();
   const [action,dataDir,modeDir]=process.argv.slice(2);
   if (!['build','parse'].includes(action)||!dataDir||!modeDir) throw new Error('invalid_bridge_arguments');
   process.env.CLAUDE_MEM_DATA_DIR=resolve(dataDir);
   process.env.CLAUDE_MEM_MODES_DIR=resolve(modeDir);
   const {ModeManager}=await import('../../src/services/domain/ModeManager.js');
   const mode=ModeManager.getInstance().loadMode('code');
-  const value=JSON.parse(readFileSync(0,'utf8'));
+  const value=request.payload;
   if (action==='build') {
     const {buildObserverBatch,OBSERVER_DEFAULT_PROFILE}=await import('../../src/services/worker/ObserverBatchRequest.js');
     const profile={...OBSERVER_DEFAULT_PROFILE,...value.profile};
@@ -41,20 +52,29 @@ async function main(): Promise<void> {
         pending=pending.filter((r:any)=>!ids.has(r.id));
       }
     }
-    console.log(JSON.stringify(output));
+    await respond(output);
   } else {
     const {parseAgentXml}=await import('../../src/sdk/parser.js');
     const {extractObservationFileEvidence,sanitizeObservationFiles,normalizeSummaryForStorage,attachObservationFilesToSummary}=
       await import('../../src/services/worker/agents/ObservationNormalization.js');
     const parsed=parseAgentXml(value.text);
-    if (!parsed.valid) {console.log(JSON.stringify({valid:false,parser_valid:false,value:null}));return;}
+    if (!parsed.valid) {await respond({valid:false,parser_valid:false,value:null});return;}
     const evidence=extractObservationFileEvidence(value.records.map((r:any)=>({...r,type:value.kind==='summary'?'summarize':'observation'})));
     const observations=sanitizeObservationFiles(parsed.observations,evidence);
     const summary=attachObservationFilesToSummary(normalizeSummaryForStorage(parsed.summary),[
       {files_read:evidence.files_read,files_modified:evidence.files_modified},...observations]);
     const valid=value.kind==='summary' ? observations.length===0 : !summary;
-    console.log(JSON.stringify({valid,parser_valid:true,value:{observations,summary,skipped:!!parsed.summary?.skipped},
-      persistence:'pure normalization only; no DB access'}));
+    await respond({valid,parser_valid:true,value:{observations,summary,skipped:!!parsed.summary?.skipped},
+      persistence:'pure normalization only; no DB access'});
   }
 }
-main().catch(error=>{console.error(error.message);process.exitCode=1;});
+main().catch(async error=>{
+  process.exitCode=1;
+  if (transport && request && !responseStarted) {
+    const code=String(error.message).split(':')[0];
+    const allowed=['invalid_bridge_arguments','batch_input_over_budget','captured_profile_mismatch','empty_batch'];
+    try { await transport.writeError(request,allowed.includes(code)?code:'business_bridge_error');return; }
+    catch { /* Partial frames are rejected by the shared caller; never replay. */ }
+  }
+  console.error('business_bridge_failed');
+});

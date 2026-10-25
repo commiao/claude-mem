@@ -1,4 +1,6 @@
 """Business adapter contracts; no model or production database access."""
+import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,5 +67,45 @@ class ObserverAdapterTest(unittest.TestCase):
     def test_uncalibrated_policy_cannot_claim_production(self):
         self.assertFalse(Observation().describe()['policy']['calibrated'])
         self.assertFalse(Summary().describe()['policy']['calibrated'])
+
+    def test_six_cases_including_twenty_records_cross_pipe_capacity(self):
+        cases=[copy.deepcopy(c) for c in self.cases if c['kind']=='observation']
+        batch=copy.deepcopy(cases[0]);batch['id']='synthetic-batch20'
+        batch['records']=[{'tool_name':'Read','tool_input':{'file_path':'config/synthetic.json'},
+            'tool_output':'Synthetic: worker.max_batch_items=20; maxBytes=64000.'} for _ in range(20)]
+        cases.append(batch)
+        requests=Observation().build_requests(cases,{})
+        self.assertGreater(len(json.dumps(requests,ensure_ascii=False).encode()),65536)
+        self.assertEqual(len(requests),6)
+        self.assertEqual({r['case_ids'][0] for r in requests},{c['id'] for c in cases})
+        self.assertEqual(len(next(r for r in requests if r['case_ids']==['synthetic-batch20'])['records']),20)
+
+    def test_large_parser_response_is_complete(self):
+        request=Observation().build_requests([self.cases[0]],{})[0]
+        fact='Unicode 完整性🙂 ' * 10000
+        text='<observation><type>bugfix</type><title>Large</title><facts><fact>'+fact+'</fact></facts></observation>'
+        parsed=Observation().parse_response(request,text)
+        self.assertTrue(parsed['valid'])
+        self.assertEqual(parsed['value']['observations'][0]['facts'],[fact.strip()])
+
+    def test_character_denominator_includes_frozen_context_excludes_gold(self):
+        for adapter in [Observation(),Summary()]:
+            case=copy.deepcopy(next(c for c in self.cases if c['kind']==adapter.kind))
+            case['context']={'project_note':'中文🙂'}
+            aggregate={'valid':True,'value':[{'observations':[],'summary':None,'skipped':True}]}
+            metrics=adapter.evaluate_case(case,aggregate)
+            source=json.dumps(adapter.review_source(case),ensure_ascii=False)
+            self.assertEqual(metrics['source_characters'],len(source))
+            self.assertNotEqual(metrics['source_characters'],len(source.encode()))
+            self.assertEqual(metrics['character_ratio'],metrics['knowledge_characters']/len(source))
+            case['expected']={'required_facts':[{'anchors':['gold'*100]}]}
+            self.assertEqual(adapter.evaluate_case(case,aggregate)['source_characters'],len(source))
+            case['persisted_observations']=[{'facts':['more historical context']}]
+            self.assertEqual(adapter.evaluate_case(case,aggregate)['source_characters'],
+                len(json.dumps(adapter.review_source(case),ensure_ascii=False)))
+            case['request']={'system':'frozen system','messages':[{'content':'full context'}]}
+            self.assertEqual(adapter.evaluate_case(case,aggregate)['source_characters'],
+                len(json.dumps(adapter.review_source(case),ensure_ascii=False)))
+            self.assertEqual(adapter.describe()['policy_version'],'mem-unvalidated-2')
 
 if __name__=='__main__': unittest.main()
