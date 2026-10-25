@@ -386,6 +386,12 @@ Restart Claude Code to apply the new mode configuration.
 
 ## Development
 
+To compare observation compression or session summaries across tool-side models, use the
+[offline observer model benchmark](docs/observer-model-bench.md). It freezes identical inputs,
+exports packets for Claude Code/Codex/Cursor, supports prompt and batch-size variants, and
+produces a blind review sheet plus HTML/JSON/CSV quality, latency and usage comparisons.
+It never writes evaluated outputs to production memory.
+
 See the **[Development Guide](https://docs.claude-mem.ai/development)** for build instructions, testing, and contribution workflow.
 
 ---
