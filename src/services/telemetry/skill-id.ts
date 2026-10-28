@@ -21,6 +21,7 @@ export const FIRST_PARTY_SKILL_IDS = [
   'knowledge-agent',
   'learn-codebase',
   'make-plan',
+  'mem-check',
   'mem-search',
   'mode-creator',
   'oh-my-issues',
