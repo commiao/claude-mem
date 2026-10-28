@@ -3,14 +3,54 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def source_identity(root: Path):
+    git = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True)
+    if git.returncode == 0:
+        state = subprocess.run(['git', '-C', str(root), 'status', '--porcelain'], capture_output=True, text=True)
+        return git.stdout.strip(), bool(state.stdout.strip()) if state.returncode == 0 else None, 'git-worktree'
+    metadata = root / 'RELEASE.json'
+    if not metadata.is_file():
+        return None, None, 'unknown'
+    release = json.loads(metadata.read_text())
+    revision = release.get('commit', '')
+    if release.get('name') != 'claude-mem-eval' or not re.fullmatch(r'[0-9a-f]{40}', revision):
+        raise RuntimeError('invalid claude-mem-eval release metadata')
+    tree = subprocess.run(['git', '-C', release['repo'], 'ls-tree', '-rz', revision], capture_output=True)
+    if tree.returncode:
+        raise RuntimeError('release source commit cannot be verified')
+    entries = [r for r in tree.stdout.split(b'\0') if r]
+    if not entries:
+        raise RuntimeError('release source tree is empty')
+    for entry in entries:
+        meta, name = entry.split(b'\t', 1)
+        mode, kind, expected = meta.split()
+        path = root / os.fsdecode(name)
+        if kind != b'blob':
+            raise RuntimeError('release contains unsupported source entry')
+        if mode == b'120000':
+            if not path.is_symlink():
+                raise RuntimeError('release source link differs')
+            data = os.fsencode(os.readlink(path))
+        else:
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError('release source file differs')
+            data = path.read_bytes()
+        actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+        if actual != expected.decode():
+            raise RuntimeError('release source bytes differ from frozen commit')
+    return revision, False, 'verified-release-snapshot'
 
 
 def integration_status():
@@ -33,15 +73,13 @@ def integration_status():
     for ident, descriptor in installed.items():
         if bundle['adapters'][ident]['descriptor'] != descriptor:
             raise RuntimeError('active bundle changed or installed descriptor differs')
-    git = subprocess.run(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], capture_output=True, text=True)
-    head = git.stdout.strip() if git.returncode == 0 else None
-    git_status = subprocess.run(['git', '-C', str(REPO), 'status', '--porcelain'], capture_output=True, text=True)
-    dirty = bool(git_status.stdout.strip()) if git_status.returncode == 0 else None
+    head, dirty, source_kind = source_identity(REPO)
     python = bundle_path.parent / 'venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     filter_keys = {'no_value_contamination', 'low_value_contamination', 'filter_quality'}
     return {'name': 'MemCheck / 记忆质检', 'active_bundle': str(bundle_path), 'runtime_python': str(python),
             'installed_scenarios': sorted(installed), 'installed_business_source_revision': revision,
             'candidate_source_revision': head, 'candidate_worktree_dirty': dirty,
+            'candidate_source_kind': source_kind,
             'candidate_matches_installed_source': head == revision and dirty is False,
             'filter_metrics_in_shared_report': any(filter_keys & set(d.get('metrics', {})) for d in installed.values()),
             'baseline_source': str(Path.home() / '.local/share/claude-mem-eval/releases' / revision),
@@ -59,6 +97,8 @@ def quick(out: Path, evidence: Path | None):
                                   'tests/worker/agents/response-processor-notes-summary.test.ts']),
         ('filter-metrics-regressions', [status['runtime_python'], '-m', 'unittest', 'discover',
                                        '-s', 'tests/evaluation', '-p', 'test_observer_filter_quality.py', '-v']),
+        ('release-identity-regressions', [status['runtime_python'], '-m', 'unittest', 'discover',
+                                        '-s', 'tests/evaluation', '-p', 'test_mem_check_status.py', '-v']),
         ('synthetic-case-contract', ['llm-eval', 'adapter-validate', '--scenario', 'claude_mem.observation',
                                      '--cases', str(REPO / 'docs/examples/observer-semantic-regressions.json')]),
     ]

@@ -1,0 +1,16 @@
+{
+  "protocol_version": 0,
+  "skill_id": "mem-check",
+  "name": "mem-check",
+  "description": "记忆质检（MemCheck）：评估 claude-mem 抽取、摘要和过滤质量。",
+  "scope": "global",
+  "targets": ["codex"],
+  "exclude": ["__pycache__", "*.pyc", ".DS_Store"],
+  "external_references": [
+    "scripts/mem_check.py",
+    "scripts/observer_filter_quality.py",
+    "docs/observer-model-bench.md",
+    "docs/observer-semantic-regressions.md"
+  ],
+  "security": {"contains_secrets": false, "encryption": "none"}
+}

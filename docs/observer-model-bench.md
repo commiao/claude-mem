@@ -7,8 +7,8 @@
 ## 记忆质检（MemCheck）
 
 本工作流的固定名称是**记忆质检（MemCheck）**，覆盖观测抽取、摘要压缩、事实保真、
-噪音过滤和新增产出。独立`mem-check`技能随插件源码提供；发布安装前，使用已安装的
-`llm-eval`技能明确请求“记忆质检”即可，不能声称未安装的技能或CLI别名已生效。
+噪音过滤和新增产出。独立`mem-check`技能随发布源码提供；经 sidecar 安装并验证 Codex
+发现后，可用 `$mem-check` 或“运行 MemCheck 记忆质检”唤起。安装状态以实际发现结果为准。
 
 快速检查候选源码，无模型调用：
 
@@ -34,9 +34,12 @@ python scripts/mem_check.py quick --evidence /private/eval/existing-audit --out 
 因此修改parser/prompt后，需要重新构建适配器并发布、验证和激活新的固定组合才影响新实验；
 旧实验继续使用原计划绑定的组合。只改`current`、技能文字或源码都不会改写旧结果。
 
-本次新增`observer_filter_quality.py`是独立业务汇总器，尚未被公共`score/report`自动调用。
-要使过滤指标进入共享报告，还需显式接入适配器指标/报告合同并随组合发布；不能因为工作树有
-这个文件就认定框架已经使用它。快速入口会分别显示候选验证与已安装框架状态。
+从 core / `claude-mem-eval` 0.1.2 起，过滤指标通过适配器 `summarize_score` 接入公共
+`score/report`，HTML 与 `metrics.csv` 使用同一业务汇总；原脚本保留为薄入口。
+语义价值标签通过 `--annotations FILE` 显式传入，绑定计划、来源与输出摘要；缺标签保留未知。
+实际新增条数须另有只读持久化回读 receipt，新的离线生成不能冒充真实入库。
+接口与证据格式见 `adapters/evaluation/FILTER-REVIEW.md`。只有发布并激活新组合后，
+这些能力才影响新实验；快速入口分别显示候选验证与已安装框架状态。
 
 ## 数据与场景
 
@@ -70,7 +73,7 @@ candidates.json 元素为 {id,executor,model}；手工Cursor/其他工具用 exe
 每个packet新会话，屏蔽可关闭的记忆/工具/钩子，不读gold或其他候选输出，原样交回XML。
 交卷每行复制 id/plan_sha256/request_sha256，text 填原始回复。人工费用/身份只算声明。
 默认0调用预算；实际原生执行需先给模型、探针/补救总调用上限和已有授权。
-本轮仅离线验收，不发起真实探针。
+实际探针与生成须按当轮确认的预算执行；离线验收不消耗模型调用。
 
 profile 支持 maxItems（1..20）、maxBytes（4096..256000），max_tokens目前固定4096。
 模型对比固定profile；链路对比才允许候选显式变体。工具没有强制输出预算的能力时明确未验证。

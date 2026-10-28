@@ -11,7 +11,10 @@ ROOT=Path(__file__).resolve().parents[1]
 ASSETS=ROOT/'adapters/evaluation/src/claude_mem_eval/assets'
 ASSETS.mkdir(parents=True,exist_ok=True)
 sources=['scripts/observer-bench/shared-bridge.ts','src/services/worker/ObserverBatchRequest.ts',
-         'src/sdk/prompts.ts','src/sdk/parser.ts','src/services/worker/agents/ObservationNormalization.ts','plugin/modes/code.json']
+         'src/sdk/prompts.ts','src/sdk/parser.ts','src/services/worker/agents/ObservationNormalization.ts','plugin/modes/code.json',
+         'adapters/evaluation/src/claude_mem_eval/filter_quality.py',
+         'adapters/evaluation/src/claude_mem_eval/filter_metrics.py',
+         'adapters/evaluation/src/claude_mem_eval/filter_persistence.py']
 # Capture the complete local TS dependency closure, not just top-level business files.
 seen=set(sources)
 pending=list(sources)
@@ -30,6 +33,7 @@ subprocess.run(['bun','build',str(ROOT/'scripts/observer-bench/shared-bridge.ts'
                 '--outfile='+str(ASSETS/'bridge.cjs')],cwd=ROOT,check=True)
 (ASSETS/'modes').mkdir(exist_ok=True)
 shutil.copyfile(ROOT/'plugin/modes/code.json',ASSETS/'modes/code.json')
+shutil.copyfile(ROOT/'adapters/evaluation/FILTER-REVIEW.md',ASSETS/'filter-review.md')
 release=ROOT/'RELEASE.json'
 revision=json.loads(release.read_text())['commit'] if release.is_file() else subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
 manifest={'source_revision':revision,

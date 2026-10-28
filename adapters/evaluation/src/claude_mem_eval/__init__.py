@@ -38,7 +38,10 @@ class Observation:
             "unit": "frozen source case; one or more independent requests", "modes": ["smoke", "admission", "blind"],
             "runtime": "Bun (bundled business bridge)", "production_route": "claude_mem.observation",
             "profile": {"maxItems":20,"maxBytes":64000,"max_tokens":4096,"source":"production ObserverBatchRequest"},
-            "metrics": {"diagnostic_anchor_coverage": {"unit":"ratio","denominator":"labeled lexical anchors", "semantic_truth":False},
+            "metrics": {"filter_quality": {"applicable":self.kind == "observation",
+                            "source":"output-bound review annotations and optional read-only persistence receipt",
+                            "semantic_labels":"required; never inferred from lexical anchors", "production_admission":False},
+                        "diagnostic_anchor_coverage": {"unit":"ratio","denominator":"labeled lexical anchors", "semantic_truth":False},
                         "character_ratio": {"unit":"characters/characters",
                             "denominator":"serialized frozen business context characters (including persisted observations)",
                             "source_measurement":"serialized_frozen_business_context_v1", "tokens":False}},
@@ -90,7 +93,9 @@ class Observation:
         skipped=bool(values) and all(v.get("skipped") for v in values)
         facts=[" ".join(f.casefold().split()) for o in observations for f in o.get("facts",[])]
         hits=sum(any(" ".join(a.casefold().split()) in normalized for a in f["anchors"]) for f in required)
-        source=json.dumps(self.review_source(case),ensure_ascii=False)
+        # Preserve mem-unvalidated-2's character representation policy even when
+        # the independent-review source hides variant prompt text.
+        source=json.dumps(self.character_source(case),ensure_ascii=False)
         return {"valid":bool(aggregate["valid"]),"skipped":skipped,
             "expected_action_correct":(skipped == (expected["action"]=="skip")) if expected.get("action") else None,
             "diagnostic_anchor_hits":hits,"diagnostic_anchor_total":len(required),
@@ -106,7 +111,20 @@ class Observation:
         return required+forbidden+[{"id":"source-support","description":"Actual output supported; preserve ownership, completed vs planned, numbers, skip and file evidence"}]
 
     def review_source(self, case):
+        if case.get('records'):
+            # Captured A/B bodies remain sealed model inputs, not factual gold or
+            # an anonymous reviewer's source. Both arms share the actual records.
+            return {k:case[k] for k in ("user_prompt","records","last_assistant_message","persisted_observations","context") if k in case}
+        return self.character_source(case)
+
+    def character_source(self, case):
+        """Frozen source fields for the existing character-ratio policy only."""
         return {k:case[k] for k in ("user_prompt","records","request","last_assistant_message","persisted_observations","context") if k in case}
+
+    def summarize_score(self, plan, scored, annotations=None):
+        from .filter_metrics import summarize
+        persistence = annotations.get('persistence_receipt') if annotations else None
+        return summarize(self, plan, scored, annotations, persistence)
 
 
 class Summary(Observation):
