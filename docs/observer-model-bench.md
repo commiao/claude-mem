@@ -4,6 +4,40 @@
 原 scripts/observer_bench.py 是公共CLI的薄入口，不再支持 --runtime-repo 或导入 KG checkout。
 需要 Python 3.11+、Bun，以及同一发布组合安装的 llm-eval / claude-mem-eval wheel。
 
+## 记忆质检（MemCheck）
+
+本工作流的固定名称是**记忆质检（MemCheck）**，覆盖观测抽取、摘要压缩、事实保真、
+噪音过滤和新增产出。独立`mem-check`技能随插件源码提供；发布安装前，使用已安装的
+`llm-eval`技能明确请求“记忆质检”即可，不能声称未安装的技能或CLI别名已生效。
+
+快速检查候选源码，无模型调用：
+
+```text
+python scripts/mem_check.py status
+python scripts/mem_check.py quick --out /private/eval/mem-check-new-run
+python scripts/mem_check.py quick --evidence /private/eval/existing-audit --out /private/eval/mem-check-replay
+```
+
+`status`核实当前发布组合的两个mem场景、适配器来源与候选源码差异，并显示过滤指标是否由
+共享适配器声明。`quick`运行摘要/存储边界与过滤计数回归、合成案例合同；有已有审计目录时，
+另做同一历史回复的parser前后对照和已有价值标签重算。它不读真实DB、不重新生成回复，
+接受结果的正文变化会使回放失败；新的拒绝项保存供审查。
+
+**快速回归通过只证明代码与计数约束通过。** 提示词改动的实际收益需要固定同样本、允许上下文、
+模型/profile，对旧版与新版重新生成并独立评审；同时比较事实支持、价值保留、无价值拦截、
+低/无价值混入、新增条数和转化率，不能只证明调用成功或多产出。
+
+## 与公共框架的版本边界
+
+公共CLI通过已安装的`claude-mem-eval`适配器运行`claude_mem.observation`和
+`claude_mem.summary`，适配器封装了由业务源码构建的bridge和mode资源，运行时不导入开发检出。
+因此修改parser/prompt后，需要重新构建适配器并发布、验证和激活新的固定组合才影响新实验；
+旧实验继续使用原计划绑定的组合。只改`current`、技能文字或源码都不会改写旧结果。
+
+本次新增`observer_filter_quality.py`是独立业务汇总器，尚未被公共`score/report`自动调用。
+要使过滤指标进入共享报告，还需显式接入适配器指标/报告合同并随组合发布；不能因为工作树有
+这个文件就认定框架已经使用它。快速入口会分别显示候选验证与已安装框架状态。
+
 ## 数据与场景
 
 使用 claude_mem.observation 或 claude_mem.summary，分开数据集/分数/策略。
