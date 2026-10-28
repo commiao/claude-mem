@@ -94,7 +94,7 @@ class ObserverAdapterTest(unittest.TestCase):
             case['context']={'project_note':'中文🙂'}
             aggregate={'valid':True,'value':[{'observations':[],'summary':None,'skipped':True}]}
             metrics=adapter.evaluate_case(case,aggregate)
-            source=json.dumps(adapter.review_source(case),ensure_ascii=False)
+            source=json.dumps(adapter.character_source(case),ensure_ascii=False)
             self.assertEqual(metrics['source_characters'],len(source))
             self.assertNotEqual(metrics['source_characters'],len(source.encode()))
             self.assertEqual(metrics['character_ratio'],metrics['knowledge_characters']/len(source))
@@ -102,10 +102,32 @@ class ObserverAdapterTest(unittest.TestCase):
             self.assertEqual(adapter.evaluate_case(case,aggregate)['source_characters'],len(source))
             case['persisted_observations']=[{'facts':['more historical context']}]
             self.assertEqual(adapter.evaluate_case(case,aggregate)['source_characters'],
-                len(json.dumps(adapter.review_source(case),ensure_ascii=False)))
+                len(json.dumps(adapter.character_source(case),ensure_ascii=False)))
             case['request']={'system':'frozen system','messages':[{'content':'full context'}]}
             self.assertEqual(adapter.evaluate_case(case,aggregate)['source_characters'],
-                len(json.dumps(adapter.review_source(case),ensure_ascii=False)))
+                len(json.dumps(adapter.character_source(case),ensure_ascii=False)))
             self.assertEqual(adapter.describe()['policy_version'],'mem-unvalidated-2')
+
+    def test_captured_ab_requests_share_factual_source_without_prompt_variant_leakage(self):
+        from llm_eval.evidence import digest
+        left=copy.deepcopy(self.cases[0])
+        left['request']={'system':'BASELINE_PRIVATE_PROMPT','messages':[{'content':'BASELINE_WRAPPER'}]}
+        right=copy.deepcopy(left)
+        right['request']={'system':'CANDIDATE_DIFFERENT_PRIVATE_PROMPT','messages':[{'content':'CANDIDATE_WRAPPER'}]}
+        adapter=Observation()
+        self.assertEqual(adapter.review_source(left),adapter.review_source(right))
+        self.assertEqual(digest(adapter.review_source(left)),digest(adapter.review_source(right)))
+        self.assertNotIn('PRIVATE_PROMPT',json.dumps(adapter.review_source(left)))
+        self.assertNotIn('WRAPPER',json.dumps(adapter.review_source(right)))
+        self.assertEqual(adapter.review_source(left)['records'],left['records'])
+        aggregate={'valid':True,'value':[{'observations':[],'summary':None,'skipped':True}]}
+        # Character metrics keep the old independent field algorithm, including
+        # captured request; anonymizing review context must not rewrite it.
+        expected={k:left[k] for k in ('user_prompt','records','request','last_assistant_message','persisted_observations','context') if k in left}
+        self.assertEqual(adapter.evaluate_case(left,aggregate)['source_characters'],len(json.dumps(expected,ensure_ascii=False)))
+        self.assertNotEqual(adapter.evaluate_case(left,aggregate)['source_characters'],
+                            adapter.evaluate_case(right,aggregate)['source_characters'])
+        historical={'kind':'observation','request':left['request']}
+        self.assertEqual(adapter.review_source(historical),{'request':left['request']})
 
 if __name__=='__main__': unittest.main()

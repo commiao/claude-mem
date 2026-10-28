@@ -1,0 +1,217 @@
+[
+  {
+    "id": "semantic-metric-name-preservation",
+    "kind": "observation",
+    "category": "semantic-metric-scope",
+    "split": "holdout",
+    "project": "synthetic-observer-regression",
+    "user_prompt": "记录本轮抽取复核的指标，不改变指标含义。",
+    "records": [
+      {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "show-batch-review"
+        },
+        "tool_output": "SUBMIT model-a-batch-016 accepted=50 mismerges=12 errors=[]\nSUBMIT model-a-batch-017 accepted=50 mismerges=2 errors=[]\nBoth batches use model-a version v1; the suffix is the batch number."
+      }
+    ],
+    "expected": {
+      "action": "keep",
+      "required_facts": [
+        {
+          "statement": "两个批次各受理50条，误并分别为12和2，错误列表均为空；不能混淆三个指标。",
+          "anchors": [
+            "mismerge",
+            "误并"
+          ]
+        },
+        {
+          "statement": "016和017是同一模型版本的批号，不能据此声称新版模型更好。",
+          "anchors": [
+            "batch",
+            "批次"
+          ]
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "statement": "不能把误并12/2写成错误数12/2。",
+          "anchors": [
+            "12 errors",
+            "12个错误",
+            "12 个错误"
+          ]
+        },
+        {
+          "statement": "不能从相邻批号推断模型版本更新或模型质量改善。",
+          "anchors": [
+            "latest version",
+            "新版模型",
+            "版本升级"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "semantic-visible-rows-not-population",
+    "kind": "observation",
+    "category": "semantic-count-and-success",
+    "split": "holdout",
+    "project": "synthetic-observer-regression",
+    "user_prompt": "记录队列结束时可见的结果，区分处理状态和答案质量。",
+    "records": [
+      {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "tail -4 queue.log"
+        },
+        "tool_output": "SUBMIT model-a-batch-018 accepted=50 mismerges=5 errors=[]\nSUBMIT model-a-batch-019 accepted=50 mismerges=5 errors=[]\nSUBMIT model-a-batch-015 accepted=50 mismerges=3 errors=[]\nQUEUE_DONE\nThis tail contains three visible batches. Total batches and semantic answer accuracy were not measured."
+      }
+    ],
+    "expected": {
+      "action": "keep",
+      "required_facts": [
+        {
+          "statement": "可见三个批次各受理50条，误并分别为5、5、3，错误列表为空，队列结束。",
+          "anchors": [
+            "QUEUE_DONE",
+            "队列结束"
+          ]
+        },
+        {
+          "statement": "来源没有测量全队列批次数和语义正确率，受理计数不能证明答案正确。",
+          "anchors": [
+            "accuracy",
+            "正确率",
+            "未测量",
+            "not measured"
+          ]
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "statement": "不能补造约60个模型或全部答案正确的结论。",
+          "anchors": [
+            "60 models",
+            "60个模型",
+            "60 个模型",
+            "all answers correct",
+            "所有答案正确"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "semantic-operation-stage-attribution",
+    "kind": "observation",
+    "category": "semantic-operation-scope",
+    "split": "holdout",
+    "project": "synthetic-observer-regression",
+    "user_prompt": "记录路由上线和探测结果，分别说明各步骤调用情况及未验证项。",
+    "records": [
+      {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "show-release-verification"
+        },
+        "tool_output": "step=register-route external_calls=0 result=created\nstep=dashboard-precheck external_calls=0 result=blocked_locally\nstep=cli-provider-probe external_calls=1 provider_http_status=429\nRoute deployment is complete. Provider-probe billing is unknown. Key usability is not verified."
+      }
+    ],
+    "expected": {
+      "action": "keep",
+      "required_facts": [
+        {
+          "statement": "路由注册和看板预检未外呼，之后的CLI供应商探测外呼1次并返回429。",
+          "anchors": [
+            "429"
+          ]
+        },
+        {
+          "statement": "探测账单未知，Key可用性未验证。",
+          "anchors": [
+            "unknown",
+            "未知",
+            "未验证"
+          ]
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "statement": "不能把先前阶段的0外呼套到供应商探测上。",
+          "anchors": [
+            "probe made zero external calls",
+            "探测未外呼",
+            "探测0次外呼"
+          ]
+        },
+        {
+          "statement": "不能把账单未知写成探测免费或Key已验证可用。",
+          "anchors": [
+            "probe was free",
+            "探测免费",
+            "Key已验证可用"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "semantic-routine-claim-metadata-noise",
+    "kind": "observation",
+    "category": "routine-metadata-noise",
+    "split": "holdout",
+    "project": "synthetic-observer-regression",
+    "user_prompt": "只记录本轮值得未来复用的新发现；本地进度由任务队列负责。",
+    "records": [
+      {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "claim-next-batch"
+        },
+        "tool_output": "Claim succeeded. batch=batch-014 items=50 input=/tmp/run/batch-014.json output=/tmp/run/result-014.json. No results, blockers, configuration changes, or new technical findings are present."
+      }
+    ],
+    "expected": {
+      "action": "skip",
+      "required_facts": [],
+      "forbidden_claims": [
+        {
+          "statement": "不能把临时领取元数据写成持久技术发现或处理已完成。",
+          "anchors": [
+            "processing completed",
+            "处理已完成",
+            "new capability",
+            "新增能力"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "semantic-retrieved-memory-no-new-signal",
+    "kind": "observation",
+    "category": "memory-recapture-noise",
+    "project": "synthetic-observer-regression",
+    "user_prompt": "Read recorded context to plan follow-up work; this event makes no change and adds no new finding.",
+    "records": [
+      {
+        "tool_name": "memory_read",
+        "tool_input": {
+          "ids": [
+            101,
+            102
+          ]
+        },
+        "tool_output": "Existing memory #101: Retry attempts are capped at three. Existing memory #102: Reconciliation preserves unknown outcomes. These are previously recorded observations; no new event or verification result is supplied.",
+        "occurred_at": "2026-01-01T00:00:00Z"
+      }
+    ],
+    "expected": {
+      "action": "skip",
+      "required_facts": [],
+      "forbidden_claims": []
+    }
+  }
+]

@@ -4,9 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-mem-eval"
-version = "0.1.1"
+version = "0.1.2"
 requires-python = ">=3.11"
-dependencies = ["llm-eval>=0.1.1,<0.2"]
+dependencies = ["llm-eval>=0.1.2,<0.2"]
+
+[project.scripts]
+claude-mem-persistence-receipt = "claude_mem_eval.filter_persistence:main"
 
 [project.entry-points."llm_eval.scenarios"]
 "claude_mem.observation" = "claude_mem_eval:Observation"
