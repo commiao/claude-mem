@@ -66,8 +66,10 @@ export function parseAgentXml(raw: string, correlationId?: string | number): Par
 
   raw = stripCodeFences(raw);
 
+  const firstRoot = /<(observation|summary)\b/i.exec(raw);
   const skipMatch = /<skip_summary(?:\s+reason="([^"]*)")?\s*\/>/i.exec(raw);
-  if (skipMatch) {
+  // A sentinel quoted inside a real response is content, not a skip decision.
+  if (skipMatch && (!firstRoot || skipMatch.index < firstRoot.index)) {
     return {
       valid: true,
       observations: [],
@@ -84,7 +86,6 @@ export function parseAgentXml(raw: string, correlationId?: string | number): Par
     };
   }
 
-  const firstRoot = /<(observation|summary)\b/i.exec(raw);
   if (!firstRoot) {
     return { valid: false };
   }
@@ -207,18 +208,20 @@ function parseObservationBlocks(
 }
 
 function parseSummaryBlock(text: string, correlationId?: string | number): ParsedSummary | null {
-  const summaryRegex = /<summary>([\s\S]*?)<\/summary>/i;
+  // Use the outer closing tag: a code example or CDATA section can contain a
+  // literal </summary>. Field scanning below ignores those literal spans.
+  const summaryRegex = /<summary>([\s\S]*)<\/summary>/i;
   const summaryMatch = summaryRegex.exec(text);
   if (!summaryMatch) return null;
 
   const summaryContent = summaryMatch[1];
 
-  const request = extractField(summaryContent, 'request');
-  const investigated = extractField(summaryContent, 'investigated');
-  const learned = extractField(summaryContent, 'learned');
-  const completed = extractField(summaryContent, 'completed');
-  const next_steps = extractField(summaryContent, 'next_steps');
-  const notes = extractField(summaryContent, 'notes'); 
+  const fields = extractSummaryFields(summaryContent);
+  if (!fields) {
+    logger.warn('PARSER', 'Summary has malformed field boundaries — rejecting partial content', { correlationId });
+    return null;
+  }
+  const { request, investigated, learned, completed, next_steps, notes } = fields;
 
   if (!request && !investigated && !learned && !completed && !next_steps && !notes) {
     logger.warn('PARSER', 'Summary block has no sub-tags — rejecting false positive', { correlationId });
@@ -233,6 +236,53 @@ function parseSummaryBlock(text: string, correlationId?: string | number): Parse
     next_steps,
     notes,
   };
+}
+
+/**
+ * Summary fields are optional, but an emitted field must be complete. A regex
+ * per field used to discard e.g. <learned>...</investigated> while accepting a
+ * surviving <request>, silently storing an incomplete summary as a success.
+ *
+ * Validate just this schema's field boundaries rather than imposing strict XML
+ * on code/prose values. CDATA, comments and Markdown code are literal spans;
+ * HTML-like markup and ordinary unescaped ampersands retain existing behavior.
+ */
+function extractSummaryFields(content: string): ParsedSummary | null {
+  type SummaryField = 'request' | 'investigated' | 'learned' | 'completed' | 'next_steps' | 'notes';
+  const fields: Record<SummaryField, string | null> = {
+    request: null, investigated: null, learned: null,
+    completed: null, next_steps: null, notes: null,
+  };
+  const seen = new Set<string>();
+  let open: { name: SummaryField; start: number } | null = null;
+  const tokens = /<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->|```[\s\S]*?```|`[^`\r\n]*`|<(\/?)(request|investigated|learned|completed|next_steps|notes|summary)(?=[\s/>]|$)([^<>]*)(?:(>)|(?=<|$))/gi;
+
+  for (const match of content.matchAll(tokens)) {
+    if (match[2] === undefined) continue;
+    const name = match[2].toLowerCase();
+    // A started schema tag cut off before '>' still carries field content;
+    // ignoring it would recreate the partial-summary success this guards.
+    if (!match[4]) return null;
+    // Nested/second root blocks and attributed fields cannot be faithfully
+    // represented by this flat schema. Do not quietly omit their contents.
+    if (name === 'summary' || !/^\s*\/?$/.test(match[3])) return null;
+    const field = name as SummaryField;
+    const closing = match[1] === '/';
+    const selfClosing = /\/\s*$/.test(match[3]);
+
+    if (closing) {
+      if (selfClosing || open?.name !== field) return null;
+      const value = decodeXmlReferences(content.slice(open.start, match.index).trim());
+      fields[field] = value.trim() === '' ? null : value;
+      open = null;
+    } else {
+      if (open || seen.has(name)) return null;
+      seen.add(name);
+      if (!selfClosing) open = { name: field, start: match.index! + match[0].length };
+    }
+  }
+
+  return open ? null : fields;
 }
 
 // Some local observers echo the field label into the value, producing

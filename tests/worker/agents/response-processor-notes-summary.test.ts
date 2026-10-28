@@ -52,4 +52,49 @@ describe('notes-only summary replies', () => {
       expect(parseAgentXml(raw).valid).toBe(false);
     }
   });
+
+  it('preserves queued work instead of storing a partially parsed malformed summary', async () => {
+    const localSettingsSpy = spyOn(SettingsDefaultsManager, 'loadFromFile').mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: 'false',
+    }));
+    const store = new SessionStore(':memory:');
+    const storageSpy = spyOn(store, 'storeObservations');
+    const dbManager = {
+      getSessionById: (id: number) => store.getSessionById(id),
+      getSessionStore: () => store,
+      getChromaSync: () => null,
+      getCloudSync: () => null,
+    } as unknown as DatabaseManager;
+    const manager = new SessionManager(dbManager);
+    const confirmSpy = spyOn(manager, 'confirmClaimedMessages');
+    const sid = store.createSDKSession('malformed-content', 'malformed-project', 'Record investigation');
+    const session = manager.initializeSession(sid, undefined, 1);
+    session.memorySessionId = 'malformed-memory';
+    store.ensureMemorySessionIdRegistered(sid, session.memorySessionId);
+    session.lastGeneratorSource = 'summarize';
+    manager.queueSummarize(sid, 'Investigation complete; remediation is pending');
+    const messages = manager.getMessageIterator(sid);
+    try {
+      expect((await messages.next()).value.type).toBe('summarize');
+      const result = await processAgentResponse(
+        '<summary><request>Investigate</request><learned>Allocation can collide</investigated><notes>Remediation is pending</notes></summary>',
+        session, dbManager, manager, undefined, 10, null, 'SDK',
+      );
+      expect(result).toBeNull();
+      expect(storageSpy).not.toHaveBeenCalled();
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(store.getSummaryForSession('malformed-memory')).toBeNull();
+      expect(manager.getTotalQueueDepth()).toBe(1);
+      expect(session.abortReason).toStartWith('output_retry:');
+    } finally {
+      session.abortController.abort();
+      await messages.return(undefined);
+      manager.removeSessionImmediate(sid);
+      confirmSpy.mockRestore();
+      storageSpy.mockRestore();
+      localSettingsSpy.mockRestore();
+      store.close();
+    }
+  });
 });
