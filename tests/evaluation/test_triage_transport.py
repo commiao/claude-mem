@@ -77,3 +77,11 @@ class TriageTransportTest(unittest.TestCase):
         self.assertEqual(result['started'],33);self.assertEqual(result['imported'],33)
         self.assertEqual(imported.call_args_list[0].args[2][0]['text'],text)
         self.assertNotIn('test-only',(self.run/'business-transport/calls.jsonl').read_text())
+
+    def test_any_escaped_packet_over_budget_stops_entire_cohort_before_credentials(self):
+        self.plan['jobs'][23]['request']['body']['messages'][0]['content']='"'*11000
+        with patch.object(module.engine,'load_run',return_value=self.plan),patch.object(module,'caller_token') as token:
+            with self.assertRaisesRegex(ValueError,'wire_budget'):
+                module.execute(self.run,self.auth,'http://127.0.0.1:39002',token)
+            token.assert_not_called()
+        self.assertFalse((self.run/'business-transport/calls.jsonl').exists())

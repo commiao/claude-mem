@@ -30,6 +30,13 @@ def fraction(n, d):
     return {'numerator': n, 'denominator': d, 'rate': n / d if d else None}
 
 
+def within_route_budget(body):
+    # Match CostLimiter._input_chars exactly: nested JSON escaping counts.
+    messages = json.dumps(body.get('messages', []), ensure_ascii=False, separators=(',', ':'))
+    wire = json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()
+    return len(messages) <= 20000 and len(wire) <= 65536
+
+
 class ObservationTriage:
     def describe(self):
         return {'sdk': 1, 'id': 'claude_mem.observation_triage', 'version': '1',
@@ -71,7 +78,7 @@ class ObservationTriage:
             payload = {'state': state, 'questions': QUESTIONS}
             query = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
             body = {'business_key': 'kg_hub.obs_triage', 'messages': [{'role': 'user', 'content': query}]}
-            if len(query) > 20000 or len(json.dumps(body, ensure_ascii=False).encode()) > 65536:
+            if not within_route_budget(body):
                 raise ValueError('decision route input budget exceeded')
             requests.append({'id': case['id'], 'case_ids': [case['id']], 'system': '', 'query': query,
                              'body': body, 'drop_confidence': confidence, 'source_truncated': truncated})

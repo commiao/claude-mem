@@ -43,6 +43,24 @@ class ObservationTriageTest(unittest.TestCase):
         self.assertFalse(adapter.parse_response(request,self.response(label='unknown'))['value']['would_drop'])
         self.assertFalse(adapter.parse_response(request,self.response(confidence=None))['value']['would_drop'])
 
+    def test_route_budget_counts_nested_json_escaping(self):
+        body={'messages':[{'role':'user','content':'"'*11000}]}
+        self.assertLess(len(body['messages'][0]['content']),20000)
+        self.assertFalse(module.within_route_budget(body))
+        body['messages'][0]['content']='中'*19000
+        self.assertTrue(module.within_route_budget(body))
+        body['messages'][0]['content']='中'*19970
+        self.assertEqual(len(json.dumps(body['messages'],ensure_ascii=False,separators=(',',':'))),20000)
+        self.assertTrue(module.within_route_budget(body))
+        body['messages'][0]['content']+='中'
+        self.assertEqual(len(json.dumps(body['messages'],ensure_ascii=False,separators=(',',':'))),20001)
+        self.assertFalse(module.within_route_budget(body))
+
+    def test_escaped_sources_fail_during_packet_build(self):
+        case=self.case();case['source_records'][0]['tool_response']='"\\'*2000
+        with self.assertRaisesRegex(ValueError,'input budget exceeded'):
+            module.ObservationTriage().build_requests([case],{})
+
     def test_invalid_shapes_and_probabilities_never_become_a_drop(self):
         adapter=module.ObservationTriage();request=adapter.build_requests([self.case()],{})[0]
         for text in ['{}','not json',self.response(confidence=2),self.response(label='invented')]:

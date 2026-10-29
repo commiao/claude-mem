@@ -61,6 +61,8 @@ value=low/none 且 confidence≥0.9 仅记录“会拒绝”的诊断指标；�
 共享计划，使用既有专用 caller 提交并以公共 `import_results` 导入；证据等级保持 manual-declared，
 不冒充 native-local-observed。原始请求/HTTP 回复、调用前 fsync 的日志、用量声明及停止原因单独封存。
 外部传输授权文件绑定 plan hash 和 33 次上限，抽取/探针/自动重试为0；串行控制在30 RPM以内。
+发送前整批检查网关的两种限制：`messages` 紧凑 JSON 的字符数（包括嵌套转义）及请求体 UTF-8 字节数；
+不能只按模型 query 的字符数估算。任一包超限都在读取凭据和网络调用前拒绝整批，保留原冻结输入。
 HTTP失败或未知结果停止整轮，不继续耗用剩余预算，已有尝试禁止自动重放，也不换用其他 caller。
 计费未知保留未知，0输出token不代表0输入token或已核实0费用。
 

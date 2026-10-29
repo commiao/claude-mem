@@ -20,7 +20,7 @@ import urllib.request
 
 from llm_eval import engine
 from llm_eval.evidence import read, verify
-from .triage import ObservationTriage
+from .triage import ObservationTriage, within_route_budget
 
 BUSINESS = 'kg_hub.obs_triage'
 
@@ -82,7 +82,7 @@ def execute(run, authorization, url, token_loader, *, opener=None):
         if body.get('business_key') != BUSINESS or len(body.get('messages', [])) != 1:
             raise ValueError('invalid_business_packet')
         query = body['messages'][0]
-        if query.get('role') != 'user' or not isinstance(query.get('content'), str) or len(query['content']) > 20000 or len(json.dumps(body, ensure_ascii=False).encode()) > 65536:
+        if query.get('role') != 'user' or not isinstance(query.get('content'), str) or not within_route_budget(body):
             raise ValueError('invalid_decision_wire_budget')
     root = Path(run) / 'business-transport'
     root.mkdir(mode=0o700, exist_ok=True)
