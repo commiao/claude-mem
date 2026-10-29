@@ -34,7 +34,9 @@ def within_route_budget(body):
     # Match CostLimiter._input_chars exactly: nested JSON escaping counts.
     messages = json.dumps(body.get('messages', []), ensure_ascii=False, separators=(',', ':'))
     wire = json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()
-    return len(messages) <= 20000 and len(wire) <= 65536
+    # The gateway also measures a decoded/re-serialized body with default spaces.
+    gateway_bytes = json.dumps(body, ensure_ascii=False).encode()
+    return len(messages) <= 20000 and max(len(wire), len(gateway_bytes)) <= 65536
 
 
 class ObservationTriage:

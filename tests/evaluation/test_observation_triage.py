@@ -61,6 +61,15 @@ class ObservationTriageTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'input budget exceeded'):
             module.ObservationTriage().build_requests([case],{})
 
+    def test_wire_limit_also_covers_gateway_reserialization(self):
+        body={'business_key':'kg_hub.obs_triage','messages':[{'role':'user','content':'🙂'*16000}]}
+        compact=lambda:len(json.dumps(body,ensure_ascii=False,separators=(',',':')).encode())
+        body['messages'][0]['content']+='a'*(65536-compact())
+        self.assertEqual(compact(),65536)
+        self.assertLess(len(json.dumps(body['messages'],ensure_ascii=False,separators=(',',':'))),20000)
+        self.assertGreater(len(json.dumps(body,ensure_ascii=False).encode()),65536)
+        self.assertFalse(module.within_route_budget(body))
+
     def test_invalid_shapes_and_probabilities_never_become_a_drop(self):
         adapter=module.ObservationTriage();request=adapter.build_requests([self.case()],{})[0]
         for text in ['{}','not json',self.response(confidence=2),self.response(label='invented')]:
