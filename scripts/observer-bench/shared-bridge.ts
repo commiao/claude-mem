@@ -57,14 +57,20 @@ async function main(): Promise<void> {
     const {parseAgentXml}=await import('../../src/sdk/parser.js');
     const {extractObservationFileEvidence,sanitizeObservationFiles,normalizeSummaryForStorage,attachObservationFilesToSummary}=
       await import('../../src/services/worker/agents/ObservationNormalization.js');
+    const {gateObservationPersistence}=await import('../../src/services/worker/agents/ObservationQualityGate.js');
     const parsed=parseAgentXml(value.text);
     if (!parsed.valid) {await respond({valid:false,parser_valid:false,value:null});return;}
-    const evidence=extractObservationFileEvidence(value.records.map((r:any)=>({...r,type:value.kind==='summary'?'summarize':'observation'})));
+    const sources=value.records.map((r:any)=>({...r,type:value.kind==='summary'?'summarize':'observation'}));
+    const evidence=extractObservationFileEvidence(sources);
+    // Keep the generation denominator and schema validity independent of the
+    // later persistence gate. A rejected observation was still generated.
     const observations=sanitizeObservationFiles(parsed.observations,evidence);
+    const quality=gateObservationPersistence(observations,sources);
     const summary=attachObservationFilesToSummary(normalizeSummaryForStorage(parsed.summary),[
       {files_read:evidence.files_read,files_modified:evidence.files_modified},...observations]);
     const valid=value.kind==='summary' ? observations.length===0 : !summary;
-    await respond({valid,parser_valid:true,value:{observations,summary,skipped:!!parsed.summary?.skipped},
+    await respond({valid,parser_valid:true,value:{observations,summary,skipped:!!parsed.summary?.skipped,
+      observationFiltering:{sourceIndices:quality.sourceIndices,rejected:quality.rejected}},
       persistence:'pure normalization only; no DB access'});
   }
 }

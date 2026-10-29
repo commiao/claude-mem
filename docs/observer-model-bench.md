@@ -18,6 +18,83 @@ python scripts/mem_check.py quick --out /private/eval/mem-check-new-run
 python scripts/mem_check.py quick --evidence /private/eval/existing-audit --out /private/eval/mem-check-replay
 ```
 
+候选源码的过滤及实际入库回归（仅用户明确要求验证该候选时运行）：
+
+```sh
+python scripts/mem_check.py persistence \
+  --evidence /private/eval/frozen-real-audit \
+  --annotations /private/eval/frozen-real-audit/review-annotations.json \
+  --out /private/eval/new-persistence-replay
+```
+
+该入口锁定当前已发布基线源码，复用原请求、原回复及已绑定来源/输出的价值标签，
+分别通过基线与候选的生产解析器和 `SessionStore` 写入两个全新的临时 SQLite，随后只读回查。
+它复用已安装适配器的标签/历史回执校验及过滤指标汇总器，不读取或写入真实记忆库，
+不重新生成回复、不调用探针或 judge。原始生成数保持不变，入库拦截不能冒充模型主动跳过。
+报告并列历史实际、空库基线回放和空库候选回放；空库回放没有完整历史去重状态，
+历史与回放的差异不得计入修复收益。只有缺失标题可复制已有副标题，原事实和正文必须一致。
+
+候选的 `ObservationQualityGate` 被队列入库、直接响应入库和评测 bridge 共用。
+它只识别纯计划工具、完整的只读文件清单命令及特定旧版 `episode_body` 转储格式；
+混合来源、诊断错误、不认识的命令和新分析保持可入库。历史转储规则是保守的格式识别，
+不是通用语义去重：不支持的历史阅读方式仍可能漏过，复杂脚本内混合的新旧证据需要人工核对。
+缺标题且没有可复用副标题的内容仍拒绝。输出索引与拒绝理由随任务回执保留，不能把空新增统一算去噪成功。
+这不修正原回复中的事实错误，也不签发生产准入；安装中的评测 wheel 和生产 worker 不随源码编辑自动改变。
+
+### 来源过滤前移与决策模型分诊
+
+队列先把完整原事件存入 `observer_tasks`，随后在 `prepareBatch` 创建付费任务之前，
+对同一批来源调用共用过滤器。统一的非持久来源批次记录 `phase=before_model`、
+策略版本、理由和 `externalCalls=0` 后进入 skipped；原事件不删除。混合/未知来源保持放行。
+直接 SDK 路径只对已有 durable task 的来源做前置过滤，保留旧输入的入库后防线。
+摘要不会被观测来源过滤器拦截；已经提交的付费任务不追溯改写。
+`observer_prefilter_replay.ts` 只在临时 SQLite 回放队列准备，不提交模型任务。
+历史输入/输出 token 的可避免量是反事实测算，不是已部署节省或货币账单。
+
+`claude_mem.observation_triage` 是独立的诊断场景，模型路由为已有的 `kg_hub.obs_triage`。
+一个冻结观测加原始来源组成一个样本，原有价值标签不进入请求；只询问价值、新增性和来源支持，
+不重写观测。来源过长时显式保留首尾并标记截断，不能把未展示的来源当作支持证据。
+value=low/none 且 confidence≥0.9 仅记录“会拒绝”的诊断指标；该阈值未校准，不能自动启用生产拒绝。
+原 KG 长度/分数闸不能直接成为该场景的价值标准。沿用的标签并非独立真值，事实支持未知不作负例。
+
+公共核心暂没有 SystemOne 原生执行器。本场景通过已安装业务包中的 `triage_transport` 显式读取
+共享计划，使用既有专用 caller 提交并以公共 `import_results` 导入；证据等级保持 manual-declared，
+不冒充 native-local-observed。原始请求/HTTP 回复、调用前 fsync 的日志、用量声明及停止原因单独封存。
+外部传输授权文件绑定 plan hash 和 33 次上限，抽取/探针/自动重试为0；串行控制在30 RPM以内。
+发送前整批检查网关的两种限制：`messages` 紧凑 JSON 的字符数（包括嵌套转义）及请求体 UTF-8 字节数；
+不能只按模型 query 的字符数估算。任一包超限都在读取凭据和网络调用前拒绝整批，保留原冻结输入。
+HTTP失败或未知结果停止整轮，不继续耗用剩余预算，已有尝试禁止自动重放，也不换用其他 caller。
+计费未知保留未知，0输出token不代表0输入token或已核实0费用。
+
+候选 wheel 可安装到独立的评测组合，在 `--bundle` 中锁定；不激活全局指针或修改生产路由。
+模型评测沿用公共 freeze/plan/prepare/import/score/review/report，完整性和身份门仍由公共核心执行。
+
+#### 原子分诊 v2
+
+新增 `claude_mem.observation_triage_v2`，旧场景及旧冻结试验继续使用原 wheel。
+v2 用 Noul 单独判断长期价值，用 Choice 分别判断相对已展示旧记忆的增量和来源支持；
+三个答案在代码中组合 `keep / review / drop`。Noul 是 P(yes)，不当作 Choice confidence；
+默认0.9仍是未校准的起始策略。来源冲突、关键证据省略、重复对照不足都进入 review，
+review 不表示通过，也不按丢弃计数。即使判定重复，也必须有可靠历史正文及完整候选正文证据。
+
+使用安装版本所对应源码中的 `scripts/observer_triage_prepare.py`，显式提供旧观测、原始来源、
+原入库回执和只读数据库。它在 read-only/query-only 事务中按项目和原事件时间取对照，
+排除整个评测批次的已知 observationIds（含合并目标），避免拿待评输出判自己重复。
+先查精确正文候选（不是只比标题），再从最近至多500条中做确定性词项相关检索，最多带3条。
+这不是向量语义检索，不声称覆盖全库；没有候选不证明新增。当前库里旧行的正文可能已变，
+所以导出器一律标历史正文未验证；仅真正早于事件的不可变快照才能声明时间验证，不能事后补勾。
+精确匹配可在本地处理：可靠历史匹配为 drop；历史未验证为 review，均不调用模型。
+
+来源保留为结构化记录和相关原文片段，不再把所有来源编码为一个长字符串。
+起止位置和哈希放在请求附带的本地 evidence_receipt，模型只看同一批原文片段与省略标记，减少格式开销。
+来源默认6000字符、旧记忆2400字符；必要时缩小来源片段预算，保留观测正文及精确 JSON 长度检查。
+超限且无法安全容纳时整批停止，不修改网关限额。字符/字节下降只证明请求体缩小，不冒充token或账单节省。
+
+新场景必须重新 freeze/plan/prepare，旧三分类回复不能导入为 v2 的新模型结果。
+传输须显式 `--scenario claude_mem.observation_triage_v2`，新授权文件必须绑定该场景及新 plan hash；
+旧授权不能跨场景复用。确定性动作单独记录 local_decisions，不计 provider HTTP；
+默认离线准备不生成授权文件、不调用模型、不激活全局组合或生产过滤。
+
 `status`核实当前发布组合的两个mem场景、适配器来源与候选源码差异，并显示过滤指标是否由
 共享适配器声明。`quick`运行摘要/存储边界与过滤计数回归、合成案例合同；有已有审计目录时，
 另做同一历史回复的parser前后对照和已有价值标签重算。它不读真实DB、不重新生成回复，

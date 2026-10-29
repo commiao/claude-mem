@@ -62,8 +62,8 @@ def integration_status():
     # The released launcher validates the bundle and loads its installed adapters.
     result = subprocess.run([launcher, 'scenarios'], capture_output=True, text=True, check=True)
     descriptors = json.loads(result.stdout)
-    installed = {d['id']: d for d in descriptors if d['id'].startswith('claude_mem.')}
     expected = {'claude_mem.observation', 'claude_mem.summary'}
+    installed = {d['id']: d for d in descriptors if d['id'] in expected}
     if set(installed) != expected:
         raise RuntimeError('released observation/summary adapters are incomplete')
     revisions = {d['business_provenance']['source_revision'] for d in installed.values()}
@@ -134,6 +134,38 @@ def quick(out: Path, evidence: Path | None):
     return 0 if passed else 1
 
 
+def persistence(out: Path, evidence: Path, annotations: Path):
+    """Candidate-only replay; historical generation is never rerun."""
+    status = integration_status()
+    source = Path(status['baseline_source'])
+    revision, dirty, kind = source_identity(source)
+    if kind != 'verified-release-snapshot' or dirty or revision != status['installed_business_source_revision']:
+        raise RuntimeError('installed baseline source snapshot is not verified')
+    out.mkdir(parents=True, mode=0o700, exist_ok=False)
+    (out / 'integration-status.json').write_text(json.dumps(status, ensure_ascii=False, indent=2))
+    commands = [
+        ('sqlite-replay', ['bun', str(REPO / 'scripts/observer_persistence_replay.ts'),
+                          str(evidence), str(source), str(REPO), str(out / 'replay')]),
+        ('reviewed-metrics', [status['runtime_python'], '-I', str(REPO / 'scripts/observer_persistence_report.py'),
+                              '--evidence', str(evidence), '--replay', str(out / 'replay'),
+                              '--annotations', str(annotations)]),
+    ]
+    steps = []
+    for name, command in commands:
+        result = subprocess.run(command, cwd=REPO, capture_output=True, text=True, timeout=120)
+        (out / (name + '.log')).write_text(result.stdout + result.stderr)
+        steps.append({'name': name, 'exit_code': result.returncode, 'passed': result.returncode == 0})
+        if result.returncode:
+            break
+    passed = len(steps) == len(commands) and all(s['passed'] for s in steps)
+    (out / 'report.json').write_text(json.dumps({'name': 'MemCheck persistence replay', 'passed': passed,
+        'steps': steps, 'new_model_calls': 0, 'production_allowed': False,
+        'candidate_source': str(REPO), 'comparison': str(out / 'replay/comparison.json'),
+        'note': 'Historical outcomes and empty-SQLite baseline/candidate results are separate columns.'}, indent=2))
+    print(json.dumps({'passed': passed, 'new_model_calls': 0, 'report': str(out / 'report.json')}))
+    return 0 if passed else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -141,10 +173,16 @@ def main():
     check = commands.add_parser('quick', help='run offline parser/counting regressions without model calls')
     check.add_argument('--out', required=True, type=Path, help='new private results directory')
     check.add_argument('--evidence', type=Path, help='optional existing audit directory; never reads live DB')
+    replay = commands.add_parser('persistence', help='candidate SQLite replay of frozen historical replies; no model/live DB')
+    replay.add_argument('--out', required=True, type=Path, help='new private results directory')
+    replay.add_argument('--evidence', required=True, type=Path, help='frozen cases, replies, plan, score and persistence evidence')
+    replay.add_argument('--annotations', required=True, type=Path, help='existing source/output-bound review labels; never infer labels')
     args = parser.parse_args()
     if args.command == 'status':
         print(json.dumps(integration_status(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == 'persistence':
+        return persistence(args.out.resolve(), args.evidence.resolve(), args.annotations.resolve())
     return quick(args.out.resolve(), args.evidence)
 
 

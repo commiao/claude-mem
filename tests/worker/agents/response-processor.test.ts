@@ -130,6 +130,7 @@ let claimedMessages: Array<{
   type: 'observation' | 'summarize';
   tool_name?: string;
   tool_input?: unknown;
+  tool_response?: unknown;
 }> = [];
 let mockGetClaimedMessages: ReturnType<typeof mock>;
 
@@ -278,6 +279,44 @@ describe('ResponseProcessor', () => {
     } finally {
       store.close();
     }
+  });
+
+  it('uses the same source gate in the direct response path and records why no row was stored', async () => {
+    const store = new SessionStore(':memory:');
+    const sessionDbId = store.createSDKSession('plan-gate-source', 'test-project', 'prompt');
+    store.ensureMemorySessionIdRegistered(sessionDbId, 'plan-gate-memory');
+    mockDbManager = { ...mockDbManager, getSessionStore: () => store } as unknown as DatabaseManager;
+    claimedMessages = [{type:'observation',tool_name:'update_plan',tool_input:{items:[]},tool_response:'Plan shown'}];
+    try {
+      const result = await processAgentResponse(
+        '<observation><type>discovery</type><title>Plan initiated</title><facts><fact>Work planned</fact></facts></observation>',
+        createMockSession({sessionDbId,contentSessionId:'plan-gate-source',memorySessionId:'plan-gate-memory'}),
+        mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent',
+      );
+      expect(result?.observationIds).toEqual([]);
+      expect(store.getObservationsForSession('plan-gate-memory')).toEqual([]);
+      const calls = (mockSessionManager.markClaimedSkipped as ReturnType<typeof mock>).mock.calls;
+      expect(JSON.parse(calls[0][1]).observationFiltering).toEqual([{outputIndex:0,reason:'plan_bookkeeping_only'}]);
+      expect(mockChromaSyncObservation).not.toHaveBeenCalled();
+    } finally { store.close(); }
+  });
+
+  it('stores an existing subtitle as the missing title in the direct response path', async () => {
+    const store = new SessionStore(':memory:');
+    const sessionDbId = store.createSDKSession('subtitle-source', 'test-project', 'prompt');
+    store.ensureMemorySessionIdRegistered(sessionDbId, 'subtitle-memory');
+    mockDbManager = { ...mockDbManager, getSessionStore: () => store } as unknown as DatabaseManager;
+    try {
+      const result = await processAgentResponse(
+        '<observation><type>discovery</type><subtitle>Cache collision confirmed</subtitle><facts><fact>Original finding</fact></facts></observation>',
+        createMockSession({sessionDbId,contentSessionId:'subtitle-source',memorySessionId:'subtitle-memory'}),
+        mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent',
+      );
+      expect(result?.insertedObservationIds).toHaveLength(1);
+      const row=store.getObservationById(result!.observationIds[0]);
+      expect(row?.title).toBe('Cache collision confirmed');
+      expect(JSON.parse(row!.facts)).toEqual(['Original finding']);
+    } finally { store.close(); }
   });
 
   it.each([

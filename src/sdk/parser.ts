@@ -159,6 +159,13 @@ function parseObservationBlocks(
     let finalTitle = title;
     let finalNarrative = narrative;
 
+    // A missing display label is not evidence that the body has no value.
+    // Reuse an emitted subtitle only when there is actual body content; keep
+    // every original field intact and leave metadata-only blocks unstorable.
+    if (!finalTitle && subtitle && (narrative || facts.length > 0)) {
+      finalTitle = extractObservationFallback(subtitle).title;
+    }
+
     if (cleanedConcepts.length !== concepts.length) {
       logger.debug('PARSER', 'Removed observation type from concepts array', {
         correlationId,
