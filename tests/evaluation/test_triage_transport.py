@@ -85,3 +85,26 @@ class TriageTransportTest(unittest.TestCase):
                 module.execute(self.run,self.auth,'http://127.0.0.1:39002',token)
             token.assert_not_called()
         self.assertFalse((self.run/'business-transport/calls.jsonl').exists())
+
+    def test_v2_needs_new_scenario_bound_authorization(self):
+        with patch.object(module.engine,'load_run',return_value=self.plan),patch.object(module,'caller_token') as token:
+            with self.assertRaisesRegex(ValueError,'v2_authorization'):
+                module.execute(self.run,self.auth,'http://127.0.0.1:39002',token,scenario='claude_mem.observation_triage_v2')
+            token.assert_not_called()
+
+    def test_v2_all_local_decisions_need_no_credentials_or_http(self):
+        auth=self.root/'v2-authorization.json'
+        write_sealed(auth,{'business_key':'kg_hub.obs_triage','plan_sha256':'plan-sha','max_calls':33,
+            'generation_calls':0,'probes':0,'automatic_retries':0,'user_authorization':'new explicit test-only budget',
+            'scenario':'claude_mem.observation_triage_v2'})
+        for job in self.plan['jobs']:
+            job['request']={'execution':'local','body':None,'local_action':'review','local_reason':'exact_match_history_unverified'}
+        with patch.object(module.engine,'load_run',return_value=self.plan),patch.object(module.engine,'import_results') as imported,patch.object(module,'caller_token') as token:
+            result=module.execute(self.run,auth,'http://127.0.0.1:39002',token,scenario='claude_mem.observation_triage_v2')
+            token.assert_not_called()
+        self.assertEqual(result['started'],0);self.assertEqual(result['local_decisions'],33)
+        self.assertEqual(result['imported_judge'],0);self.assertEqual(result['not_attempted'],0)
+        self.assertEqual(imported.call_count,33)
+        row=imported.call_args_list[0].args[2][0]
+        self.assertEqual(json.loads(row['text'])['deterministic_action'],'review')
+        self.assertEqual(row['stop'],'local_deterministic')

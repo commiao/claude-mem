@@ -63,14 +63,22 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def execute(run, authorization, url, token_loader, *, opener=None):
-    adapter = ObservationTriage()
+def execute(run, authorization, url, token_loader, *, opener=None, scenario='claude_mem.observation_triage'):
+    if scenario == 'claude_mem.observation_triage_v2':
+        from .triage_v2 import ObservationTriageV2
+        adapter = ObservationTriageV2()
+    elif scenario == 'claude_mem.observation_triage':
+        adapter = ObservationTriage()
+    else:
+        raise ValueError('unsupported_triage_scenario')
     plan = engine.load_run(adapter, run)
     permit = verify(read(authorization))
     if (permit.get('business_key') != BUSINESS or permit.get('plan_sha256') != plan['sha256'] or
         permit.get('max_calls') != 33 or permit.get('generation_calls') != 0 or
         permit.get('probes') != 0 or permit.get('automatic_retries') != 0 or not permit.get('user_authorization')):
         raise ValueError('explicit_fixed_cohort_authorization_required')
+    if scenario.endswith('_v2') and permit.get('scenario') != scenario:
+        raise ValueError('explicit_v2_authorization_required')
     endpoint = urllib.parse.urlsplit(url)
     if endpoint.scheme != 'http' or endpoint.hostname != '127.0.0.1' or endpoint.port != 39002 or endpoint.path not in ('', '/') or endpoint.query or endpoint.fragment or endpoint.username:
         raise ValueError('verified_loopback_gateway_required')
@@ -78,6 +86,10 @@ def execute(run, authorization, url, token_loader, *, opener=None):
     if len(jobs) != 33 or plan['repeat'] != 1 or plan['recovery_calls'] != 0 or any(c['executor'] != 'manual' for c in plan['candidates']):
         raise ValueError('fixed_33_manual_packets_required')
     for job in jobs:
+        if scenario.endswith('_v2') and job['request'].get('execution') == 'local':
+            if job['request'].get('local_action') not in ('drop','review') or job['request'].get('body') is not None:
+                raise ValueError('invalid_local_decision_packet')
+            continue
         body = job['request'].get('body', {})
         if body.get('business_key') != BUSINESS or len(body.get('messages', [])) != 1:
             raise ValueError('invalid_business_packet')
@@ -95,12 +107,22 @@ def execute(run, authorization, url, token_loader, *, opener=None):
         # successful calls whose shared import was interrupted after response.
         if existing:
             raise ValueError('transport_already_attempted_no_automatic_replay')
-        token = token_loader()
-        succeeded, stop = 0, None
+        token = None
+        succeeded, local_count, stop = 0, 0, None
         next_start=0.0
         for number, job in enumerate(jobs, 1):
             if number > permit['max_calls']:
                 raise ValueError('judge_budget_exhausted')
+            if scenario.endswith('_v2') and job['request'].get('execution') == 'local':
+                text = json.dumps({'deterministic_action':job['request']['local_action'],'reason':job['request']['local_reason']})
+                engine.import_results(adapter, run, [{'id':job['id'],'plan_sha256':plan['sha256'],
+                    'request_sha256':job['request_sha256'],'text':text,'ms':0,'stop':'local_deterministic'}])
+                append(ledger, {'job':job['id'],'number':number,'state':'local_imported','at':stamp(),
+                                'plan_sha256':plan['sha256'],'request_sha256':job['request_sha256'],'external_calls':0})
+                local_count += 1
+                continue
+            if token is None:
+                token = token_loader()
             time.sleep(max(0.0,next_start-time.monotonic()))
             next_start=time.monotonic()+2.1  # serial; below the verified 30 RPM route cap
             body = json.dumps(job['request']['body'], ensure_ascii=False, separators=(',', ':')).encode()
@@ -149,7 +171,8 @@ def execute(run, authorization, url, token_loader, *, opener=None):
                             'response_sha256': hashlib.sha256(raw).hexdigest(), 'usage': document.get('usage')})
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         summary = {'planned_judge_calls': 33, 'started': sum(r['state']=='started' for r in rows),
-                   'imported': succeeded, 'not_attempted': 33-sum(r['state']=='started' for r in rows),
+                   'imported': succeeded+local_count, 'imported_judge': succeeded, 'local_decisions':local_count,
+                   'not_attempted': 33-local_count-sum(r['state']=='started' for r in rows),
                    'stopped_reason': stop, 'generation_calls': 0, 'probes': 0, 'automatic_retries': 0,
                    'evidence_grade': 'manual-declared shared import plus local HTTP journal; no independent admission',
                    'money_cost': None, 'credits_measured': False}
@@ -160,6 +183,8 @@ def execute(run, authorization, url, token_loader, *, opener=None):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', type=Path, required=True)
+    parser.add_argument('--scenario', choices=['claude_mem.observation_triage','claude_mem.observation_triage_v2'],
+                        default='claude_mem.observation_triage')
     parser.add_argument('--authorization', type=Path, required=True)
     parser.add_argument('--execute', action='store_true', required=True)
     parser.add_argument('--gateway-url', default='http://127.0.0.1:39002')
@@ -167,7 +192,7 @@ def main():
     parser.add_argument('--caller-config', required=True)
     args=parser.parse_args()
     result=execute(args.run.resolve(),args.authorization.resolve(),args.gateway_url,
-                   lambda:caller_token(args.caller_host,args.caller_config))
+                   lambda:caller_token(args.caller_host,args.caller_config),scenario=args.scenario)
     print(json.dumps(result))
 
 

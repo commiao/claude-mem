@@ -10,12 +10,14 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 ASSETS=ROOT/'adapters/evaluation/src/claude_mem_eval/assets'
 ASSETS.mkdir(parents=True,exist_ok=True)
-sources=['scripts/observer-bench/shared-bridge.ts','src/services/worker/ObserverBatchRequest.ts',
+sources=['scripts/observer-bench/shared-bridge.ts','scripts/observer_triage_prepare.py','src/services/worker/ObserverBatchRequest.ts',
          'src/sdk/prompts.ts','src/sdk/parser.ts','src/services/worker/agents/ObservationNormalization.ts','plugin/modes/code.json',
          'adapters/evaluation/src/claude_mem_eval/filter_quality.py',
          'adapters/evaluation/src/claude_mem_eval/filter_metrics.py',
          'adapters/evaluation/src/claude_mem_eval/filter_persistence.py',
          'adapters/evaluation/src/claude_mem_eval/triage.py',
+         'adapters/evaluation/src/claude_mem_eval/triage_context.py',
+         'adapters/evaluation/src/claude_mem_eval/triage_v2.py',
          'adapters/evaluation/src/claude_mem_eval/triage_transport.py']
 # Capture the complete local TS dependency closure, not just top-level business files.
 seen=set(sources)

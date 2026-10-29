@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-mem-eval"
-version = "0.1.3"
+version = "0.1.4"
 requires-python = ">=3.11"
 dependencies = ["llm-eval>=0.1.2,<0.2"]
 
@@ -15,6 +15,7 @@ claude-mem-persistence-receipt = "claude_mem_eval.filter_persistence:main"
 "claude_mem.observation" = "claude_mem_eval:Observation"
 "claude_mem.summary" = "claude_mem_eval:Summary"
 "claude_mem.observation_triage" = "claude_mem_eval.triage:ObservationTriage"
+"claude_mem.observation_triage_v2" = "claude_mem_eval.triage_v2:ObservationTriageV2"
 
 [tool.setuptools.packages.find]
 where = ["src"]
