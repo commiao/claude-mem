@@ -14,7 +14,9 @@ sources=['scripts/observer-bench/shared-bridge.ts','src/services/worker/Observer
          'src/sdk/prompts.ts','src/sdk/parser.ts','src/services/worker/agents/ObservationNormalization.ts','plugin/modes/code.json',
          'adapters/evaluation/src/claude_mem_eval/filter_quality.py',
          'adapters/evaluation/src/claude_mem_eval/filter_metrics.py',
-         'adapters/evaluation/src/claude_mem_eval/filter_persistence.py']
+         'adapters/evaluation/src/claude_mem_eval/filter_persistence.py',
+         'adapters/evaluation/src/claude_mem_eval/triage.py',
+         'adapters/evaluation/src/claude_mem_eval/triage_transport.py']
 # Capture the complete local TS dependency closure, not just top-level business files.
 seen=set(sources)
 pending=list(sources)

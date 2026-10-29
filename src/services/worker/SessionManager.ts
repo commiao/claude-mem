@@ -1,4 +1,5 @@
 import { gatewayQueueEnabled, readQueueHold } from './GatewayObserverQueue.js';
+import { nonDurableSourceReason, SOURCE_QUALITY_POLICY_VERSION } from './agents/ObservationQualityGate.js';
 import { createHash } from 'crypto';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
@@ -616,6 +617,15 @@ export class SessionManager {
     // into a second SDK execution after ingress is retried.
     if (data.recoveryTaskId && this.dbManager.getObserverTaskStore().isGatewayOwned(data.recoveryTaskId)) {
       throw new Error('gateway_owned_task_requires_queue_runtime');
+    }
+    if (data.recoveryTaskId) {
+      const reason=nonDurableSourceReason({...data,type:'observation'});
+      if (reason) {
+        this.dbManager.getObserverTaskStore().recordSkipped([data.recoveryTaskId],JSON.stringify({
+          phase:'before_model',reason,policyVersion:SOURCE_QUALITY_POLICY_VERSION,externalCalls:0,
+        }));
+        return;
+      }
     }
     let session = this.sessions.get(sessionDbId);
     if (!session) {

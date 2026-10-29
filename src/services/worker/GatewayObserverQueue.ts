@@ -7,7 +7,7 @@ import { buildObserverBatch, validateObserverProfile } from './ObserverBatchRequ
 import { parseAgentXml } from '../../sdk/parser.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { extractObservationFileEvidence, sanitizeObservationFiles, normalizeSummaryForStorage, attachObservationFilesToSummary } from './agents/ObservationNormalization.js';
-import { gateObservationPersistence } from './agents/ObservationQualityGate.js';
+import { gateObservationPersistence, nonDurableBatchReason, SOURCE_QUALITY_POLICY_VERSION } from './agents/ObservationQualityGate.js';
 import { getWorkerPort } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { bodyGatewayDisposition, jobErrorDisposition, type GatewayDisposition } from './gateway-disposition.js';
@@ -156,6 +156,17 @@ export class GatewayObserverQueue {
       const {selected,body,overBudget} = buildObserverBatch(candidates,ModeManager.getInstance().getActiveMode(),this.config,prior);
       if (overBudget) {
         db.prepare("UPDATE observer_tasks SET state='failed',outcome='batch_input_over_budget',version=version+1 WHERE id=?").run(first.id);
+        return true;
+      }
+      // The immutable source already lives in observer_tasks. Reject only a
+      // uniformly non-durable batch before creating any payable gateway job.
+      const reason=nonDurableBatchReason(selected.map(row=>({
+        ...JSON.parse(row.payload),type:row.kind==='summary'?'summarize':'observation',
+      })));
+      if (reason) {
+        this.manager.getObserverTaskStore().recordSkipped(selected.map(row=>row.id),JSON.stringify({
+          phase:'before_model',reason,policyVersion:SOURCE_QUALITY_POLICY_VERSION,externalCalls:0,
+        }));
         return true;
       }
       const raw = JSON.stringify(body);

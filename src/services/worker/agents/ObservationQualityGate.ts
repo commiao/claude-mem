@@ -15,6 +15,7 @@ export interface ObservationSource {
 }
 
 export type QualityReason = 'plan_bookkeeping_only' | 'file_inventory_only' | 'retrieved_memory_only';
+export const SOURCE_QUALITY_POLICY_VERSION = 'source-quality-v1';
 export interface ObservationGateDecision {
   outputIndex: number;
   reason: QualityReason | 'missing_title';
@@ -124,9 +125,7 @@ export function nonDurableSourceReason(source: ObservationSource): QualityReason
 export function gateObservationPersistence<T extends ParsedObservation>(
   observations: T[], sources: ReadonlyArray<ObservationSource>,
 ): { observations: T[]; sourceIndices: number[]; rejected: ObservationGateDecision[] } {
-  const reasons = sources.map(nonDurableSourceReason);
-  const sourceReason = reasons.length > 0 && reasons[0] && reasons.every(reason=>reason===reasons[0])
-    ? reasons[0]! : null;
+  const sourceReason = nonDurableBatchReason(sources);
   const accepted: T[] = [], sourceIndices: number[] = [], rejected: ObservationGateDecision[] = [];
   observations.forEach((observation, outputIndex) => {
     const reason = sourceReason ?? (!hasStorableTitle(observation.title) ? 'missing_title' : null);
@@ -134,4 +133,10 @@ export function gateObservationPersistence<T extends ParsedObservation>(
     else { accepted.push(observation); sourceIndices.push(outputIndex); }
   });
   return { observations: accepted, sourceIndices, rejected };
+}
+
+/** Preserve mixed source batches; unknown evidence is never an implicit drop. */
+export function nonDurableBatchReason(sources: ReadonlyArray<ObservationSource>): QualityReason | null {
+  const reasons=sources.map(nonDurableSourceReason);
+  return reasons.length>0 && reasons[0] && reasons.every(reason=>reason===reasons[0]) ? reasons[0] : null;
 }

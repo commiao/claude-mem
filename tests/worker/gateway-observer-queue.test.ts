@@ -135,7 +135,7 @@ describe('durable gateway observer batches', () => {
     expect(batches()[0].receipt).toBeNull();
     expect(batches()[0].result).not.toBeNull();
   });
-  it('records a source-quality rejection atomically without inserting a plan as memory', async () => {
+  it('records a source-quality rejection before creating any payable batch and retains the raw source', async () => {
     const id=add(71,{payload:JSON.stringify({tool_name:'mcp__ccd_turn__update_plan',
       tool_input:{items:[{content:'Fix cache',status:'pending'}]},tool_response:'Plan shown',prompt_number:1})});
     const worker=queue(async(_url:any,req:any)=>{
@@ -143,13 +143,39 @@ describe('durable gateway observer batches', () => {
       result.job.response.content[0].text='<observation><type>discovery</type><title>Cache plan started</title><facts><fact>Work is planned</fact></facts></observation>';
       return Response.json(result);
     });
-    worker.prepareBatch();await worker.processBatch(batches()[0]);
+    worker.prepareBatch();
     const outcome=JSON.parse(tasks.get(id)!.outcome!);
-    expect(outcome.insertedObservationIds).toEqual([]);
-    expect(outcome.observationFiltering).toEqual({sourceIndices:[],rejected:[{outputIndex:0,reason:'plan_bookkeeping_only'}]});
+    expect(outcome).toEqual({phase:'before_model',reason:'plan_bookkeeping_only',policyVersion:'source-quality-v1',externalCalls:0});
+    expect(tasks.get(id)?.state).toBe('skipped');
+    expect(tasks.get(id)?.payload).toContain('Fix cache');
+    expect(batches()).toHaveLength(0);
     expect((db.prepare('SELECT count(*) AS n FROM observations').get() as any).n).toBe(0);
-    expect(batches()[0].state).toBe('succeeded');
-    expect(batches()[0].result).not.toBeNull();
+  });
+  it('keeps mixed plan/live batches', () => {
+    add(81,{payload:JSON.stringify({tool_name:'update_plan',tool_input:{items:[]},tool_response:'Plan shown',prompt_number:1})});
+    add(82);
+    const worker=queue();
+    expect(worker.prepareBatch()).toBe(true);
+    expect(batches()).toHaveLength(1);
+    expect(db.prepare('SELECT count(*) AS n FROM observer_queue_members').get()).toEqual({n:2});
+  });
+  it('never applies observation-source filtering to summarize events', () => {
+    add(83,{queueKind:'summary',payload:JSON.stringify({tool_name:'update_plan',tool_input:{items:[]},last_assistant_message:'Session findings',prompt_number:1})});
+    expect(queue().prepareBatch()).toBe(true);
+    expect(batches()).toHaveLength(1);
+    expect(JSON.parse(batches()[0].body).messages[0].content).toContain('Session findings');
+  });
+  it('filters an SDK-owned durable plan before initializing a generator and keeps its source', () => {
+    const id=add(91,{queueContext:undefined,payload:JSON.stringify({tool_name:'update_plan',tool_input:{items:[]},tool_response:'Plan shown'})});
+    const sessions=new SessionManager(manager);
+    const old=process.env.CLAUDE_MEM_LLM_QUEUE_URL;
+    delete process.env.CLAUDE_MEM_LLM_QUEUE_URL;
+    try {
+      sessions.queueObservation(session,{recoveryTaskId:id,tool_name:'update_plan',tool_input:{items:[]},tool_response:'Plan shown'} as any);
+      expect(tasks.get(id)?.state).toBe('skipped');
+      expect(tasks.get(id)?.payload).toContain('Plan shown');
+      expect(sessions.getMessageBuffer().getPendingCount(session)).toBe(0);
+    } finally {if(old!==undefined) process.env.CLAUDE_MEM_LLM_QUEUE_URL=old;}
   });
   it('recovers a missing title from the emitted subtitle and keeps output/id positions explicit', async () => {
     const id=add(72);

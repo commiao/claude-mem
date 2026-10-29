@@ -62,8 +62,8 @@ def integration_status():
     # The released launcher validates the bundle and loads its installed adapters.
     result = subprocess.run([launcher, 'scenarios'], capture_output=True, text=True, check=True)
     descriptors = json.loads(result.stdout)
-    installed = {d['id']: d for d in descriptors if d['id'].startswith('claude_mem.')}
     expected = {'claude_mem.observation', 'claude_mem.summary'}
+    installed = {d['id']: d for d in descriptors if d['id'] in expected}
     if set(installed) != expected:
         raise RuntimeError('released observation/summary adapters are incomplete')
     revisions = {d['business_provenance']['source_revision'] for d in installed.values()}

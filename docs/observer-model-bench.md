@@ -41,6 +41,32 @@ python scripts/mem_check.py persistence \
 缺标题且没有可复用副标题的内容仍拒绝。输出索引与拒绝理由随任务回执保留，不能把空新增统一算去噪成功。
 这不修正原回复中的事实错误，也不签发生产准入；安装中的评测 wheel 和生产 worker 不随源码编辑自动改变。
 
+### 来源过滤前移与决策模型分诊
+
+队列先把完整原事件存入 `observer_tasks`，随后在 `prepareBatch` 创建付费任务之前，
+对同一批来源调用共用过滤器。统一的非持久来源批次记录 `phase=before_model`、
+策略版本、理由和 `externalCalls=0` 后进入 skipped；原事件不删除。混合/未知来源保持放行。
+直接 SDK 路径只对已有 durable task 的来源做前置过滤，保留旧输入的入库后防线。
+摘要不会被观测来源过滤器拦截；已经提交的付费任务不追溯改写。
+`observer_prefilter_replay.ts` 只在临时 SQLite 回放队列准备，不提交模型任务。
+历史输入/输出 token 的可避免量是反事实测算，不是已部署节省或货币账单。
+
+`claude_mem.observation_triage` 是独立的诊断场景，模型路由为已有的 `kg_hub.obs_triage`。
+一个冻结观测加原始来源组成一个样本，原有价值标签不进入请求；只询问价值、新增性和来源支持，
+不重写观测。来源过长时显式保留首尾并标记截断，不能把未展示的来源当作支持证据。
+value=low/none 且 confidence≥0.9 仅记录“会拒绝”的诊断指标；该阈值未校准，不能自动启用生产拒绝。
+原 KG 长度/分数闸不能直接成为该场景的价值标准。沿用的标签并非独立真值，事实支持未知不作负例。
+
+公共核心暂没有 SystemOne 原生执行器。本场景通过已安装业务包中的 `triage_transport` 显式读取
+共享计划，使用既有专用 caller 提交并以公共 `import_results` 导入；证据等级保持 manual-declared，
+不冒充 native-local-observed。原始请求/HTTP 回复、调用前 fsync 的日志、用量声明及停止原因单独封存。
+外部传输授权文件绑定 plan hash 和 33 次上限，抽取/探针/自动重试为0；串行控制在30 RPM以内。
+HTTP失败或未知结果停止整轮，不继续耗用剩余预算，已有尝试禁止自动重放，也不换用其他 caller。
+计费未知保留未知，0输出token不代表0输入token或已核实0费用。
+
+候选 wheel 可安装到独立的评测组合，在 `--bundle` 中锁定；不激活全局指针或修改生产路由。
+模型评测沿用公共 freeze/plan/prepare/import/score/review/report，完整性和身份门仍由公共核心执行。
+
 `status`核实当前发布组合的两个mem场景、适配器来源与候选源码差异，并显示过滤指标是否由
 共享适配器声明。`quick`运行摘要/存储边界与过滤计数回归、合成案例合同；有已有审计目录时，
 另做同一历史回复的parser前后对照和已有价值标签重算。它不读真实DB、不重新生成回复，
