@@ -1,6 +1,6 @@
 
 import { logger } from '../../../utils/logger.js';
-import { hasStorableTitle } from '../../sqlite/observations/store.js';
+import { gateObservationPersistence } from './ObservationQualityGate.js';
 import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
 import {
   classifyObserverOutput,
@@ -451,11 +451,13 @@ export async function processAgentResponse(
   // parsed observations with stored ids by position (Chroma sync, SSE, alerts,
   // the brainbeat webhook). Drop them here so one list feeds both sides: a
   // skipped row in the middle would shift every later id onto the wrong one.
-  const storableObservations = sanitizedObservations.filter(obs => hasStorableTitle(obs.title));
+  const quality = gateObservationPersistence(sanitizedObservations, claimedMessages);
+  const storableObservations = quality.observations;
   if (storableObservations.length < sanitizedObservations.length) {
-    logger.debug('DB', 'Dropped observations without a title before storage', {
+    logger.debug('DB', 'Filtered observations before storage', {
       sessionId: session.sessionDbId,
       dropped: sanitizedObservations.length - storableObservations.length,
+      rejected: quality.rejected,
     });
   }
   const labeledObservations = storableObservations.map(obs => ({
@@ -477,11 +479,14 @@ export async function processAgentResponse(
       modelId,
       stored => {
         if (stored.observationIds.length === 0 && stored.summaryId === null) {
-          sessionManager.markClaimedSkipped(session.sessionDbId, 'valid_empty_model_decision');
+          sessionManager.markClaimedSkipped(session.sessionDbId,
+            quality.rejected.length ? JSON.stringify({ observationFiltering: quality.rejected }) : 'valid_empty_model_decision');
         } else {
           sessionManager.markClaimedPersistedOutcome(
             session.sessionDbId,
-            JSON.stringify({ observationIds: stored.observationIds, summaryId: stored.summaryId }),
+            JSON.stringify({ ...stored, observationFiltering: {
+              sourceIndices: quality.sourceIndices, rejected: quality.rejected,
+            } }),
           );
         }
       },

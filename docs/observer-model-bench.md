@@ -18,6 +18,29 @@ python scripts/mem_check.py quick --out /private/eval/mem-check-new-run
 python scripts/mem_check.py quick --evidence /private/eval/existing-audit --out /private/eval/mem-check-replay
 ```
 
+候选源码的过滤及实际入库回归（仅用户明确要求验证该候选时运行）：
+
+```sh
+python scripts/mem_check.py persistence \
+  --evidence /private/eval/frozen-real-audit \
+  --annotations /private/eval/frozen-real-audit/review-annotations.json \
+  --out /private/eval/new-persistence-replay
+```
+
+该入口锁定当前已发布基线源码，复用原请求、原回复及已绑定来源/输出的价值标签，
+分别通过基线与候选的生产解析器和 `SessionStore` 写入两个全新的临时 SQLite，随后只读回查。
+它复用已安装适配器的标签/历史回执校验及过滤指标汇总器，不读取或写入真实记忆库，
+不重新生成回复、不调用探针或 judge。原始生成数保持不变，入库拦截不能冒充模型主动跳过。
+报告并列历史实际、空库基线回放和空库候选回放；空库回放没有完整历史去重状态，
+历史与回放的差异不得计入修复收益。只有缺失标题可复制已有副标题，原事实和正文必须一致。
+
+候选的 `ObservationQualityGate` 被队列入库、直接响应入库和评测 bridge 共用。
+它只识别纯计划工具、完整的只读文件清单命令及特定旧版 `episode_body` 转储格式；
+混合来源、诊断错误、不认识的命令和新分析保持可入库。历史转储规则是保守的格式识别，
+不是通用语义去重：不支持的历史阅读方式仍可能漏过，复杂脚本内混合的新旧证据需要人工核对。
+缺标题且没有可复用副标题的内容仍拒绝。输出索引与拒绝理由随任务回执保留，不能把空新增统一算去噪成功。
+这不修正原回复中的事实错误，也不签发生产准入；安装中的评测 wheel 和生产 worker 不随源码编辑自动改变。
+
 `status`核实当前发布组合的两个mem场景、适配器来源与候选源码差异，并显示过滤指标是否由
 共享适配器声明。`quick`运行摘要/存储边界与过滤计数回归、合成案例合同；有已有审计目录时，
 另做同一历史回复的parser前后对照和已有价值标签重算。它不读真实DB、不重新生成回复，

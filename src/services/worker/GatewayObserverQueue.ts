@@ -7,6 +7,7 @@ import { buildObserverBatch, validateObserverProfile } from './ObserverBatchRequ
 import { parseAgentXml } from '../../sdk/parser.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { extractObservationFileEvidence, sanitizeObservationFiles, normalizeSummaryForStorage, attachObservationFilesToSummary } from './agents/ObservationNormalization.js';
+import { gateObservationPersistence } from './agents/ObservationQualityGate.js';
 import { getWorkerPort } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { bodyGatewayDisposition, jobErrorDisposition, type GatewayDisposition } from './gateway-disposition.js';
@@ -269,10 +270,12 @@ export class GatewayObserverQueue {
     // The database relation is stable; it is not a provider conversation ID.
     const memoryId = store.ensureMemorySessionIdRegistered(batch.session_db_id,
       'queue-'+first.content_session_id, getWorkerPort()) || 'queue-'+first.content_session_id;
-    const evidence = extractObservationFileEvidence(rows.map(row => ({
+    const sourceMessages = rows.map(row => ({
       ...JSON.parse(row.payload), type: row.kind === 'summary' ? 'summarize' : 'observation',
-    })));
-    const observations = sanitizeObservationFiles(parsed.observations, evidence).map(obs => ({
+    }));
+    const evidence = extractObservationFileEvidence(sourceMessages);
+    const quality = gateObservationPersistence(sanitizeObservationFiles(parsed.observations, evidence), sourceMessages);
+    const observations = quality.observations.map(obs => ({
       ...obs, agent_id:input.agentId || null, agent_type:input.agentType || null,
     }));
     const summary = attachObservationFilesToSummary(normalizeSummaryForStorage(parsed.summary), [
@@ -284,7 +287,10 @@ export class GatewayObserverQueue {
       const saved = store.storeObservations(memoryId,context.project,observations,summary,
         input.prompt_number, (job.response.usage?.input_tokens || 0)+(job.response.usage?.output_tokens || 0),
         first.enqueued_at_epoch,job.response.model);
-      this.manager.getObserverTaskStore().recordPersistedOutcome(rows.map(r=>r.id),JSON.stringify(saved));
+      this.manager.getObserverTaskStore().recordPersistedOutcome(rows.map(r=>r.id),JSON.stringify({
+        ...saved,
+        observationFiltering: { sourceIndices: quality.sourceIndices, rejected: quality.rejected },
+      }));
       db.prepare("UPDATE observer_queue_batches SET state='succeeded',receipt=? WHERE id=?")
         .run(JSON.stringify({state:'completed',reference:'sqlite:observer_queue_batches:'+batch.id}),batch.id);
     })();

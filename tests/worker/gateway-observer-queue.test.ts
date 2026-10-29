@@ -135,4 +135,37 @@ describe('durable gateway observer batches', () => {
     expect(batches()[0].receipt).toBeNull();
     expect(batches()[0].result).not.toBeNull();
   });
+  it('records a source-quality rejection atomically without inserting a plan as memory', async () => {
+    const id=add(71,{payload:JSON.stringify({tool_name:'mcp__ccd_turn__update_plan',
+      tool_input:{items:[{content:'Fix cache',status:'pending'}]},tool_response:'Plan shown',prompt_number:1})});
+    const worker=queue(async(_url:any,req:any)=>{
+      const result=await response(req).json();
+      result.job.response.content[0].text='<observation><type>discovery</type><title>Cache plan started</title><facts><fact>Work is planned</fact></facts></observation>';
+      return Response.json(result);
+    });
+    worker.prepareBatch();await worker.processBatch(batches()[0]);
+    const outcome=JSON.parse(tasks.get(id)!.outcome!);
+    expect(outcome.insertedObservationIds).toEqual([]);
+    expect(outcome.observationFiltering).toEqual({sourceIndices:[],rejected:[{outputIndex:0,reason:'plan_bookkeeping_only'}]});
+    expect((db.prepare('SELECT count(*) AS n FROM observations').get() as any).n).toBe(0);
+    expect(batches()[0].state).toBe('succeeded');
+    expect(batches()[0].result).not.toBeNull();
+  });
+  it('recovers a missing title from the emitted subtitle and keeps output/id positions explicit', async () => {
+    const id=add(72);
+    const worker=queue(async(_url:any,req:any)=>{
+      const result=await response(req).json();
+      result.job.response.content[0].text='<observation><type>discovery</type><facts><fact>No display label</fact></facts></observation>'+
+        '<observation><type>discovery</type><subtitle>Cache collision confirmed</subtitle><facts><fact>Keys omit facts</fact></facts></observation>';
+      return Response.json(result);
+    });
+    worker.prepareBatch();await worker.processBatch(batches()[0]);
+    const outcome=JSON.parse(tasks.get(id)!.outcome!);
+    expect(outcome.observationFiltering.sourceIndices).toEqual([1]);
+    expect(outcome.observationFiltering.rejected).toEqual([{outputIndex:0,reason:'missing_title'}]);
+    expect(outcome.insertedObservationIds).toHaveLength(1);
+    const row=store.getObservationById(outcome.insertedObservationIds[0]);
+    expect(row?.title).toBe('Cache collision confirmed');
+    expect(JSON.parse(row!.facts)).toEqual(['Keys omit facts']);
+  });
 });
