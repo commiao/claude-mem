@@ -170,7 +170,8 @@ def execute(run, authorization, url, token_loader, *, opener=None, scenario='cla
             append(ledger, {**record, 'state': 'imported', 'at': stamp(), 'http_status': status, 'ms': elapsed,
                             'response_sha256': hashlib.sha256(raw).hexdigest(), 'usage': document.get('usage')})
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
-        summary = {'planned_judge_calls': 33, 'started': sum(r['state']=='started' for r in rows),
+        planned_judge = sum(job['request'].get('execution') != 'local' for job in jobs) if scenario.endswith('_v2') else 33
+        summary = {'planned_cases':33, 'planned_judge_calls': planned_judge, 'started': sum(r['state']=='started' for r in rows),
                    'imported': succeeded+local_count, 'imported_judge': succeeded, 'local_decisions':local_count,
                    'not_attempted': 33-local_count-sum(r['state']=='started' for r in rows),
                    'stopped_reason': stop, 'generation_calls': 0, 'probes': 0, 'automatic_retries': 0,

@@ -103,6 +103,7 @@ class TriageTransportTest(unittest.TestCase):
             result=module.execute(self.run,auth,'http://127.0.0.1:39002',token,scenario='claude_mem.observation_triage_v2')
             token.assert_not_called()
         self.assertEqual(result['started'],0);self.assertEqual(result['local_decisions'],33)
+        self.assertEqual(result['planned_judge_calls'],0)
         self.assertEqual(result['imported_judge'],0);self.assertEqual(result['not_attempted'],0)
         self.assertEqual(imported.call_count,33)
         row=imported.call_args_list[0].args[2][0]
